@@ -1,0 +1,16 @@
+# 数值计算与数组处理。
+numpy>=1.24
+
+# 棋盘格、圆点、视频和图像读写。
+opencv-python>=4.8
+
+# 点匹配、滤波、频谱和信号处理。
+scipy>=1.10
+
+# 轨迹、时域和频域结果绘图。
+matplotlib>=3.7
+
+# UR10 真机模式使用；离线视觉、dry_run 和 analyze 不会导入它。
+ur-rtde>=1.5
+
+# 海康 MVS 及 MvCameraControl_class 不能只靠 pip 安装，需要另行安装厂商 SDK。
