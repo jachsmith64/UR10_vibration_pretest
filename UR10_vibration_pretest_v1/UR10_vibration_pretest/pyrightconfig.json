@@ -1,0 +1,18 @@
+{
+    "include": [
+        "."
+    ],
+    "exclude": [
+        ".venv",
+        ".npm-cache",
+        "outputs",
+        "__pycache__"
+    ],
+    "venvPath": ".",
+    "venv": ".venv",
+    "pythonVersion": "3.12",
+    "pythonPlatform": "Windows",
+    "extraPaths": [
+        "."
+    ]
+}

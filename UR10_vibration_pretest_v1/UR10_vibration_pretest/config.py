@@ -2,6 +2,18 @@
 UR10 末端振动预实验：统一配置文件。
 
 你平时最常修改的就是这个文件。其余文件负责“怎么做”，这里负责“这次做什么、用什么参数做”。
+
+给初学者的阅读方法：
+1. 先只看 RUN_MODE、VISION_SOURCE、VISION_METHOD，这三项决定程序会走哪条路线。
+2. 没有实机时，保持 RUN_MODE="vision_test" 或命令行使用 --mode robot_dry_run。
+3. 任何和 ROBOT、POINT、WORKSPACE 有关的值都不要猜；它们必须来自真实示教和现场确认。
+4. 任何和 HIK 开头有关的值都属于海康相机 SDK 配置；普通图片/视频测试暂时不用管。
+5. validate_config() 是启动前的“门卫”，它会提前阻止明显危险或不完整的配置。
+
+重要安全原则：
+- 配置文件中的示例坐标只用于软件 dry-run，不代表你的实验台安全。
+- .venv、依赖安装、VS Code 解释器设置不在这里配置；这些看 ENVIRONMENT_SETUP.md。
+- 本文件没有主动连接相机或机器人，真正的硬件动作由 camera.py 和 robot.py 中的模式决定。
 """
 
 from __future__ import annotations
@@ -371,10 +383,20 @@ def validate_config(run_mode: str | None = None) -> None:
     在导入硬件库或创建子进程前检查明显配置错误。
 
     run_mode 允许 main.py 的命令行参数临时覆盖 RUN_MODE；不传时就检查文件顶部选择的模式。
+
+    初学者可以把这个函数理解成“开机前检查表”：
+    - 先检查模式名称有没有拼错；
+    - 再检查视觉、轨迹、控制器这些大方向是否在允许范围内；
+    - 然后检查数字参数是否明显不合理；
+    - 最后才创建输出目录。
+
+    它不会连接相机，也不会连接机器人，只做纯 Python 配置检查。
     """
 
     selected_mode = run_mode or RUN_MODE
 
+    # 第一组：检查“字符串选项”有没有写错。
+    # 这类错误最常见，例如把 vision_test 拼成 vison_test。
     if selected_mode not in VALID_RUN_MODES:
         raise ValueError(
             f"未知 RUN_MODE={selected_mode!r}，可选值为 {sorted(VALID_RUN_MODES)}。"
@@ -402,6 +424,8 @@ def validate_config(run_mode: str | None = None) -> None:
     if EXECUTOR_MODE not in VALID_EXECUTOR_MODES:
         raise ValueError(f"未知 EXECUTOR_MODE={EXECUTOR_MODE!r}。")
 
+    # 第二组：检查会影响真机安全的大开关。
+    # 当前版本预留了 SFC 名称，但还没有实现真正在线控制，所以不能让它悄悄进入真机模式。
     if selected_mode in {"robot_test", "experiment"} and CONTROL_MODE == "sfc":
         raise ValueError(
             "当前版本只预留了 SFC 接口，尚未实现在线控制。"
@@ -414,6 +438,8 @@ def validate_config(run_mode: str | None = None) -> None:
     if selected_mode in {"robot_test", "experiment"} and not ROBOT_HOST.strip():
         raise ValueError("真机模式必须填写非空 ROBOT_HOST。")
 
+    # 第三组：检查视觉算法参数。
+    # 这些值不会造成机器人运动，但写错会让图像识别结果完全不可信。
     if CHECKERBOARD_INNER_CORNERS[0] < 2 or CHECKERBOARD_INNER_CORNERS[1] < 2:
         raise ValueError("棋盘格横向和纵向内角点数都必须至少为 2。")
 
@@ -438,6 +464,8 @@ def validate_config(run_mode: str | None = None) -> None:
         if VISION_ROI[2] == 0 or VISION_ROI[3] == 0:
             raise ValueError("VISION_ROI 的 width 和 height 必须大于 0。")
 
+    # 第四组：检查机器人位姿和运动参数。
+    # 这里仍只是“数字合理性检查”，不能替代示教器和现场安全确认。
     for name, pose in (("POINT_A", POINT_A), ("POINT_B", POINT_B), ("POINT_C", POINT_C)):
         _check_pose(name, pose)
 
@@ -453,6 +481,8 @@ def validate_config(run_mode: str | None = None) -> None:
     if PRE_RECORD_SECONDS < 0 or POST_RECORD_SECONDS < 0:
         raise ValueError("运动前后记录时间不能为负数。")
 
+    # 第五组：检查离线分析参数。
+    # 分析模式不碰硬件，但参数写错会让输出图表的含义变错。
     if ANALYSIS_VISION_METHOD not in {"circles", "checkerboard"}:
         raise ValueError("ANALYSIS_VISION_METHOD 只能是 circles 或 checkerboard。")
 
