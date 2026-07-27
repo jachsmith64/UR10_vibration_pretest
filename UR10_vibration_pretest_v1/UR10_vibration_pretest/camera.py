@@ -708,6 +708,22 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
     """
     把原始图像转换成视觉识别输入。
 
+    原始图片 frame
+    ↓
+    检查是不是空图
+    ↓
+    可选：畸变校正
+    ↓
+    可选：裁剪 ROI
+    ↓
+    转成灰度图 gray
+    ↓
+    可选：轻微高斯模糊
+    ↓
+    计算画质指标 metrics
+    ↓
+    返回 gray, metrics, roi_origin
+
     输入：FramePacket.frame，即图片/视频/相机来源提供的原始 OpenCV 图像。
     输出：
     - gray：后续圆点和棋盘格算法使用的灰度图；
@@ -726,7 +742,7 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
     # 输入是原始 frame；输出 working 可能经过畸变校正和 ROI 裁剪，但原始 frame 仍保留给调试图使用。
     working = frame
 
-    # 本段可选做镜头畸变校正。
+    # 本段可选做镜头畸变校正。如果你填了相机内参和畸变参数，就先把图像做去畸变。如果没填，就跳过。
     # 输入是相机内参/畸变；输出是几何上更接近真实投影的图像，有利于像素坐标和空间坐标一致。
     if config.CAMERA_MATRIX is not None:
         camera_matrix = np.asarray(config.CAMERA_MATRIX, dtype=np.float64)
@@ -765,12 +781,12 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
         )
 
     # 本段生成图像质量指标。
-    # 输出写入每帧 VISION 记录，用于回头解释识别失败或位移异常。
+    # 输出写入每帧 VISION 记录，以后如果某一帧识别失败，用于回头解释识别失败或位移异常。
     metrics = {
-        "mean_brightness": float(np.mean(gray)),
-        "blur_variance": float(cv2.Laplacian(gray, cv2.CV_64F).var()),
-        "dark_fraction": float(np.mean(gray <= config.DARK_PIXEL_THRESHOLD)),
-        "bright_fraction": float(np.mean(gray >= config.BRIGHT_PIXEL_THRESHOLD)),
+        "mean_brightness": float(np.mean(gray)),#平均亮度
+        "blur_variance": float(cv2.Laplacian(gray, cv2.CV_64F).var()),#清晰度指标
+        "dark_fraction": float(np.mean(gray <= config.DARK_PIXEL_THRESHOLD)),#过暗的像素的比例
+        "bright_fraction": float(np.mean(gray >= config.BRIGHT_PIXEL_THRESHOLD)),#过亮的像素的比例
     }
     return gray, metrics, roi_origin
 
@@ -1462,7 +1478,25 @@ class VisionProcessor:
             }
 
     def process_frame(self, packet: FramePacket) -> tuple[dict[str, Any], np.ndarray]:
-        # 本段把“原始图像帧”转换成“可识别的灰度图 + 图像质量记录”。
+        # 本段通过棋盘格和圆点的识别算法，把“原始图像帧”转换成“可识别的灰度图 + 图像质量记录”。
+        #一帧 FramePacket
+        #↓
+        #预处理成灰度图，记录画质 preprocess_frame()
+        #↓
+        #创建 result 基础信息
+        #↓
+        #决定这一帧的分析时间 analysis_time_s
+        #↓
+        #按配置运行棋盘格法
+        #↓
+        #按配置运行圆点法
+        #↓
+        #汇总这一帧是否有效
+        #↓
+        #画 debug 调试图
+        #↓
+        #返回 result, debug
+
         # 输入：FramePacket.frame，即 OpenCV 图像数组。
         # 输出：gray 进入圆点/棋盘格识别；image_metrics 写入日志，帮助判断某帧失败是否由曝光或模糊导致。
         gray, image_metrics, roi_origin = preprocess_frame(packet.frame)
@@ -1480,8 +1514,7 @@ class VisionProcessor:
         }
 
         # 本段决定这帧进入离线分析时使用哪个时间轴。
-        # 图片/视频优先使用采集或文件时间，避免把“电脑解码速度”误当成相机采样速度。
-        # 真实相机的硬件 tick 尚未统一换算时，预实验先使用电脑时钟，便于和 UR 日志放到同一时间轴。
+        # 如果是离线的图片/视频，优先使用图片自己自带的时间戳。如果没有，就用电脑当前时间。（一般是有的）
         if (
             packet.source_name.startswith(("image_folder:", "video:"))
             and packet.camera_timestamp_raw is not None
@@ -1490,8 +1523,7 @@ class VisionProcessor:
         else:
             result["analysis_time_s"] = float(packet.host_ns) * 1e-9
 
-        # 本段预留“算法看见的点”。
-        # 输入为空；输出在下面两个测量链路中被填充。
+        # 本段 预留 “算法看见的点”。
         # 这些点既会进入日志成为排错证据，也会画到 debug 图上给人肉眼检查。
         checker_corners: np.ndarray | None = None
         circle_centers: np.ndarray | None = None
@@ -1512,9 +1544,7 @@ class VisionProcessor:
             result.update(circle_result)
             self._add_point_outputs(result, "circle", circle_centers, roi_origin)
 
-        # 本段给整帧结果一个总有效性标记。
-        # 输入：checker_is_valid 和 circle_is_valid。
-        # 输出：is_valid，用于快速统计本次测试的整体可用帧比例。
+        # 本段给整帧结果一个总有效性标记。只要棋盘格法或圆点法有一种有效，就认为这一帧总体有效。
         # 后续严肃分析仍会检查具体方法自己的有效性，而不是只依赖这个总标记。
         valid_flags = [
             bool(result.get("checker_is_valid", False)),
@@ -1985,6 +2015,8 @@ def run_vision_test() -> Path:
 
             # 本循环是离线视觉测试的主流水线。
             # 输入：一帧 FramePacket；输出：一行机器可读测量结果，以及可选调试图。
+            # 图像来源每吐出一帧，我就把这一帧交给视觉处理器。处理器返回两样东西：
+            # 一个是机器可读的测量结果 result，一个是给人看的标注图 debug。然后把 result 写成一行 JSON。
             # 本函数只把原始图像序列转换成逐帧视觉测量结果，不做频谱和恢复时间分析。
             for packet in source:
                 result, debug = processor.process_frame(packet)
@@ -2000,7 +2032,7 @@ def run_vision_test() -> Path:
                 # 为避免批量离线数据产生过多图片，只按固定间隔和最大张数保存。
                 should_save = (
                     config.SAVE_DEBUG_IMAGE
-                    and packet.frame_id % config.DEBUG_IMAGE_EVERY_N_FRAMES == 0
+                    and packet.frame_id % config.DEBUG_IMAGE_EVERY_N_FRAMES == 0 # 当前帧编号能不能被DEBUG_IMAGE_EVERY_N_FRAMES整除（余数为0），能则保存为参考
                     and saved_debug_count < config.MAX_DEBUG_IMAGES
                 )
                 if should_save:
