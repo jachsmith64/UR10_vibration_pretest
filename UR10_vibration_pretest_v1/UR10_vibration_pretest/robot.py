@@ -1,24 +1,20 @@
 """
 UR10 轨迹生成、安全检查、离线 dry-run 和 ur_rtde 真机适配。
 
-所有可能让机械臂运动的调用都集中在本文件，并受“位姿已确认”和“操作者再次确认”两层开关保护。
+从用户操作看，本文件承担两类任务：
+1. 离线阶段：把 config.py 里的 A/B/C 点变成轨迹，检查数值是否离谱，生成 dry-run 报告。
+2. 真机阶段：连接 UR，读取状态，必要时发送 moveL 轨迹，并把机器人状态写入实验日志。
 
-给初学者的文件地图：
-1. Waypoint 表示一个机器人 TCP 路径点，也就是“末端要到哪里、用多快速度去”。
-2. build_trajectory() 根据 config.py 里的 A/B/C 点生成一条路径。
-3. validate_trajectory() 做纯数字层面的安全检查，例如点是否超出工作区、线段是否过长。
-4. run_robot_dry_run() 只做软件检查和报告，不导入 ur_rtde，也不会连接机器人。
-5. URRobot 是真实机器人连接的包装类，所有 RTDE 读写都集中在这个类里。
-6. run_robot_test() 和 robot_worker() 才可能接触真机；它们都必须先通过安全开关。
-
-把这个文件分成两半会更容易读：
-- 上半部分是“纸上算轨迹”：可以安全离线运行。
-- 下半部分是“和真机说话”：必须确认 IP、工作区、点位和现场安全后才能运行。
+读代码时建议按“会不会让机械臂运动”分层看：
+- Waypoint、build_trajectory()、validate_trajectory()、estimate_trajectory() 只是内存计算，不连接机器人。
+- run_robot_dry_run() 只生成报告和轨迹图，不导入 ur_rtde，不可能发运动命令。
+- URRobot.connect(require_control=False) 只读状态；require_control=True 才创建可发送运动命令的接口。
+- run_robot_test() 和 robot_worker() 才可能接触真机运动，它们会先经过配置、安全检查和人工确认。
 
 安全边界：
-- dry-run 不是实机安全证明，只能说明代码里的数值没有明显错误。
-- 示例点位不能直接发给 UR10。
-- 只有 ROBOT_POSES_CONFIRMED=True 且操作者再次确认后，真机运动才会继续。
+- dry-run 只能说明代码里的坐标、速度、线段长度没有明显数字错误，不代表现场一定安全。
+- 示例点位绝不能直接发给 UR10；实机前必须用示教器确认点位和工作区。
+- 只有 ROBOT_POSES_CONFIRMED=True、控制器安全检查通过、起点检查通过、操作者再次确认后，真机运动才会继续。
 """
 
 from __future__ import annotations
@@ -40,22 +36,26 @@ import config
 
 
 # =============================================================================
-# 1. 统一轨迹数据结构
+# 1. 统一轨迹数据结构：把 config.py 里的点位包装成后续流程共同理解的路径点
 # =============================================================================
 
 @dataclass(slots=True)
 class Waypoint:
     """
-    一个 TCP 路径点及其运动参数。
+    一条机器人 TCP 轨迹中的单个路径点。
 
-    pose 顺序固定为 [x, y, z, rx, ry, rz]；speed、acceleration 和 blend_radius 都使用 SI 单位。
+    输入来源：
+    - config.POINT_A / POINT_B / POINT_C 提供 pose；
+    - config.LINEAR_SPEED_M_S、LINEAR_ACCELERATION_M_S2、BLEND_RADIUS_M 提供运动参数。
 
-    字段解释：
-    - name：点名，例如 A、B、C，主要用于日志和报错。
-    - pose：UR 的 TCP 位姿。前三个数是位置 m，后三个数是旋转向量 rad。
-    - speed_m_s：机器人沿路径运动的线速度，单位 m/s。
-    - acceleration_m_s2：线加速度，单位 m/s²。
-    - blend_radius_m：交融半径。中间点可用它圆滑过渡，终点必须为 0。
+    输出去向：
+    - dry-run 报告会把 Waypoint 写成人能检查的 JSON；
+    - 真机运动时 execute_trajectory() 会把 Waypoint 转成 ur_rtde 的 moveL path 格式。
+
+    实验作用：
+    - 它把“末端要到哪里”和“用多快速度去”放在同一个对象里，避免轨迹生成、
+      安全检查和真机执行各自理解一套格式。
+    - pose 顺序固定为 [x, y, z, rx, ry, rz]，位置单位 m，姿态为旋转向量 rad。
     """
 
     name: str
@@ -67,18 +67,25 @@ class Waypoint:
 
 def build_trajectory() -> list[Waypoint]:
     """
-    根据 TRAJECTORY_TYPE 生成 A、A→B 或 A→B→C 的统一路径。
+    根据 config.TRAJECTORY_TYPE 把 A/B/C 点组装成一条轨迹清单。
 
-    初学者理解方式：
-    - static：只需要 A 点，用于静止记录；
-    - line：从 A 到 B；
-    - l_shape：从 A 到 B 再到 C，中间 B 点可以带 blend 半径。
+    输入：
+    - TRAJECTORY_TYPE 决定使用 static、line 还是 l_shape；
+    - POINT_A/B/C 提供末端位姿；
+    - 速度、加速度和交融半径来自 config.py。
 
-    这里还没有连接机器人，只是在内存里组装“将来可能要走的路径清单”。
+    输出：
+    - list[Waypoint]，供 dry-run、robot_test 或 experiment 后续检查/执行。
+
+    实验作用：
+    - static 只返回 A 点，用于静止记录；
+    - line 返回 A→B，用于直线运动工况；
+    - l_shape 返回 A→B→C，B 点可带 blend 半径，用于转弯工况。
+    这里还没有连接机器人，只是在内存里生成“将来可能要走的路径清单”。
     """
 
-    # A 点永远是轨迹起点。真机模式下程序要求机器人已经人工放到 A 附近，
-    # 因此后面执行运动时不会再盲目发送“回到 A”的命令。
+    # 本段创建起点 A。输入是 config.POINT_A；输出是轨迹清单中的第一个 Waypoint。
+    # 真机模式要求操作者已经把 TCP 放到 A 附近，后续不会自动发送“回到 A”的盲目运动。
     point_a = Waypoint(
         "A",
         list(config.POINT_A),
@@ -87,10 +94,12 @@ def build_trajectory() -> list[Waypoint]:
         0.0,
     )
 
-    # static 模式没有后续运动点，只有起点。
+    # 本段处理静止工况。输出只有 A 点，表示机器人不执行后续位移，只配合记录静止数据。
     if config.TRAJECTORY_TYPE == "static":
         return [point_a]
 
+    # 本段创建 B 点。line 工况中 B 是终点；l_shape 工况中 B 是中间转弯点。
+    # 只有 l_shape 才给 B 点使用 blend 半径，让轨迹更接近圆滑过渡。
     point_b = Waypoint(
         "B",
         list(config.POINT_B),
@@ -98,10 +107,11 @@ def build_trajectory() -> list[Waypoint]:
         config.LINEAR_ACCELERATION_M_S2,
         config.BLEND_RADIUS_M if config.TRAJECTORY_TYPE == "l_shape" else 0.0,
     )
-    # line 模式只需要 A 和 B。
+    # 本段处理直线工况。输出 A→B，适合匀速直线段的振动预实验。
     if config.TRAJECTORY_TYPE == "line":
         return [point_a, point_b]
 
+    # 本段创建 C 点。C 是 L 形轨迹终点，终点 blend 必须为 0，避免机器人不精确到达终点。
     point_c = Waypoint(
         "C",
         list(config.POINT_C),
@@ -117,27 +127,31 @@ def build_trajectory() -> list[Waypoint]:
 
 def _position(pose: list[float]) -> np.ndarray:
     """
-    从 6 维 UR 位姿中取出前三个位置坐标。
+    从 UR 的 6 维 TCP 位姿中取出 xyz 位置。
 
-    UR 位姿格式是 [x, y, z, rx, ry, rz]：
-    - x/y/z 决定 TCP 在空间中的位置；
-    - rx/ry/rz 决定 TCP 姿态。
-    计算线段长度时只需要位置，不需要姿态。
+    输入：pose = [x, y, z, rx, ry, rz]。
+    输出：NumPy 向量 [x, y, z]。
+
+    实验作用：轨迹长度、工作区范围、起点误差这些检查只关心末端位置，
+    不在这里处理姿态 rx/ry/rz。
     """
 
-    # np.asarray 让后续可以直接做向量减法和范数计算。
+    # 本段把普通列表变成 NumPy 向量，方便后续做相减和求长度。
     return np.asarray(pose[:3], dtype=float)
 
 
 def _segment_length(start: Waypoint, end: Waypoint) -> float:
     """
-    计算相邻 TCP 点的直线距离，单位 m。
+    计算相邻两个 TCP 路径点之间的直线距离。
 
-    这不是机器人真实关节运动长度，只是 TCP 在笛卡尔空间中的直线距离。
-    用它可以快速发现点位是否离得离谱。
+    输入：相邻的 Waypoint，例如 A 和 B。
+    输出：TCP 在笛卡尔空间中的距离，单位 m。
+
+    实验作用：这不是机器人关节真实运动长度，但可以快速发现点位是否离得离谱，
+    例如单位写错、示教坐标抄错或 A/B/C 相距过远。
     """
 
-    # 两个位置向量相减得到位移向量，np.linalg.norm 计算它的长度。
+    # 本段做几何距离计算。输入是两个 xyz；输出是位移向量的模长。
     return float(np.linalg.norm(_position(end.pose) - _position(start.pose)))
 
 
@@ -147,24 +161,31 @@ def validate_trajectory(
     for_real_robot: bool,
 ) -> list[str]:
     """
-    检查格式、工作区、线段长度和交融半径，返回便于展示的说明列表。
+    对一条轨迹做启动前的纯软件安全检查。
 
-    软件检查只能发现数字层面的风险，无法看见桌子、夹具、电缆和人员。
+    输入：
+    - trajectory：build_trajectory() 生成的 Waypoint 清单；
+    - for_real_robot：这次检查是否准备进入真机流程。
 
-    参数 for_real_robot 的意义：
-    - False：用于 dry-run，只检查数值是否合理；
-    - True：用于真机模式，还会要求 ROBOT_POSES_CONFIRMED=True。
+    输出：
+    - 检查通过时返回 messages，供终端和 dry-run 报告展示；
+    - 发现格式、工作区、线段长度、交融半径或真机确认问题时抛错。
+
+    实验作用：
+    - dry-run 时用于帮你发现轨迹数字是否明显不合理；
+    - 真机前用于拦住未确认点位或明显危险配置。
+    它仍然看不见桌子、夹具、电缆和人员，所以不能替代现场安全确认。
     """
 
     if not trajectory:
         raise ValueError("轨迹不能为空。")
 
-    # messages 不是给算法用的，而是给终端和报告看的“检查说明”。
+    # 本段准备检查结果说明。它不是给机器人用的，而是给终端和报告中人读的。
     messages: list[str] = []
     axes = ("x", "y", "z")
 
-    # 第一轮：逐个点检查。
-    # 这里主要确认每个 Waypoint 本身没有明显错误。
+    # 本段逐个检查路径点本身。
+    # 输入：每个 Waypoint；输出：确认 pose、速度、加速度、blend 和 xyz 工作区都基本合理。
     for waypoint in trajectory:
         if len(waypoint.pose) != 6:
             raise ValueError(f"{waypoint.name} 点位姿不是 6 个数。")
@@ -178,8 +199,8 @@ def validate_trajectory(
         if waypoint.blend_radius_m < 0:
             raise ValueError(f"{waypoint.name} 点的交融半径不能为负数。")
 
-        # 只检查 TCP 的 xyz 是否在软件工作区内。
-        # 姿态 rx/ry/rz 不在这里用范围限制，因为不同工具姿态差异很大。
+        # 本段只检查 TCP 的 xyz 是否在软件工作区内。
+        # 姿态 rx/ry/rz 不在这里设统一范围，因为不同末端工具和安装方式差异很大。
         for axis_index, axis_name in enumerate(axes):
             lower, upper = config.WORKSPACE_LIMITS_M[axis_name]
             value = waypoint.pose[axis_index]
@@ -196,8 +217,9 @@ def validate_trajectory(
             f"blend={waypoint.blend_radius_m:.4f} m"
         )
 
-    # 第二轮：检查相邻点之间的线段。
-    # 两个点单独看都在工作区内，不代表它们之间的连线长度合理。
+    # 本段检查相邻点之间的路径段。
+    # 输入：A→B、B→C 等相邻点对；输出：每段长度，或在线段过短/过长时停止。
+    # 实验作用：两个点单独都在工作区内，不代表它们之间的距离适合当前预实验。
     lengths: list[float] = []
     for start, end in zip(trajectory[:-1], trajectory[1:]):
         length = _segment_length(start, end)
@@ -212,11 +234,14 @@ def validate_trajectory(
             )
         messages.append(f"{start.name}→{end.name}: 线段长度 {length:.4f} m")
 
-    # 只有内部路径点才允许使用 blend；终点设置 blend 会让机器人可能不到达指定终点。
+    # 本段检查终点是否被错误设置了 blend。
+    # 实验作用：终点带 blend 时机器人可能不会精确到达最后指定点，所以这里直接禁止。
     if trajectory[-1].blend_radius_m != 0:
         raise ValueError("最后一个轨迹点的 blend_radius_m 必须为 0。")
 
-    # blend 半径不能大到超过相邻线段的一半，否则圆滑过渡可能吞掉整段路径。
+    # 本段检查中间点的交融半径是否过大。
+    # 输入：中间点 blend 和前后两段长度；输出：允许圆滑过渡或拒绝过大的 blend。
+    # 实验作用：blend 太大可能吞掉整段路径，让实际轨迹偏离你以为的 A→B→C。
     for index in range(1, len(trajectory) - 1):
         radius = trajectory[index].blend_radius_m
         allowed = 0.5 * min(lengths[index - 1], lengths[index])
@@ -226,8 +251,9 @@ def validate_trajectory(
                 f"根据相邻线段，本程序要求小于 {allowed:.4f} m。"
             )
 
-    # 最后一关：只有真机模式才要求人为确认点位。
-    # dry-run 允许使用示例点，因为它不会发送给机器人。
+    # 本段只在真机流程中启用。
+    # 输入：for_real_robot 和 ROBOT_POSES_CONFIRMED；输出：允许真机继续或拒绝示例点位。
+    # 实验作用：dry-run 可以用示例点学习流程，但真机绝不能用未确认点位。
     if for_real_robot and not config.ROBOT_POSES_CONFIRMED:
         raise PermissionError(
             "ROBOT_POSES_CONFIRMED=False。示例位姿只能用于 dry_run；"
@@ -238,52 +264,56 @@ def validate_trajectory(
 
 
 # =============================================================================
-# 2. 轨迹时间估计和 dry-run 输出
+# 2. 轨迹时间估计和 dry-run 输出：把轨迹变成可人工检查的报告
 # =============================================================================
 
 def _trapezoid_time(distance: float, speed: float, acceleration: float) -> float:
     """
-    用一维梯形/三角速度曲线粗估单段运动时间。
+    粗略估计一段直线运动需要多久。
 
-    UR 控制器会考虑姿态、交融和内部限制，所以该结果只用于发现数量级错误，不是精确预测。
+    输入：线段长度、目标速度、加速度。
+    输出：一维梯形/三角速度模型下的估计时间，单位 s。
+
+    实验作用：dry-run 报告用它检查运动时长数量级是否合理。
+    UR 控制器实际还会考虑姿态、交融、关节限制和内部规划，所以这个结果不是精确预测。
     """
 
-    # 若能加速到目标速度，acceleration_time 是从 0 加速到 speed 需要的时间。
+    # 本段计算达到目标速度前需要的时间和距离。
+    # 后面用它判断本段运动是否有足够距离进入匀速阶段。
     acceleration_time = speed / acceleration
-
-    # acceleration_distance 是加速阶段走过的距离。
     acceleration_distance = 0.5 * acceleration * acceleration_time**2
 
-    # 如果加速距离的两倍已经超过总距离，说明还没来得及达到目标速度就要减速。
-    # 这种情况是“三角速度曲线”。
+    # 本段处理短距离运动。输出是“三角速度曲线”时间：加速后立刻减速，没有匀速段。
     if 2.0 * acceleration_distance >= distance:
         return 2.0 * math.sqrt(distance / acceleration)
 
-    # 否则就是“加速 -> 匀速 -> 减速”的梯形速度曲线。
+    # 本段处理较长距离运动。输出是“加速 -> 匀速 -> 减速”的梯形速度曲线时间。
     cruise_distance = distance - 2.0 * acceleration_distance
     return 2.0 * acceleration_time + cruise_distance / speed
 
 
 def estimate_trajectory(trajectory: list[Waypoint]) -> dict[str, Any]:
     """
-    汇总每段长度、粗略时间、总长度和包围盒，供 dry-run 报告使用。
+    把轨迹清单转换成 dry-run 报告中的统计信息。
 
-    返回的是普通 dict，方便直接写入 JSON。
-    这些信息用于人检查轨迹数量级，而不是给机器人控制器执行。
+    输入：Waypoint 清单。
+    输出：普通 dict，包含每段长度、粗略时间、总长度、总时长和 xyz 包围盒。
+
+    实验作用：这些信息服务“人检查轨迹数量级”，不是给机器人控制器执行。
+    你可以通过总长度、时间和 xyz_min/max 快速判断点位是否落在预期实验区域。
     """
 
     segments: list[dict[str, Any]] = []
 
-    # 遍历相邻点对，例如 A->B、B->C。
+    # 本段逐段估算路径。输入是相邻点对；输出是 segments 中的一条段信息。
     for start, end in zip(trajectory[:-1], trajectory[1:]):
-        # 每一段都单独估计距离和运动时间。
         distance = _segment_length(start, end)
         duration = _trapezoid_time(
             distance,
             end.speed_m_s,
             end.acceleration_m_s2,
         )
-        # 把本段信息保存成字典，后面会写入 trajectory_report.json。
+        # 本段把一段运动整理成 JSON 友好的字段，后面直接写入 trajectory_report.json。
         segments.append(
             {
                 "from": start.name,
@@ -296,11 +326,10 @@ def estimate_trajectory(trajectory: list[Waypoint]) -> dict[str, Any]:
             }
         )
 
-    # positions 是所有点的 xyz，用来计算整条路径的空间范围。
+    # 本段取出所有路径点位置，用于计算整条轨迹覆盖的 xyz 范围。
     positions = np.asarray([waypoint.pose[:3] for waypoint in trajectory], dtype=float)
 
-    # 总长度和总时间只是把每段加起来。
-    # xyz_min/max 可帮助你检查轨迹是否落在预期工作区附近。
+    # 本段输出整条轨迹的汇总。它是 dry-run 的“检查摘要”，不是运动命令。
     return {
         "trajectory_type": config.TRAJECTORY_TYPE,
         "for_real_robot": False,
@@ -317,25 +346,26 @@ def estimate_trajectory(trajectory: list[Waypoint]) -> dict[str, Any]:
 
 def _plot_trajectory(trajectory: list[Waypoint], output_path: Path) -> None:
     """
-    生成三维路径示意图；图只展示数值关系，不代表机械臂连杆或现场障碍物。
+    把 dry-run 轨迹画成三维 TCP 路径示意图。
 
-    注意：
-    - 图里的线是 TCP 轨迹，不是机械臂各关节的实际形状；
-    - 图里没有桌子、夹具、电缆；
-    - 所以这张图只能帮助理解路径，不能作为真机安全依据。
+    输入：Waypoint 清单和 PNG 输出路径。
+    输出：trajectory_3d.png。
+
+    实验作用：帮助你直观看出 A/B/C 的相对位置和路径方向。
+    图里的线只是 TCP 轨迹，不是机械臂连杆，也不包含桌面、夹具、电缆，因此不能作为真机安全依据。
     """
 
-    # matplotlib 只在需要画图时导入，避免普通轨迹计算加载绘图库。
+    # 本段只在真正需要画图时加载 matplotlib，避免普通轨迹计算被绘图库依赖拖住。
     import matplotlib
 
-    # Agg 后端不需要桌面窗口，适合在脚本里直接保存 PNG。
+    # Agg 后端不需要桌面窗口，适合脚本直接保存 PNG。
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # 取出所有路径点的 xyz 坐标。
+    # 本段把 Waypoint 转成三维坐标数组，供 matplotlib 画线和标点。
     positions = np.asarray([waypoint.pose[:3] for waypoint in trajectory], dtype=float)
 
-    # 创建 3D 图，并把 A/B/C 点连成折线。
+    # 本段创建图像并画出 TCP 折线路径。
     figure = plt.figure(figsize=(8, 6))
     axes = figure.add_subplot(111, projection="3d")
 
@@ -346,7 +376,7 @@ def _plot_trajectory(trajectory: list[Waypoint], output_path: Path) -> None:
         marker="o",
         linewidth=2,
     )
-    # 在每个点旁边写上名称，方便看出路径方向。
+    # 本段在每个路径点旁标注 A/B/C，帮助人检查路径方向。
     for waypoint, position in zip(trajectory, positions):
         axes.text(position[0], position[1], position[2], f" {waypoint.name}")
 
@@ -355,42 +385,41 @@ def _plot_trajectory(trajectory: list[Waypoint], output_path: Path) -> None:
     axes.set_zlabel("Z / m")
     axes.set_title("TCP dry-run trajectory")
     axes.grid(True)
-    # tight_layout 尽量避免坐标轴标签被裁掉。
+    # 本段调整布局，尽量避免坐标轴标签被裁掉。
     figure.tight_layout()
 
-    # 保存 PNG 后关闭 figure，避免多次运行时占用内存。
+    # 本段输出 PNG 并释放绘图对象，避免多次运行时占用内存。
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
 
 
 def run_robot_dry_run() -> Path:
     """
-    完全不导入 ur_rtde 的轨迹检查入口。
+    用户选择 robot_dry_run 后进入这里。
 
-    你可以先用它验证 A/B/C 数据格式、线段长度和交融半径，再讨论真机连接。
+    输入：config.py 中的轨迹类型、A/B/C 点、速度、加速度、工作区限制。
+    输出：robot_dry_run_时间戳 文件夹，其中包含 trajectory_report.json 和 trajectory_3d.png。
 
-    这个函数适合初学者反复运行，因为它只做三件事：
-    1. 按 config.py 生成轨迹；
-    2. 做纯软件检查；
-    3. 保存 JSON 报告和 PNG 示意图。
+    实验作用：这是最安全的机器人相关入口。
+    它只在软件里生成轨迹、检查数值、保存报告，不导入 ur_rtde，不连接 UR，不可能发送运动命令。
     """
 
-    # 第一步：根据 TRAJECTORY_TYPE 和 POINT_A/B/C 生成路径。
+    # 本段把配置参数变成轨迹清单。输入是 TRAJECTORY_TYPE 和 A/B/C；输出是 Waypoint 列表。
     trajectory = build_trajectory()
 
-    # 第二步：检查路径数字是否合理。
-    # for_real_robot=False 表示允许示例点用于软件演示，但仍检查格式、长度和工作区。
+    # 本段做 dry-run 级别检查。for_real_robot=False 表示允许示例点用于软件演示，
+    # 但仍检查格式、线段长度、工作区和 blend 是否明显不合理。
     messages = validate_trajectory(trajectory, for_real_robot=False)
 
-    # 第三步：计算每段距离、粗略时间、包围盒等报告字段。
+    # 本段生成给人检查的轨迹统计摘要。
     estimate = estimate_trajectory(trajectory)
 
-    # 第四步：为本次 dry-run 创建独立输出目录。
+    # 本段创建本次 dry-run 的输出目录，避免覆盖旧报告。
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = config.OUTPUT_ROOT / f"robot_dry_run_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 第五步：组装要写入 JSON 的报告内容。
+    # 本段组装 JSON 报告。输入是轨迹、检查说明和估计摘要；输出是完整 dry-run 记录。
     report = {
         "kind": "ROBOT_DRY_RUN",
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -403,17 +432,17 @@ def run_robot_dry_run() -> Path:
         "estimate": estimate,
     }
 
-    # 第六步：保存机器可读的 JSON 报告。
+    # 本段保存机器和人都能读的 JSON 报告。
     report_path = output_dir / "trajectory_report.json"
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    # 第七步：保存人眼更容易理解的三维轨迹示意图。
+    # 本段保存人眼更容易理解的三维轨迹示意图。
     _plot_trajectory(trajectory, output_dir / "trajectory_3d.png")
 
-    # 第八步：在终端打印摘要，方便你不打开文件也能看到检查结果。
+    # 本段在终端打印摘要，方便不打开文件也能确认这次 dry-run 的关键结果。
     print("[轨迹 dry-run] 数值检查通过，但这不等于真机安全检查通过。")
     for message in messages:
         print(f"  - {message}")
@@ -426,49 +455,55 @@ def run_robot_dry_run() -> Path:
 
 
 # =============================================================================
-# 3. UR Dashboard 只读信息：判断 CB3 / e-Series 控制器代际
+# 3. UR Dashboard 只读信息：连接控制器文本接口，但只查询状态
 # =============================================================================
 
 def _read_socket_line(connection: socket.socket) -> str:
     """
-    从 Dashboard socket 读取一行文本。
+    从 UR Dashboard socket 读取一行文本回复。
 
-    Dashboard 协议是很朴素的文本协议：发一行命令，收一行回复。
-    这里不解析运动，只读取状态类文本。
+    输入：已经连接到 29999 端口的 socket。
+    输出：去掉换行后的字符串。
+
+    实验作用：Dashboard 协议是“发一行命令，收一行回复”的文本协议。
+    这里仅服务版本和状态读取，不解析也不发送运动命令。
     """
 
-    # bytearray 适合一点一点追加网络收到的 bytes。
+    # 本段准备接收缓冲区。socket 收到的是 bytes，后面才解码成字符串。
     chunks = bytearray()
 
-    # 最多读 8192 字节，防止异常连接一直发送内容导致内存增长。
+    # 本段持续读取，直到遇到换行、连接关闭或达到最大长度。
+    # 8192 字节是保护上限，避免异常连接持续发送内容导致内存增长。
     while len(chunks) < 8192:
-        # recv(1024) 表示这次最多收 1024 字节。
         data = connection.recv(1024)
 
-        # 收到空 bytes 通常表示连接被对方关闭。
+        # 空 bytes 通常表示连接被对方关闭。
         if not data:
             break
 
-        # 把本次收到的数据追加到总缓冲区。
+        # 本段把本次收到的数据追加到总缓冲区。
         chunks.extend(data)
 
         # Dashboard 正常回复以换行结束，看到换行就可以停止读取。
         if b"\n" in data:
             break
 
-    # UR 返回的是字节，decode 后才是 Python 字符串。
-    # errors="replace" 表示遇到异常字符时用替代字符，不让程序直接崩溃。
+    # 本段把 UR 返回的字节转换成 Python 字符串；异常字符用替代符，避免读取状态时直接崩溃。
     return chunks.decode("utf-8", errors="replace").strip()
 
 
 def read_dashboard_information() -> dict[str, str]:
     """
-    通过 UR 的 29999 Dashboard 端口读取软件版本、机器人模式和安全状态。
+    通过 UR Dashboard 端口读取控制器版本和状态。
 
-    这一步不发送运动命令；若端口不可用，后续仍可尝试 RTDE，但代际会标为 unknown。
+    输入：config.ROBOT_HOST、ROBOT_DASHBOARD_PORT、连接超时。
+    输出：包含 greeting、Polyscope 版本、机器人模式、安全状态和控制器代际的 dict。
+
+    实验作用：在 robot_test 或 experiment 开始前确认连到的是预期 UR 控制器。
+    这一步只发只读状态查询，不发送运动命令；若端口不可用，RTDE 后续仍可尝试连接。
     """
 
-    # 先准备默认字段。即使后面某些读取失败，返回字典结构也尽量稳定。
+    # 本段准备默认返回结构。即使某些读取失败，日志里的 dashboard 字段也尽量稳定。
     information = {
         "greeting": "",
         "polyscope_version": "",
@@ -477,33 +512,29 @@ def read_dashboard_information() -> dict[str, str]:
         "controller_generation": "unknown",
     }
 
-    # Dashboard 默认端口是 29999。
-    # create_connection 只建立 TCP 连接，不会让机器人运动。
+    # 本段建立 Dashboard 文本连接。输入是 ROBOT_HOST 和端口；输出是可收发文本命令的 socket。
     with socket.create_connection(
         (config.ROBOT_HOST, int(config.ROBOT_DASHBOARD_PORT)),
         timeout=float(config.ROBOT_CONNECT_TIMEOUT_S),
     ) as connection:
-        # 给读写都设置超时，避免网线/IP 错误时程序一直卡住。
+        # 本段设置读写超时，避免网线/IP 错误时程序一直卡住。
         connection.settimeout(float(config.ROBOT_CONNECT_TIMEOUT_S))
 
-        # 连接成功后，Dashboard 会先发一行 greeting。
+        # 本段读取连接后控制器主动发来的 greeting。
         information["greeting"] = _read_socket_line(connection)
 
-        # 这些命令都是只读状态查询。
-        # key 是我们保存到字典里的名字，command 是发给 UR Dashboard 的文本。
+        # 本段定义只读状态查询命令。key 是保存字段名，command 是发给 Dashboard 的文本。
         commands = {
             "polyscope_version": "PolyscopeVersion",
             "robot_mode": "robotmode",
             "safety_status": "safetystatus",
         }
         for key, command in commands.items():
-            # Dashboard 命令需要以换行结尾。
+            # 本段发送一条只读命令，并读取一行回复。
             connection.sendall((command + "\n").encode("ascii"))
-
-            # 每发一个命令，就读回一行回复。
             information[key] = _read_socket_line(connection)
 
-    # 从 PolyscopeVersion 文本中提取主版本号，用来粗略判断控制器代际。
+    # 本段从 PolyscopeVersion 文本中提取主版本号，用于粗略判断 CB3 或 e/UR 系列。
     version_text = information["polyscope_version"]
     match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version_text)
     if match:
@@ -519,14 +550,24 @@ def read_dashboard_information() -> dict[str, str]:
 
 
 # =============================================================================
-# 4. ur_rtde 适配器
+# 4. ur_rtde 适配器：把第三方库包装成项目内部固定的机器人接口
 # =============================================================================
 
 class URRobot:
     """
-    把第三方 ur_rtde 的字段名封装成项目内部固定接口。
+    项目内部和 UR 真机通信的统一包装类。
 
-    以后若更换通信库，主要改这个类；轨迹生成、主程序和分析文件不需要知道底层差异。
+    输入：
+    - config.py 中的 ROBOT_HOST、RTDE 频率和安全参数；
+    - 上游生成并检查过的 Waypoint 轨迹。
+
+    输出：
+    - read_state() 返回可写入 JSON 的机器人状态；
+    - execute_trajectory() 把轨迹提交给 UR 控制器；
+    - stop_motion()/disconnect() 负责异常或正常收尾。
+
+    实验作用：把第三方 ur_rtde 的字段名和连接细节集中在一个类里。
+    以后若更换通信库，主要改这里；轨迹生成、主程序和分析文件不需要知道底层差异。
     """
 
     def __init__(self) -> None:
@@ -537,14 +578,23 @@ class URRobot:
 
     def connect(self, *, require_control: bool) -> None:
         """
-        先尝试读取 Dashboard，再按需要创建 RTDE Receive 和 Control 连接。
+        建立机器人通信连接，并按需要决定是否创建运动控制接口。
 
-        require_control=False 时只建立“读取状态”的连接，用于更安全的 robot_test。
-        require_control=True 时才建立“发送控制命令”的连接，后续才可能执行 moveL。
+        输入：
+        - require_control=False：只建立 RTDE Receive，用于读取状态；
+        - require_control=True：额外建立 RTDE Control，后续才可能发送 moveL。
+
+        输出：
+        - self.dashboard_info 保存 Dashboard 状态；
+        - self.receive 保存只读状态接口；
+        - self.control 在需要运动控制时保存控制接口。
+
+        实验作用：把“只读连接”和“可运动连接”分开。robot_test 默认只读；
+        experiment 和显式允许的 robot_test 才会创建 control 接口。
         """
 
         try:
-            # Dashboard 是 UR 控制器的文本接口，可读取版本、安全状态等信息。
+            # 本段先读取 Dashboard 状态。输入是 UR 的文本接口；输出是控制器版本和安全状态信息。
             # 这一步失败不一定代表 RTDE 失败，所以这里只记录警告并继续尝试 RTDE。
             self.dashboard_info = read_dashboard_information()
         except Exception as exc:
@@ -554,7 +604,8 @@ class URRobot:
             }
             print(f"[机器人警告] Dashboard 信息读取失败：{exc}")
 
-        # 导入放在函数内，确保 robot_dry_run 不会因为未安装 ur_rtde 而启动失败。
+        # 本段在真机连接时才导入 rtde_receive。
+        # 实验作用：robot_dry_run 不会因为未安装 ur_rtde 而启动失败。
         try:
             import rtde_receive
         except ImportError as exc:
@@ -563,14 +614,15 @@ class URRobot:
                 "或先切换到 robot_dry_run。"
             ) from exc
 
-        # Receive 接口只读机器人状态，例如关节角、TCP 位姿、速度。
+        # 本段建立只读状态接口。输出的 receive 只能读取关节角、TCP 位姿、速度等状态。
         self.receive = rtde_receive.RTDEReceiveInterface(
             config.ROBOT_HOST,
             float(config.ROBOT_RTDE_FREQUENCY),
         )
 
         if require_control:
-            # Control 接口能发送运动命令，所以只有真机运动确实需要时才创建。
+            # 本段只有 require_control=True 时执行。
+            # Control 接口能够发送运动命令，所以只有真机运动确实需要时才创建。
             try:
                 import rtde_control
             except ImportError as exc:
@@ -588,7 +640,15 @@ class URRobot:
         method_name: str,
         default: Any,
     ) -> Any:
-        """不同 ur_rtde 版本偶尔缺少次要状态字段；缺失时记录 None，不伪造数据。"""
+        """
+        安全读取不同 ur_rtde 版本中可能存在差异的状态字段。
+
+        输入：目标对象、方法名和默认值。
+        输出：方法调用结果；方法不存在或调用失败时返回默认值。
+
+        实验作用：关节角、TCP 位姿这些核心字段必须成功读取；
+        但某些次要状态字段在不同 ur_rtde 版本中可能不存在，缺失时记录 None，而不是伪造数据。
+        """
 
         method = getattr(target, method_name, None)
         if method is None:
@@ -600,20 +660,21 @@ class URRobot:
 
     def read_state(self) -> dict[str, Any]:
         """
-        读取一条可序列化的 UR 状态，所有列表都转为普通 float。
+        读取一条机器人状态，并整理成可写入 JSON 的普通字典。
 
-        为什么要“可序列化”：
-        实验日志是一行一条 JSON，NumPy 数组或某些库对象不能直接写进 JSON，
-        所以这里把它们提前变成 list[float]、float、None 这些普通类型。
+        输入：RTDE Receive 当前读取到的机器人状态。
+        输出：kind="ROBOT" 的 dict，包含主机时间戳、机器人时间戳、关节角、TCP 位姿、TCP 速度等。
+
+        实验作用：完整实验中 robot_worker 会按 ROBOT_RECORD_HZ 反复调用它，
+        把机器人状态和视觉帧写入同一个 run_log.txt，供后续对时和振动分析使用。
+        这里会把 NumPy 数组或库对象转换成 list[float]、float、None 等 JSON 友好类型。
         """
 
         if self.receive is None:
             raise RuntimeError("尚未连接 RTDE Receive。")
 
-        # 这三个是最核心的机器人状态：
-        # actual_q：6 个关节角；
-        # tcp_pose：末端 TCP 的 [x,y,z,rx,ry,rz]；
-        # tcp_speed：末端当前速度。
+        # 本段读取最核心的机器人状态。
+        # actual_q 是 6 个关节角；tcp_pose 是末端位姿；tcp_speed 是末端当前速度。
         actual_q = self.receive.getActualQ()
         tcp_pose = self.receive.getActualTCPPose()
         tcp_speed = self.receive.getActualTCPSpeed()
@@ -649,16 +710,20 @@ class URRobot:
 
     def verify_controller_safety_limits(self, trajectory: list[Waypoint]) -> None:
         """
-        调用 UR 控制器自身的逆解与安全限制检查。
+        让 UR 控制器自己判断每个目标位姿是否在安全限制内。
 
-        这比软件 xyz 包围盒更强，但仍不能识别环境中的桌子或夹具。
+        输入：即将执行的 Waypoint 轨迹。
+        输出：全部点通过时无返回值；任一点不可达或超限制时抛错。
+
+        实验作用：这是软件 xyz 工作区之外的第二层检查。
+        它更接近控制器真实判断，但仍不能识别桌面、夹具、电缆和人员。
         """
 
         if self.control is None:
             raise RuntimeError("控制连接未建立，无法调用控制器安全检查。")
 
-        # UR 控制器自己知道当前安全平面、关节限制和可达性。
-        # 这个检查比我们自己写的 xyz 范围更接近真实控制器判断。
+        # 本段取出 ur_rtde 提供的控制器安全检查方法。
+        # 如果当前库版本没有这个方法，为了安全，不允许跳过后继续运动。
         checker = getattr(self.control, "isPoseWithinSafetyLimits", None)
         if checker is None:
             raise RuntimeError(
@@ -666,6 +731,7 @@ class URRobot:
                 "为了安全，程序不允许跳过该检查后运动。"
             )
 
+        # 本段逐点询问控制器。输入是每个 Waypoint 的 pose；输出是控制器层面的通过/拒绝。
         for waypoint in trajectory:
             if not bool(checker(waypoint.pose)):
                 raise RuntimeError(
@@ -673,7 +739,14 @@ class URRobot:
                 )
 
     def current_tcp_pose(self) -> list[float]:
-        """只读取当前 TCP 位姿，不引发运动。"""
+        """
+        读取当前 TCP 位姿。
+
+        输入：RTDE Receive 当前状态。
+        输出：[x, y, z, rx, ry, rz]。
+
+        实验作用：用于起点检查，只读状态，不引发任何运动。
+        """
 
         if self.receive is None:
             raise RuntimeError("尚未连接 RTDE Receive。")
@@ -681,11 +754,16 @@ class URRobot:
 
     def verify_at_start(self, start_pose: list[float]) -> None:
         """
-        要求操作者已经用示教器把 TCP 放到 A 点附近。
+        确认机器人当前 TCP 已经在轨迹起点附近。
 
+        输入：轨迹起点 pose，通常是 POINT_A。
+        输出：足够接近时无返回值；距离超过 START_POSE_TOLERANCE_M 时抛错。
+
+        实验作用：要求操作者先用示教器把 TCP 放到 A 点附近。
         程序不会为了“自动回起点”而先执行一段未经观察的运动。
         """
 
+        # 本段比较当前 TCP 和目标起点的 xyz 距离。姿态不在这里做距离范数比较。
         current = np.asarray(self.current_tcp_pose()[:3], dtype=float)
         target = np.asarray(start_pose[:3], dtype=float)
         error = float(np.linalg.norm(current - target))
@@ -699,8 +777,12 @@ class URRobot:
 
     def execute_trajectory(self, trajectory: list[Waypoint]) -> None:
         """
-        一次提交完整 moveL 路径，让 UR 控制器按自身周期插补。
+        把已检查通过的轨迹提交给 UR 控制器执行。
 
+        输入：Waypoint 清单，第一项应是人工确认过的起点 A。
+        输出：UR 控制器接受异步 moveL 路径；函数返回后运动可能仍在继续。
+
+        实验作用：一次提交完整 moveL 路径，让 UR 控制器按自身周期插补。
         因此相机 132 fps 与 RTDE 125/500 Hz 不需要逐帧互相“对齐发送”，只需共享时间戳。
         """
 
@@ -710,10 +792,9 @@ class URRobot:
         if len(trajectory) <= 1:
             return
 
+        # 本段把内部 Waypoint 转成 ur_rtde 的 moveL path 格式。
         # 第一项 A 是已经人工到达的起点；真正发送的是后续 B/C，避免重复命令 A。
-        # ur_rtde 的 moveL path 格式是：
-        # [x, y, z, rx, ry, rz, speed, acceleration, blend]
-        # 所以这里把 Waypoint 拆成第三方库需要的列表。
+        # 单个 path 点格式：[x, y, z, rx, ry, rz, speed, acceleration, blend]。
         path: list[list[float]] = []
         for waypoint in trajectory[1:]:
             path.append(
@@ -725,15 +806,23 @@ class URRobot:
                 ]
             )
 
-        # 第二个参数 True 表示异步执行：
-        # 命令发出后 Python 不会卡在 moveL 里，而是由 motion_in_progress() 轮询完成状态。
+        # 本段提交异步 moveL。
+        # 第二个参数 True 表示命令发出后 Python 不会卡在 moveL 里，
+        # 后续由 motion_in_progress() 轮询完成状态，同时还能继续读取机器人状态。
         accepted = bool(self.control.moveL(path, True))
         if not accepted:
             raise RuntimeError("UR 控制器拒绝了异步 moveL 路径。")
         self.motion_command_time = time.perf_counter()
 
     def motion_in_progress(self) -> bool:
-        """异步操作进度大于等于 0 表示仍在执行，-1 通常表示当前无异步操作。"""
+        """
+        判断异步 moveL 是否仍在执行。
+
+        输入：RTDE Control 的异步进度接口，必要时退回到 TCP 速度判断。
+        输出：True 表示运动仍在进行；False 表示当前没有异步运动。
+
+        实验作用：robot_worker 用它决定何时写入 motion_finished，并通知 main.py 进入后记录阶段。
+        """
 
         if self.control is None:
             return False
@@ -744,7 +833,8 @@ class URRobot:
             if progress >= 0:
                 return True
 
-            # 控制与接收接口存在极短同步间隙，刚提交后立即得到 -1 不应误判为已经完成。
+            # 本段处理刚提交命令后的短暂同步间隙。
+            # 刚提交后立刻得到 -1 不应误判为已经完成，否则 motion_finished 会过早写入。
             if (
                 self.motion_command_time is not None
                 and time.perf_counter() - self.motion_command_time < 0.20
@@ -752,12 +842,20 @@ class URRobot:
                 return True
             return False
 
-        # 极旧版本没有异步进度时，用 TCP 速度作保守退路；正式使用前应升级 ur_rtde。
+        # 本段是极旧 ur_rtde 版本的保守退路：没有异步进度接口时，用 TCP 速度判断是否仍在动。
+        # 正式使用前更建议升级 ur_rtde，让完成判断来自控制器异步状态。
         speed = np.asarray(self.receive.getActualTCPSpeed(), dtype=float)
         return float(np.linalg.norm(speed[:3])) > 1e-4
 
     def stop_motion(self) -> None:
-        """异常退出时使用受控 stopL，不发送新目标点。"""
+        """
+        异常退出时请求 UR 做受控停止。
+
+        输入：RTDE Control 当前连接。
+        输出：调用 stopL(1.0)，不发送新的目标位姿。
+
+        实验作用：发生超时、主程序停止或异常时，尽量用受控减速停止，而不是继续执行旧轨迹。
+        """
 
         if self.control is None:
             return
@@ -767,7 +865,14 @@ class URRobot:
             print(f"[机器人警告] stopL 调用失败：{exc}")
 
     def disconnect(self) -> None:
-        """先断开控制再断开接收，任一对象不存在时也可以安全调用。"""
+        """
+        断开机器人通信接口。
+
+        输入：当前可能存在的 control 和 receive 连接。
+        输出：接口 disconnect，并把对象引用清空。
+
+        实验作用：正常结束或异常退出时释放 RTDE 连接，避免下次运行被旧连接占用。
+        """
 
         for interface_name in ("control", "receive"):
             interface = getattr(self, interface_name)
@@ -780,102 +885,122 @@ class URRobot:
 
 
 # =============================================================================
-# 5. 真机前的人工确认
+# 5. 真机前的人工确认：程序层面的最后一道防误触
 # =============================================================================
 
 def require_operator_confirmation(purpose: str) -> None:
     """
-    在终端要求完整输入确认短语，避免误按一个回车就启动。
+    在真机动作前要求操作者输入完整确认短语。
 
-    这个确认不能替代示教器急停、防护区和现场风险评估，只是程序层最后一道防误触。
+    输入：
+    - purpose：这次确认对应的动作说明；
+    - config.OPERATOR_CONFIRM_TEXT：必须逐字输入的确认文本。
+
+    输出：
+    - 文本一致时函数正常返回；
+    - 文本不一致时抛出 PermissionError，取消本次运动。
+
+    实验作用：降低误按回车或误触发脚本导致真机运动的风险。
+    它不能替代示教器急停、防护区和现场风险评估，只是程序层最后一道防误触。
     """
 
-    # 如果配置里关闭了人工确认，就直接返回。
-    # 正式实验中建议保持开启。
+    # 本段允许配置关闭人工确认。正式实验中建议保持开启。
     if not config.REQUIRE_OPERATOR_CONFIRMATION:
         return
 
-    # 终端打印明确说明，让操作者知道接下来要做什么。
+    # 本段把即将发生的真机动作打印出来，让操作者知道自己正在确认什么。
     print()
     print(f"[安全确认] 即将进行：{purpose}")
     print("[安全确认] 请确认工作区无人、路径无夹具/桌面/线缆干涉，急停可立即触及。")
 
-    # 要求输入完整短语，而不是简单 y/n，降低误触风险。
+    # 本段要求输入完整短语，而不是简单 y/n，降低误触风险。
     typed = input(f"[安全确认] 请输入：{config.OPERATOR_CONFIRM_TEXT}\n> ").strip()
 
-    # 输入不完全一致就取消本次运动。
+    # 本段执行确认判断。输入不完全一致就取消本次运动。
     if typed != config.OPERATOR_CONFIRM_TEXT:
         raise PermissionError("确认文本不一致，本次运动已取消。")
 
 
 # =============================================================================
-# 6. robot_test：先读状态，默认绝不运动
+# 6. robot_test：用户单独验证 UR 连接，默认只读状态不运动
 # =============================================================================
 
 def run_robot_test() -> Path:
     """
-    单独验证 Dashboard、RTDE 版本识别和状态读取。
+    用户选择 robot_test 后进入这里。
 
-    ROBOT_TEST_ALLOW_MOTION=False 时不创建控制连接，更不会上传或执行运动脚本。
+    输入：
+    - 机器人 IP、RTDE 频率、A/B/C 点和 robot_test 安全开关；
+    - 当 ROBOT_TEST_ALLOW_MOTION=True 时，还需要点位确认和人工确认。
 
-    这个函数分两种情况：
-    - 默认 False：只连接读取接口，采样一小段状态并保存；
-    - 手动 True：在更多安全检查后执行 A->B 低速测试。
+    输出：
+    - robot_test_时间戳 文件夹；
+    - robot_test_log.txt，其中保存 META 和若干条 ROBOT 状态记录。
+
+    实验作用：
+    - 默认 False：只连接 Dashboard/RTDE Receive，读取关节角和 TCP 状态，不创建控制接口；
+    - 手动 True：在轨迹检查、控制器安全检查、起点检查和人工确认后，执行低速 A→B 测试。
     """
 
-    # 先按 config.py 生成轨迹。即使默认不运动，也要检查配置是否基本合理。
+    # 本段先把 config.py 中的 A/B/C 和 TRAJECTORY_TYPE 变成轨迹对象。
+    # 即使默认不运动，也要检查这些配置是否基本合理，避免日志里留下明显坏配置。
     trajectory = build_trajectory()
 
-    # 只有 ROBOT_TEST_ALLOW_MOTION=True 时，才按真机运动标准要求点位确认。
+    # 本段根据是否允许运动选择检查强度。
+    # False 时只做数值检查；True 时额外要求 ROBOT_POSES_CONFIRMED=True。
     validate_trajectory(
         trajectory,
         for_real_robot=bool(config.ROBOT_TEST_ALLOW_MOTION),
     )
 
-    # 每次 robot_test 也单独创建输出目录，避免覆盖旧状态记录。
+    # 本段创建本次 robot_test 的输出目录和日志路径，避免覆盖旧状态记录。
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = config.OUTPUT_ROOT / f"robot_test_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "robot_test_log.txt"
 
-    # URRobot 负责封装 Dashboard、RTDE Receive 和 RTDE Control。
+    # 本段创建机器人通信包装对象。真正连接在 robot.connect() 中发生。
     robot = URRobot()
     try:
-        # 默认只需要 receive 读取状态；只有允许运动时才创建 control。
+        # 本段建立连接。默认只创建 receive 读取状态；只有允许运动时才创建 control。
         robot.connect(require_control=bool(config.ROBOT_TEST_ALLOW_MOTION))
 
-        # 打印 Dashboard 信息，方便确认连到的是预期控制器。
+        # 本段把 Dashboard 信息打印出来，帮助确认连接到的是预期控制器。
         print(
             "[机器人] 控制器代际判断："
             f"{robot.dashboard_info.get('controller_generation', 'unknown')}"
         )
         print(f"[机器人] Dashboard：{robot.dashboard_info}")
 
-        # samples 保存若干条机器人状态，最后写入 robot_test_log.txt。
+        # 本段准备状态缓存。输入来自 robot.read_state()；输出最终写入 robot_test_log.txt。
         samples: list[dict[str, Any]] = []
 
-        # 采样时长借用 PRE_RECORD_SECONDS；采样频率由 ROBOT_RECORD_HZ 控制。
+        # 本段计算只读采样节奏。输出 sample_count 和 period，后续按 ROBOT_RECORD_HZ 读取状态。
         sample_count = max(1, int(config.PRE_RECORD_SECONDS * config.ROBOT_RECORD_HZ))
         period = 1.0 / config.ROBOT_RECORD_HZ
         next_time = time.perf_counter()
 
-        # 先读一段静止状态，不发送运动命令。
+        # 本段先读一段状态，不发送任何运动命令。
+        # 实验作用：确认 RTDE Receive 能稳定返回关节角、TCP 位姿和速度。
         for _ in range(sample_count):
             samples.append(robot.read_state())
             next_time += period
             time.sleep(max(0.0, next_time - time.perf_counter()))
 
-        # 终端只打印第一条，完整状态序列会写入日志。
+        # 本段只在终端打印第一条摘要；完整状态序列会在后面写入日志。
         first = samples[0]
         print(f"[机器人] 当前关节角 rad：{first['actual_q_rad']}")
         print(f"[机器人] 当前 TCP：{first['actual_tcp_pose']}")
 
-        # 只有显式打开 ROBOT_TEST_ALLOW_MOTION，才会进入下面的低速运动测试。
+        # 本段只有显式打开 ROBOT_TEST_ALLOW_MOTION 时才进入。
+        # 这是 robot_test 中唯一可能让真机运动的分支。
         if config.ROBOT_TEST_ALLOW_MOTION:
             if len(trajectory) < 2:
                 raise ValueError("robot_test 允许运动时，TRAJECTORY_TYPE 不能是 static。")
 
-            # 单机测试只保留 A→B，并强制改用更低的测试速度。
+            # 本段把完整轨迹缩减为 A→B 低速测试路径。
+            # 输入：原轨迹的 A/B 点；输出：使用 ROBOT_TEST_SPEED/ACCEL 的 test_path。
+            # 实验作用：robot_test 只验证最小运动闭环，不直接跑完整 experiment 轨迹。
             test_path = [
                 Waypoint(
                     "A",
@@ -892,19 +1017,20 @@ def run_robot_test() -> Path:
                     0.0,
                 ),
             ]
-            # 运动前再次对缩减后的 A->B 测试路径做检查。
+            # 本段再次检查缩减后的 A→B 测试路径，确保低速测试本身也满足真机条件。
             validate_trajectory(test_path, for_real_robot=True)
 
-            # 调用控制器自己的安全限制判断。
+            # 本段调用 UR 控制器自己的安全限制判断。
             robot.verify_controller_safety_limits(test_path)
 
-            # 要求当前 TCP 已经人工放在 A 点附近。
+            # 本段要求当前 TCP 已经人工放在 A 点附近，避免程序先盲目回起点。
             robot.verify_at_start(test_path[0].pose)
 
-            # 终端人工确认，防止误触发。
+            # 本段要求终端人工确认，防止误触发低速测试运动。
             require_operator_confirmation("UR10 A→B 低速单机测试")
 
-            # 发送异步 moveL 后，通过 motion_in_progress() 轮询直到完成或超时。
+            # 本段发送异步 moveL，并在运动期间持续读取状态。
+            # 输出：samples 中追加运动过程的机器人状态；超时时 stopL 并报错。
             robot.execute_trajectory(test_path)
             deadline = time.perf_counter() + config.ROBOT_MOTION_TIMEOUT_S
             while robot.motion_in_progress():
@@ -914,7 +1040,8 @@ def run_robot_test() -> Path:
                 samples.append(robot.read_state())
                 time.sleep(period)
 
-        # 无论是否运动，都把本次读取到的状态写成逐行 JSON。
+        # 本段把 robot_test 的全部结果写入日志。
+        # 输入：META、Dashboard 信息和 samples；输出：robot_test_log.txt 中逐行 JSON。
         with log_path.open("w", encoding="utf-8") as file:
             meta = {
                 "kind": "META",
@@ -930,17 +1057,26 @@ def run_robot_test() -> Path:
         print(f"[机器人] robot_test 完成，记录：{log_path}")
         return output_dir
     finally:
-        # 不管正常结束还是异常退出，都尝试停止运动并断开连接。
+        # 本段是 robot_test 的统一收尾。
+        # 无论正常结束还是异常退出，都尝试 stopL 和断开 RTDE，避免连接残留。
         robot.stop_motion()
         robot.disconnect()
 
 
 # =============================================================================
-# 7. 完整实验中的机器人子进程
+# 7. 完整实验中的机器人子进程：按主进程信号记录状态并执行轨迹
 # =============================================================================
 
 def _put_record(record_queue: Any, record: dict[str, Any], stop_event: Any) -> None:
-    """队列满说明记录进程跟不上；停止实验比继续产生无法对时的数据更安全。"""
+    """
+    把机器人记录送入完整实验的统一日志队列。
+
+    输入：record_queue、要写入的记录、stop_event。
+    输出：记录进入队列；如果队列满，则置位 stop_event 并抛错。
+
+    实验作用：队列满说明写日志进程跟不上。此时继续产生无法落盘、无法对时的数据意义不大，
+    所以选择停止实验，而不是让机器人数据悄悄丢失。
+    """
 
     try:
         record_queue.put(record, timeout=1.0)
@@ -958,28 +1094,35 @@ def robot_worker(
     motion_done: Any,
 ) -> None:
     """
-    完整实验中的机器人进程。
+    完整实验中的机器人子进程入口。
 
-    它先做软件检查、控制器安全检查和起点检查，报告 ready 后等待统一开始信号。
+    输入：
+    - record_queue：把 ROBOT/EVENT 记录交给写日志进程；
+    - error_queue：把机器人异常交回主进程；
+    - start_event：主进程确认相机和机器人都 ready、且操作者确认后才置位；
+    - stop_event：主进程或异常路径要求停止时置位；
+    - robot_ready：本进程完成连接和安全检查后置位；
+    - motion_done：本进程判断运动结束后置位。
 
-    这个函数只在 RUN_MODE="experiment" 时由 main.py 创建为子进程。
-    阅读它时可以按时间顺序看：
-    1. 建轨迹并做安全检查；
-    2. 连接 UR；
-    3. 等主程序发 start_event；
-    4. 先记录 PRE_RECORD_SECONDS 秒静止数据；
-    5. 发送运动命令；
-    6. 持续记录直到主程序要求停止。
+    输出：
+    - run_log.txt 中持续出现 ROBOT 状态记录和 motion_command_sent/motion_finished 事件；
+    - 若出错，则 error_queue 中出现错误文字，并触发 stop_event。
+
+    实验作用：这是完整 experiment 中唯一负责 UR 真机状态读取和轨迹执行的进程。
+    阅读它时按时间顺序看：建轨迹 -> 真机安全检查 -> 等 start_event -> 预记录 -> 发运动命令 -> 持续记录。
     """
 
     robot = URRobot()
     motion_started = False
 
     try:
-        # 真机运动前的三层检查：
+        # 本段是真机运动前的连续检查链。
+        # 输入：config.py 中的轨迹和当前机器人状态；输出：robot_ready 置位或抛错停止。
+        # 检查顺序：
         # 1. validate_trajectory：本程序自己的数字检查；
-        # 2. verify_controller_safety_limits：UR 控制器自己的安全限制检查；
-        # 3. verify_at_start：确认当前 TCP 已在 A 点附近，不让程序盲目回起点。
+        # 2. robot.connect(require_control=True)：建立读取和控制连接；
+        # 3. verify_controller_safety_limits：UR 控制器自己的安全限制检查；
+        # 4. verify_at_start：确认当前 TCP 已在 A 点附近，不让程序盲目回起点。
         trajectory = build_trajectory()
         validate_trajectory(trajectory, for_real_robot=True)
         robot.connect(require_control=True)
@@ -987,24 +1130,27 @@ def robot_worker(
         robot.verify_at_start(trajectory[0].pose)
         robot_ready.set()
 
-        # 连接和检查都成功后，仍然不立刻运动。
-        # 必须等 main.py 在相机也 ready、操作者确认后发出 start_event。
+        # 本段等待主进程统一开始信号。
+        # 即使机器人已经 ready，也必须等相机 ready 和操作者确认完成后，main.py 才会设置 start_event。
         while not start_event.is_set():
             if stop_event.wait(0.05):
                 return
 
-        # record_start 是统一开始时刻。
-        # 先静止记录 PRE_RECORD_SECONDS 秒，再提交运动命令，便于分析静止噪声基线。
+        # 本段建立机器人子进程自己的采样时间轴。
+        # 输入：start_event 触发后的当前时刻；输出：预记录结束时间 motion_due 和采样周期 period。
+        # 实验作用：先静止记录 PRE_RECORD_SECONDS 秒，再提交运动命令，便于分析静止噪声基线。
         record_start = time.perf_counter()
         motion_due = record_start + config.PRE_RECORD_SECONDS
         period = 1.0 / config.ROBOT_RECORD_HZ
         next_sample = time.perf_counter()
 
-        # 主循环按 ROBOT_RECORD_HZ 尽量稳定采样。
+        # 本段是机器人完整实验主循环。
+        # 输入：stop_event、motion_due、robot.read_state()；输出：持续写入 ROBOT 记录和运动事件。
         while not stop_event.is_set():
             now = time.perf_counter()
 
-            # 到达预记录时间后，只发送一次运动命令。
+            # 本段在预记录时间到达后只触发一次。
+            # 输出 motion_command_sent 事件，并根据轨迹类型决定是否执行 moveL。
             if not motion_started and now >= motion_due:
                 _put_record(
                     record_queue,
@@ -1022,7 +1168,8 @@ def robot_worker(
                     robot.execute_trajectory(trajectory)
                 motion_started = True
 
-                # static 工况没有运动命令，预记录完成就直接报告“运动阶段完成”。
+                # 本段处理 static 工况。
+                # 没有真实运动命令，预记录完成后即可报告 motion_finished，主进程随后进入后记录计时。
                 if len(trajectory) == 1:
                     motion_done.set()
                     _put_record(
@@ -1035,12 +1182,13 @@ def robot_worker(
                         stop_event,
                     )
 
-            # 不管是否已经开始运动，都持续读取机器人状态并写入日志。
+            # 本段每个采样周期都执行。
+            # 输入：RTDE Receive 当前状态；输出：一条 kind="ROBOT" 记录进入统一日志队列。
             state = robot.read_state()
             _put_record(record_queue, state, stop_event)
 
-            # 异步 moveL 完成后，记录 motion_finished 事件。
-            # 之后继续采样，直到 main.py 完成 POST_RECORD_SECONDS 计时。
+            # 本段判断异步 moveL 是否已经结束。
+            # 输出 motion_finished 事件和 motion_done 信号；之后继续采样，直到主进程结束后记录阶段。
             if motion_started and len(trajectory) > 1 and not robot.motion_in_progress():
                 motion_done.set()
                 _put_record(
@@ -1053,7 +1201,8 @@ def robot_worker(
                     stop_event,
                 )
 
-                # 运动完成后仍保持状态采集，直到主程序等完 POST_RECORD_SECONDS 再设置 stop。
+                # 本段是运动完成后的状态记录。
+                # 实验作用：主程序还要等 POST_RECORD_SECONDS，机器人进程在这段时间继续写状态。
                 while not stop_event.is_set():
                     _put_record(record_queue, robot.read_state(), stop_event)
                     next_sample += period
@@ -1063,11 +1212,14 @@ def robot_worker(
             next_sample += period
             time.sleep(max(0.0, next_sample - time.perf_counter()))
 
-            # 超时是兜底保护：如果控制器迟迟不报告完成，就先 stopL，再抛出错误。
+            # 本段是运动超时保护。
+            # 输入：运动已开始后的持续时间；输出：超时则 stopL 并把异常交给主程序处理。
             if motion_started and now - motion_due > config.ROBOT_MOTION_TIMEOUT_S:
                 robot.stop_motion()
                 raise TimeoutError("正式轨迹执行超过超时上限，已调用 stopL。")
     except Exception as exc:
+        # 本段把机器人子进程内部异常转成主进程能读到的错误消息。
+        # 输出：error_queue 中一条错误文本，并设置 stop_event 要求其他进程收尾。
         try:
             error_queue.put(
                 f"机器人进程异常：{type(exc).__name__}: {exc}",
@@ -1077,6 +1229,8 @@ def robot_worker(
             pass
         stop_event.set()
     finally:
+        # 本段是机器人子进程的统一收尾。
+        # 若已经发过运动但还没确认完成，先尝试 stopL；随后断开 RTDE 连接。
         if motion_started and not motion_done.is_set():
             robot.stop_motion()
         robot.disconnect()

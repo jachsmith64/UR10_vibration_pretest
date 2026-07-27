@@ -1,19 +1,20 @@
 """
 UR10 末端振动预实验：统一配置文件。
 
-你平时最常修改的就是这个文件。其余文件负责“怎么做”，这里负责“这次做什么、用什么参数做”。
+这个文件不直接“做实验”，而是回答三个问题：
+1. 这次运行哪种实验流程；
+2. 视觉、机器人、分析各自使用哪些参数；
+3. 启动前哪些配置必须先被拦住，避免后面产生危险动作或误导性结果。
 
-给初学者的阅读方法：
-1. 先只看 RUN_MODE、VISION_SOURCE、VISION_METHOD，这三项决定程序会走哪条路线。
-2. 没有实机时，保持 RUN_MODE="vision_test" 或命令行使用 --mode robot_dry_run。
-3. 任何和 ROBOT、POINT、WORKSPACE 有关的值都不要猜；它们必须来自真实示教和现场确认。
-4. 任何和 HIK 开头有关的值都属于海康相机 SDK 配置；普通图片/视频测试暂时不用管。
-5. validate_config() 是启动前的“门卫”，它会提前阻止明显危险或不完整的配置。
+阅读方式建议：
+- 先看第 1、2 节，确认程序会跑“离线视觉、机器人干跑、真机测试、完整实验、离线分析”中的哪一条路。
+- 再按实验阶段阅读：视觉看第 2-7 节，机器人看第 8-11 节，结果分析看第 12 节。
+- 最后看 validate_config()。它相当于启动前检查表，只检查配置是否明显错误，不会连接相机或机器人。
 
-重要安全原则：
-- 配置文件中的示例坐标只用于软件 dry-run，不代表你的实验台安全。
+安全原则：
+- ROBOT、POINT、WORKSPACE 相关值必须来自真实示教和现场确认，不能把示例值当实验值。
+- HIK 开头的值只服务海康相机 SDK；普通图片文件夹和视频分析不依赖这些设置。
 - .venv、依赖安装、VS Code 解释器设置不在这里配置；这些看 ENVIRONMENT_SETUP.md。
-- 本文件没有主动连接相机或机器人，真正的硬件动作由 camera.py 和 robot.py 中的模式决定。
 """
 
 from __future__ import annotations
@@ -26,12 +27,14 @@ from typing import Final
 # 0. 项目路径
 # =============================================================================
 
-# 所有相对路径都以 config.py 所在文件夹为基准，而不是以终端当前目录为基准。
-# 这样即使你从 VS Code 的其他目录启动 main.py，输入和输出位置也不会突然改变。
+# 本段确定整个项目的“文件坐标系”。
+# 输入：config.py 自己所在的位置；输出：后续图片、视频、结果目录都从 PROJECT_DIR 派生。
+# 实验作用：无论从 VS Code、终端还是脚本启动，程序都能找到同一批输入和输出位置。
 PROJECT_DIR: Final[Path] = Path(__file__).resolve().parent
 
-# 输入图片、输入视频和运行结果分别放在不同文件夹，避免原始数据与处理结果混在一起。
-# 程序会自动创建输出文件夹，但不会替你伪造真实的输入图片或视频。
+# 本段只声明数据应该放在哪里。
+# 输入：你人工放入的图片序列或视频；输出：程序生成的 outputs 结果目录。
+# 实验作用：把原始数据和计算结果分开，便于回看某次实验到底用了哪些输入。
 IMAGE_FOLDER = PROJECT_DIR / "input_images"
 VIDEO_PATH = PROJECT_DIR / "input_video" / "test.mp4"
 OUTPUT_ROOT = PROJECT_DIR / "outputs"
@@ -41,10 +44,13 @@ OUTPUT_ROOT = PROJECT_DIR / "outputs"
 # 1. 总运行模式：一次只允许选择一条路线
 # =============================================================================
 
-# 建议当前先用 vision_test。拿到 UR10 前不要把模式改成 robot_test 或 experiment。
+# 本段选择本次启动的主流程。
+# 输入：RUN_MODE 字符串；输出：main.py 会进入对应函数分支。
+# 实验作用：预实验理解代码时通常先用 vision_test；真机相关模式必须等坐标和安全区确认后再启用。
 RUN_MODE = "vision_test"
 
-# 允许的五种模式会在 validate_config() 中统一检查，拼错一个字母也会在启动阶段报清楚。
+# 本段定义“合法流程清单”，供 validate_config() 检查。
+# 每个模式对应一类实验任务；写错模式名时，程序会在启动阶段停止，而不是跑到一半才失败。
 VALID_RUN_MODES: Final[set[str]] = {
     "vision_test",    # 只测图像读取、标志识别和位移计算。
     "robot_dry_run",  # 只生成并检查轨迹，不导入 UR 库，也不连接真机。
@@ -58,16 +64,21 @@ VALID_RUN_MODES: Final[set[str]] = {
 # 2. 视觉输入来源与算法选择
 # =============================================================================
 
-# image_folder 和 video 不需要海康 MVS SDK；hik_camera 只在真正选择它时才导入 SDK。
+# 本段选择图像从哪里来。
+# 输入：图片文件夹、视频文件或海康相机；输出：camera.py 会把不同来源统一包装成 FramePacket。
+# 实验作用：离线预实验通常用 image_folder/video；正式在线实验才会使用 hik_camera。
 VISION_SOURCE = "image_folder"
 VALID_VISION_SOURCES: Final[set[str]] = {"image_folder", "video", "hik_camera"}
 
-# compare 会让圆点法和棋盘格法同时计算，适合前期比较稳定性；正式实验后再决定主方法。
+# 本段选择每帧图像用哪套识别方法。
+# 输入：同一张 FramePacket；输出：圆点法、棋盘格法或两者并行的位移/坐标结果。
+# 实验作用：compare 适合前期判断哪种标志更稳定；正式实验可固定为更可靠的一种，减少计算负担。
 VISION_METHOD = "compare"
 VALID_VISION_METHODS: Final[set[str]] = {"circles", "checkerboard", "compare"}
 
-# 图像文件按“自然文件名顺序”读取，例如 frame2 会排在 frame10 前面。
-# 支持这些常见扩展名，其他格式不会被程序误当作图片打开。
+# 本段限定离线图片序列的文件类型和读取顺序。
+# 输入：input_images 文件夹中的文件名；输出：按自然顺序进入处理循环的图片帧。
+# 实验作用：避免 frame10 排在 frame2 前面，也避免把非图片文件误当作实验帧。
 IMAGE_EXTENSIONS: Final[tuple[str, ...]] = (
     ".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"
 )
@@ -79,8 +90,9 @@ IMAGE_EXTENSIONS: Final[tuple[str, ...]] = (
 IMAGE_TIMESTAMPS_CSV: Path | None = IMAGE_FOLDER / "timestamps.csv"
 IMAGE_TIMESTAMPS_REQUIRED = False
 
-# 本段是没有 timestamps.csv 时的兜底采样率。
-# 对 132 fps 相机导出的连续图片，程序会用 frame_id / 132.0 生成相对秒数。
+# 本段是离线图片没有真实时间戳时的兜底时间模型。
+# 输入：frame_id 和 IMAGE_FOLDER_FPS；输出：analysis_time_s = frame_id / fps。
+# 实验作用：让纯图片序列也能做频谱分析；若相机实际帧率偏离 132 fps，分析阶段会再给出提示。
 IMAGE_FOLDER_FPS = 132.0
 
 # 本段控制“采样率偏差是否提示”。
@@ -91,10 +103,13 @@ FPS_WARNING_RELATIVE_TOLERANCE = 0.03
 FPS_WARNING_ABSOLUTE_TOLERANCE_HZ = 1.0
 FRAME_GAP_WARNING_FACTOR = 2.5
 
-# 是否弹出 OpenCV 预览窗口。服务器或无桌面环境应设为 False，Windows 本地调试可设为 True。
+# 本段只控制人眼预览，不改变识别结果。
+# 输入：VisionProcessor 画好标注后的 debug 图；输出：OpenCV 窗口显示。
+# 实验作用：现场调试时可以边跑边看是否识别错点；无桌面环境或批处理时应关闭。
 SHOW_PREVIEW = True
 
-# 按 q 或 Esc 可提前结束预览；不显示预览时，程序会自动处理完全部输入。
+# 本段限制预览窗口宽度，避免高分辨率相机画面超过屏幕。
+# 若 SHOW_PREVIEW=True，操作者还可以按 q 或 Esc 提前结束当前视觉测试。
 PREVIEW_MAX_WIDTH = 1400
 
 # 本段控制人工质检图的保存节奏。
@@ -104,8 +119,9 @@ SAVE_DEBUG_IMAGE = True
 DEBUG_IMAGE_EVERY_N_FRAMES = 66
 MAX_DEBUG_IMAGES = 300
 
-# 完整实验中不建议保存大量调试图，因为磁盘写入可能干扰实时取图。
-# 只有明确确认电脑性能足够时，才把这个额外开关改成 True。
+# 本段是正式实验专用的额外保护。
+# 输入：完整实验中的实时 debug 图；输出：是否允许边实验边落盘保存质检图。
+# 实验作用：默认关闭，避免磁盘写入拖慢在线取图；需要现场验证电脑性能后再打开。
 SAVE_DEBUG_IMAGE_DURING_EXPERIMENT = False
 
 
@@ -113,16 +129,22 @@ SAVE_DEBUG_IMAGE_DURING_EXPERIMENT = False
 # 3. 图像预处理
 # =============================================================================
 
-# ROI 依次为 x, y, width, height；None 表示处理整幅图像。
-# 正式固定相机后建议裁出测量纸附近区域，这会减少误识别并提高处理速度。
+# 本段决定每帧图像中真正送入识别算法的区域。
+# 输入：原始相机画面；输出：整幅图或裁剪后的 ROI 小图。
+# 实验作用：相机位置固定后，裁剪到测量纸附近可以减少背景干扰并提高处理速度。
+# ROI 格式为 x, y, width, height；None 表示暂时处理整幅图。
 VISION_ROI: tuple[int, int, int, int] | None = None
 
-# 轻微高斯滤波可减小传感器噪点；必须使用正奇数，1 表示不滤波。
-# 振动图像可能已有运动模糊，因此默认只使用很小的 3×3 核。
+# 本段决定识别前是否先做轻微平滑。
+# 输入：灰度图；输出：降噪后的灰度图。
+# 实验作用：小核可以压低传感器噪声；核过大则会抹掉圆点边缘或棋盘格角点，所以默认保守。
+# 数值必须是正奇数；1 表示不滤波。
 GAUSSIAN_BLUR_KERNEL = 3
 
-# 若已经完成相机标定，可填入 3×3 内参和 5/8 个畸变系数；None 表示暂不校正。
-# 这两个参数必须同时填写或同时保持 None，配置检查会阻止只填一半。
+# 本段接收相机标定结果。
+# 输入：3×3 内参矩阵和畸变系数；输出：像素点投影、去畸变和空间坐标计算所需的相机模型。
+# 实验作用：像素坐标可以先不依赖标定；一旦需要空间坐标，这里就必须填真实标定值。
+# 两个参数必须同时填写或同时保持 None，配置检查会阻止只填一半。
 CAMERA_MATRIX: list[list[float]] | None = None
 DISTORTION_COEFFICIENTS: list[float] | None = None
 
@@ -150,10 +172,12 @@ CAMERA_TO_ROBOT_TRANSLATION_M: list[float] | None = None
 MEASUREMENT_PLANE_POINT_ROBOT_M: list[float] | None = None
 MEASUREMENT_PLANE_NORMAL_ROBOT: list[float] | None = None
 
-# 清晰度使用拉普拉斯方差衡量。它只用于报警和质量记录，不会因为低于阈值就擅自删掉一帧。
+# 本段定义图像质量记录的阈值。
+# 输入：每帧的拉普拉斯方差、过暗像素比例、过亮像素比例；输出：质量分和警告信息。
+# 实验作用：帮助区分“真实振动导致点动了”和“图像太糊/曝光错误导致识别不可靠”。
+# 这些阈值只影响报警和记录，不会擅自删除一帧。
 BLUR_WARNING_THRESHOLD = 60.0
 
-# 过暗或过曝比例用于区分“算法找不到图案”和“图像本身曝光错误”。
 DARK_PIXEL_THRESHOLD = 15
 BRIGHT_PIXEL_THRESHOLD = 245
 
@@ -162,18 +186,26 @@ BRIGHT_PIXEL_THRESHOLD = 245
 # 4. 棋盘格参数
 # =============================================================================
 
-# OpenCV 要的是“内角点数量”而不是黑白方格数量，顺序为列数、行数。
-# 例如这里的 (7, 5) 对应实际打印 8 列×6 行方格。
+# 本段定义棋盘格法要寻找的几何模板。
+# 输入：实际打印纸上的黑白棋盘格；输出：OpenCV 在图像中应找到的内角点网格。
+# 实验作用：只有模板尺寸和实物一致，棋盘格法才能把角点位移解释成纸面位移。
+# 注意 OpenCV 要的是“内角点数量”，不是黑白方格数量；(7, 5) 对应实际 8 列×6 行方格。
 CHECKERBOARD_INNER_CORNERS = (7, 5)
 
-# 单个黑白方格边长，单位 mm。它负责把像素位移换算成纸面内的毫米位移。
+# 本段提供棋盘格法的物理尺度。
+# 输入：单个黑白方格边长，单位 mm；输出：像素位移到纸面毫米位移的比例。
+# 实验作用：这个值填错时，位移趋势可能还像对的，但毫米量级会整体错。
 CHECKER_SQUARE_MM = 4.0
 
-# 亚像素迭代次数和停止精度。数值更严不一定更准，图像清晰度仍是主要限制。
+# 本段控制棋盘格角点的亚像素精修。
+# 输入：初步检测到的角点；输出：更精细的角点坐标。
+# 实验作用：提高静止帧中的角点稳定性；若图像模糊，继续加严迭代参数通常也救不回来。
 CHECKER_SUBPIX_MAX_ITER = 40
 CHECKER_SUBPIX_EPS = 0.001
 
-# 残差超过该值时质量分会明显下降，但仍保留原始结果供你检查。
+# 本段给棋盘格拟合质量设定报警线。
+# 输入：角点与理想网格之间的像素残差；输出：质量分中的 warning。
+# 实验作用：提示棋盘格可能识别歪了、局部遮挡了，或测量纸本身不够平整。
 CHECKER_RESIDUAL_WARNING_PX = 0.8
 
 
@@ -181,24 +213,32 @@ CHECKER_RESIDUAL_WARNING_PX = 0.8
 # 5. 圆点参数
 # =============================================================================
 
-# 预期圆点数量和最低有效数量。跟踪中只要仍有 MIN_VALID_CIRCLES 个对应点就能估计刚体运动。
+# 本段定义圆点法需要多少个点才算可用。
+# 输入：每帧识别出的候选圆点；输出：是否允许继续做圆点跟踪和刚体拟合。
+# 实验作用：允许少量圆点临时丢失，但低于 MIN_VALID_CIRCLES 时不再相信该帧位移。
 CIRCLE_EXPECTED_COUNT = 7
 MIN_VALID_CIRCLES = 5
 
-# 圆点轮廓面积是像素面积，因此与工作距离和分辨率有关；首次实拍后要根据调试图调整。
+# 本段用轮廓面积筛掉明显不是标志点的图案。
+# 输入：二值化后每个候选轮廓的像素面积；输出：保留下来的圆点候选。
+# 实验作用：首次实拍后应根据 debug 图调整，保证真实圆点被保留、背景杂点被排除。
 CIRCLE_MIN_AREA_PX = 25.0
 CIRCLE_MAX_AREA_PX = 12000.0
 
-# 圆度越接近 1 越像圆；透视后圆会变椭圆，所以同时允许一定长短轴比例变化。
+# 本段从“形状像不像圆”继续筛选候选点。
+# 输入：轮廓圆度和椭圆长短轴比例；输出：更可靠的圆点中心。
+# 实验作用：透视会让圆变成椭圆，所以阈值不能过严；过松又容易把污点、文字或边缘当圆点。
 CIRCLE_MIN_CIRCULARITY = 0.68
 CIRCLE_MIN_AXIS_RATIO = 0.52
 
-# 当前帧圆心通过“距上一帧预测位置最近”保持身份，超过此距离的匹配会被拒绝。
-# 该值应大于相邻两帧最大位移，但不能大到允许不同圆点互相串号。
+# 本段控制相邻帧之间如何维持“同一个圆点”的身份。
+# 输入：上一帧圆点位置和当前帧候选圆点；输出：编号稳定的圆点序列。
+# 实验作用：它应大于相邻两帧最大真实位移，但不能大到允许不同圆点互相串号。
 CIRCLE_MAX_MATCH_DISTANCE_PX = 45.0
 
-# 圆点纸的理论中心坐标，单位 mm。它同时用于生成 SVG 测量纸和估计圆点法的毫米/像素比例。
-# 布局故意不对称，目的是减少旋转后“看起来仍完全一样”的身份歧义。
+# 本段定义圆点测量纸的理论布局。
+# 输入：纸面坐标系下每个圆点中心，单位 mm；输出：SVG 测量纸和圆点法的物理尺度参考。
+# 实验作用：不对称布局可以减少旋转后的身份歧义，让程序更容易知道“哪个点是哪个点”。
 CIRCLE_LAYOUT_MM: Final[tuple[tuple[float, float], ...]] = (
     (0.0, 0.0),
     (11.0, 2.0),
@@ -209,11 +249,15 @@ CIRCLE_LAYOUT_MM: Final[tuple[tuple[float, float], ...]] = (
     (9.0, 26.0),
 )
 
-# 普通圆点直径和方向锚点直径。锚点略大，只用于人眼和后续扩展辨向，不参与单点位移判断。
+# 本段只影响生成的测量纸外观。
+# 输入：圆点直径和方向锚点直径，单位 mm；输出：marker_sheet.svg 中的圆形标志。
+# 实验作用：锚点略大，方便人眼辨认方向；当前位移计算仍主要使用圆点中心。
 CIRCLE_DIAMETER_MM = 3.0
 CIRCLE_ANCHOR_DIAMETER_MM = 4.5
 
-# 圆点整体刚体拟合的像素残差阈值。残差大通常意味着串点、局部翘曲或轮廓识别错误。
+# 本段给圆点整体刚体拟合设定报警线。
+# 输入：多个圆点从参考帧到当前帧的刚体变换残差；输出：质量分中的 warning。
+# 实验作用：残差大通常说明串点、局部翘曲、纸面不平或轮廓识别错误。
 CIRCLE_RESIDUAL_WARNING_PX = 1.0
 
 
@@ -221,12 +265,16 @@ CIRCLE_RESIDUAL_WARNING_PX = 1.0
 # 6. 可打印复合测量纸
 # =============================================================================
 
-# vision_test 启动时会生成一份矢量 SVG；按 100% 比例打印，不能选择“适应页面”。
+# 本段控制是否生成实验用测量纸。
+# 输入：棋盘格和圆点布局参数；输出：一份可打印的 marker_sheet.svg。
+# 实验作用：vision_test 时自动生成参考纸，方便保持“代码里的几何尺寸”和“打印出来的实物”一致。
+# 打印时必须使用 100% 比例，不能选择“适应页面”。
 GENERATE_MARKER_SHEET_ON_VISION_TEST = True
 MARKER_SHEET_PATH = OUTPUT_ROOT / "marker_sheet.svg"
 
-# 测量纸尺寸单位为 mm，适合先平面打印后再裁剪。
-# 如果要贴在圆柱面上，应尽量减小弯曲并把被测圆点放在相机正对区域。
+# 本段定义测量纸的外框和留白。
+# 输入：纸张宽高和边距，单位 mm；输出：SVG 画布尺寸和图案摆放区域。
+# 实验作用：平面打印后裁剪使用；若贴在圆柱面上，应尽量减小弯曲并把被测区域放在相机正对位置。
 MARKER_SHEET_WIDTH_MM = 82.0
 MARKER_SHEET_HEIGHT_MM = 42.0
 MARKER_MARGIN_MM = 4.0
@@ -236,19 +284,26 @@ MARKER_MARGIN_MM = 4.0
 # 7. 海康相机参数
 # =============================================================================
 
-# 空字符串表示使用枚举到的第一台设备；正式实验建议填序列号，避免多相机时连错。
+# 本段指定在线取图时连接哪台海康相机。
+# 输入：相机序列号；输出：hik_camera 模式实际打开的设备。
+# 实验作用：单相机调试可留空；正式实验建议填写序列号，避免多相机环境连错设备。
 HIK_CAMERA_SERIAL = ""
 
-# MVS 安装后若 Python 包不在系统路径，可把官方 Samples/Python/MvImport 路径填在这里。
-# 程序只会把明确填写的目录加入 sys.path，不会扫描整块硬盘。
+# 本段告诉 Python 去哪里找海康 MVS SDK 的导入文件。
+# 输入：官方 Samples/Python/MvImport 路径；输出：运行时追加到 sys.path 的目录。
+# 实验作用：只在 hik_camera 模式需要；离线图片和视频流程完全不依赖它。
 HIK_MVS_IMPORT_PATH: str | None = None
 
-# 曝光单位通常为微秒，增益单位由相机节点定义；None 表示不主动改相机当前配置。
-# 首次连接先在 MVS 客户端里确认可用范围，再把稳定参数抄到这里。
+# 本段控制相机成像亮度。
+# 输入：曝光时间和增益；输出：相机节点参数或保留相机当前设置。
+# 实验作用：稳定曝光能减少识别点明暗波动；首次连接应先在 MVS 客户端确认可用范围。
+# None 表示程序不主动修改相机当前配置。
 HIK_EXPOSURE_US: float | None = None
 HIK_GAIN: float | None = None
 
-# 取帧等待时间过短会把轻微网络抖动误报成故障，过长则会拖慢异常退出。
+# 本段控制在线取帧时“等一帧最多等多久”。
+# 输入：相机 SDK 取帧调用；输出：成功返回 FramePacket 或超时错误。
+# 实验作用：过短会把轻微网络抖动误报成故障，过长则会拖慢异常退出。
 HIK_FRAME_TIMEOUT_MS = 1000
 
 
@@ -256,28 +311,38 @@ HIK_FRAME_TIMEOUT_MS = 1000
 # 8. 机器人连接与“禁止误运动”开关
 # =============================================================================
 
-# 这里必须改成实验室 UR10 的真实 IP；示例地址不能证明与你的网络配置一致。
+# 本段定义程序如何找到 UR10 控制器。
+# 输入：实验室网络中的机器人 IP 和 dashboard 端口；输出：robot.py 建立状态读取或运动控制连接。
+# 实验作用：只有 robot_test/experiment 会真正使用；示例地址不能证明与你的网络配置一致。
 ROBOT_HOST = "192.168.0.10"
 ROBOT_DASHBOARD_PORT = 29999
 ROBOT_CONNECT_TIMEOUT_S = 5.0
 
-# 第一次 robot_test 必须保持 False，此时只读取版本、关节和 TCP 状态，不发送运动命令。
+# 本段把 robot_test 拆成“只连机读取”和“允许低速动一下”两级。
+# 输入：ROBOT_TEST_ALLOW_MOTION；输出：robot_test 是否会发送 A→B 测试运动。
+# 实验作用：第一次接触实机必须保持 False，先确认连接、坐标读取和日志流程正常。
 ROBOT_TEST_ALLOW_MOTION = False
 
-# 只有在示教器逐点确认 A/B/C 位姿、工作区和姿态都安全后，才允许改为 True。
-# 任何会让真机运动的模式都会检查这个开关，防止示例坐标被误发给机器人。
+# 本段是所有真机运动前的总安全闸。
+# 输入：人工示教并确认后的 A/B/C 位姿和工作区；输出：是否允许 robot.py 发送运动命令。
+# 实验作用：防止示例坐标或未确认坐标被误发给机器人；只有现场逐点确认后才可改 True。
 ROBOT_POSES_CONFIRMED = False
 
-# 是否在真机运动前要求操作者在终端再次输入指定文本。正式实验建议一直保持 True。
+# 本段要求操作者在真机运动前做最后一次人工确认。
+# 输入：终端中输入的确认文本；输出：继续执行或立即停止。
+# 实验作用：给人留一个“手离键盘前再想一次”的关口，正式实验建议一直保持 True。
 REQUIRE_OPERATOR_CONFIRMATION = True
 OPERATOR_CONFIRM_TEXT = "I CONFIRM THE ROBOT AREA IS CLEAR"
 
-# ur_rtde 的 -1.0 表示让库按控制器代际选择默认频率：CB 系列 125 Hz，e/UR 系列 500 Hz。
-# 这里只是接口交换频率；本项目实际写日志仍可按下方 ROBOT_RECORD_HZ 降采样。
+# 本段设置 RTDE 接口和机器人控制器交换数据的频率。
+# 输入：ur_rtde 连接参数；输出：底层状态刷新频率。
+# 实验作用：这不是 moveL 指令发送频率，也不是最终日志频率；日志仍按 ROBOT_RECORD_HZ 记录。
+# -1.0 表示让 ur_rtde 按控制器代际选择默认频率：CB 系列 125 Hz，e/UR 系列 500 Hz。
 ROBOT_RTDE_FREQUENCY = -1.0
 
-# 状态记录 125 Hz 已足以覆盖当前预计 5–40 Hz 振动，并减小文件体积。
-# 它不是 moveL 的“指令发送频率”，因为本版轨迹是一次提交给控制器执行的。
+# 本段决定机器人状态日志的采样密度。
+# 输入：RTDE 持续读取到的机器人状态；输出：run_log.txt 中 robot_state 记录的时间序列。
+# 实验作用：125 Hz 足以覆盖当前预计 5-40 Hz 振动，同时控制文件体积。
 ROBOT_RECORD_HZ = 125.0
 
 
@@ -285,42 +350,60 @@ ROBOT_RECORD_HZ = 125.0
 # 9. 轨迹类型、示例位姿和运动参数
 # =============================================================================
 
-# static 只静止记录，line 是 A→B，l_shape 是 A→B→C。
+# 本段选择机器人在完整实验中执行哪种预设轨迹。
+# 输入：TRAJECTORY_TYPE；输出：robot.py 生成 static、A→B 或 A→B→C 路径。
+# 实验作用：对应你的静止、直线匀速、L 形转弯等预实验工况。
 TRAJECTORY_TYPE = "l_shape"
 VALID_TRAJECTORY_TYPES: Final[set[str]] = {"static", "line", "l_shape"}
 
-# 以下位姿格式固定为 [x, y, z, rx, ry, rz]，位置单位 m，姿态为旋转向量 rad。
-# 这些只是方便 dry_run 检查代码流程的演示值，绝不能直接作为你的 UR10 实验坐标。
+# 本段提供轨迹端点位姿。
+# 输入：示教器确认后的 TCP 位姿 [x, y, z, rx, ry, rz]；输出：轨迹生成器使用的 A/B/C 点。
+# 实验作用：这些点决定机械臂实际走哪里。当前值只是 dry_run 演示值，绝不能直接作为实机坐标。
+# 位置单位 m，姿态为旋转向量 rad。
 POINT_A = [-0.450, -0.250, 0.350, 2.220, -2.220, 0.000]
 POINT_B = [-0.350, -0.250, 0.350, 2.220, -2.220, 0.000]
 POINT_C = [-0.350, -0.150, 0.350, 2.220, -2.220, 0.000]
 
-# 线速度单位 m/s，加速度单位 m/s²。初次真机运动应从更低速度开始。
+# 本段定义完整实验轨迹的速度级别。
+# 输入：目标线速度和线加速度；输出：发送给 UR 控制器的 moveL/moveJ 相关运动参数。
+# 实验作用：速度越高越容易激发振动，但风险也更高；初次真机运动应从更低速度开始。
 LINEAR_SPEED_M_S = 0.05
 LINEAR_ACCELERATION_M_S2 = 0.10
 
-# B 点交融半径单位 m。L 形路径中它让机械臂不停下地圆滑经过 B 点。
+# 本段控制 L 形轨迹在 B 点是否“停顿转弯”。
+# 输入：B 点交融半径，单位 m；输出：控制器在 A→B→C 中对 B 点的圆滑过渡。
+# 实验作用：交融半径越大，越接近连续转弯；为 0 时更接近到点停下再走下一段。
 BLEND_RADIUS_M = 0.005
 
-# robot_test 若允许运动，只执行 A→B 的低速测试，并使用更保守的速度和加速度。
+# 本段只服务 robot_test 的低速验证。
+# 输入：A/B 点和保守速度参数；输出：一段短距离 A→B 测试运动。
+# 实验作用：在正式 experiment 前验证机器人可连接、可运动、可记录，但不直接跑完整实验速度。
 ROBOT_TEST_SPEED_M_S = 0.02
 ROBOT_TEST_ACCELERATION_M_S2 = 0.05
 
-# 软件工作区是额外保险，不等于 UR 控制器自身的安全平面，也无法识别桌面和夹具。
-# 这六个范围分别限制 TCP 的 x、y、z，单位 m；实机前必须按实验台重新填写。
+# 本段给代码层面加一个 TCP 工作区边界。
+# 输入：待执行轨迹中的所有 TCP 点；输出：通过检查或拒绝执行。
+# 实验作用：这是额外保险，不等于 UR 控制器自身安全设置，也无法识别桌面和夹具。
+# 三个范围分别限制 TCP 的 x、y、z，单位 m；实机前必须按实验台重新填写。
 WORKSPACE_LIMITS_M: Final[dict[str, tuple[float, float]]] = {
     "x": (-0.80, 0.20),
     "y": (-0.80, 0.80),
     "z": (0.10, 1.20),
 }
 
-# 相邻点距离过长通常意味着单位写错或误抄示教坐标；超过阈值直接拒绝真机运动。
+# 本段防止轨迹点之间出现离谱跳变。
+# 输入：A/B/C 中相邻点的空间距离；输出：允许生成轨迹或拒绝真机运动。
+# 实验作用：相邻点距离过长通常意味着单位写错或误抄示教坐标。
 MAX_SEGMENT_LENGTH_M = 0.30
 
-# 位姿的前三项与安全起点相比超过此值时，不允许假装已经位于起点。
+# 本段判断机器人当前 TCP 是否已经足够接近安全起点。
+# 输入：当前 TCP 位置和 POINT_A 的前三项；输出：是否允许进入后续轨迹。
+# 实验作用：避免机器人实际不在起点，却直接执行以 A 点为起点设计的轨迹。
 START_POSE_TOLERANCE_M = 0.005
 
-# 单段最长允许时间是兜底超时，不代表预计运动一定要持续这么久。
+# 本段给每段机器人运动设置兜底等待上限。
+# 输入：robot.py 等待运动完成的循环；输出：正常完成或超时报错。
+# 实验作用：避免控制器异常、网络异常或轨迹无法完成时程序无限等待。
 ROBOT_MOTION_TIMEOUT_S = 60.0
 
 
@@ -328,11 +411,15 @@ ROBOT_MOTION_TIMEOUT_S = 60.0
 # 10. 控制器预留接口
 # =============================================================================
 
-# 第一版只做开环预设轨迹。disabled 表示没有在线 SFC 修正，名称故意写得直白以免误认。
+# 本段说明当前是否启用在线控制。
+# 输入：控制器模式和执行器模式；输出：main.py/robot.py 是否允许进入对应控制流程。
+# 实验作用：当前代码主体是预实验和开环轨迹，SFC 只保留名字和检查口，还没有真正实现在线修正。
 CONTROL_MODE = "disabled"
 EXECUTOR_MODE = "open_loop"
 
-# 若误选 sfc，当前版本会在接触机器人前明确停止；以后真正实现后再扩展允许集合。
+# 本段定义控制模式的合法集合。
+# 输入：CONTROL_MODE/EXECUTOR_MODE 字符串；输出：validate_config() 的合法性判断。
+# 实验作用：如果误选 sfc 或 servo，当前版本会在接触机器人前明确停止。
 VALID_CONTROL_MODES: Final[set[str]] = {"disabled", "sfc"}
 VALID_EXECUTOR_MODES: Final[set[str]] = {"open_loop", "servo"}
 
@@ -341,19 +428,26 @@ VALID_EXECUTOR_MODES: Final[set[str]] = {"open_loop", "servo"}
 # 11. 完整实验的时间和进程参数
 # =============================================================================
 
-# start_event 发出后先静止记录 PRE_RECORD_SECONDS，再提交运动轨迹。
+# 本段定义完整实验的时间结构。
+# 输入：主进程发出的 start_event；输出：相机和机器人日志中的 baseline、motion、post 三段数据。
+# 实验作用：先静止记录建立噪声/静止基线，再运动激励，最后观察残余振动衰减。
 PRE_RECORD_SECONDS = 3.0
 
-# 运动完成后继续记录，用于观察残余振动如何衰减。
 POST_RECORD_SECONDS = 5.0
 
-# 相机和机器人启动、报告 ready 的最长等待时间；超时后主程序会让全部子进程退出。
+# 本段控制多进程启动阶段的等待上限。
+# 输入：相机进程和机器人进程的 ready 信号；输出：继续实验或判定启动失败。
+# 实验作用：避免某个子进程卡住时，主程序还误以为完整实验已经同步开始。
 WORKER_READY_TIMEOUT_S = 20.0
 
-# 每个子进程正常退出的等待时间，超时后才会作为最后手段终止该进程。
+# 本段控制多进程结束阶段的等待上限。
+# 输入：实验结束后各子进程的退出状态；输出：正常收尾或强制终止异常进程。
+# 实验作用：尽量让日志正常写完，同时避免异常进程长期占用相机或机器人连接。
 WORKER_JOIN_TIMEOUT_S = 8.0
 
-# 记录队列不能无限增长，否则磁盘过慢时会逐渐吃完内存。
+# 本段限制进程间记录队列的容量。
+# 输入：相机/机器人持续产生的记录；输出：等待写入 run_log.txt 的队列。
+# 实验作用：磁盘写入变慢时队列不能无限增长，否则会逐渐吃完内存。
 RECORD_QUEUE_MAXSIZE = 20000
 ERROR_QUEUE_MAXSIZE = 100
 
@@ -362,18 +456,25 @@ ERROR_QUEUE_MAXSIZE = 100
 # 12. 离线分析参数
 # =============================================================================
 
-# None 表示自动选择 outputs 下最新的 run_log.txt；也可填具体 Path 锁定一次实验。
+# 本段选择离线分析读取哪一次实验记录。
+# 输入：run_log.txt 或 vision_results.txt；输出：analyze.py 用于计算 RMS、频谱和恢复时间的数据源。
+# 实验作用：None 会自动选择 outputs 下最新记录；填具体 Path 可以固定复查某一次实验。
 ANALYSIS_FILE: Path | None = None
 
-# 优先分析圆点法还是棋盘格法，可选 circles 或 checkerboard。
+# 本段选择分析阶段使用哪套视觉结果。
+# 输入：每帧 JSON 中的 circles/checkerboard 结果；输出：用于统计和画图的一条位移序列。
+# 实验作用：前期 compare 会同时保存两套结果，分析时可以分别选用，判断问题出在识别方法还是实验本身。
 ANALYSIS_VISION_METHOD = "circles"
 
-# 可选 x、y 或 magnitude；magnitude 会计算 sqrt(dx²+dy²)。
+# 本段选择振动分析观察哪个方向。
+# 输入：视觉算法输出的 dx、dy；输出：x、y 或合位移 magnitude 时间序列。
+# 实验作用：若相机坐标轴已经和实验方向对齐，可直接看 x/y；方向不确定时先看 magnitude 更稳妥。
 ANALYSIS_AXIS = "x"
 VALID_ANALYSIS_AXES: Final[set[str]] = {"x", "y", "magnitude"}
 
-# 主分析窗口决定“哪一段数据拿去算 RMS 和频谱”。
-# motion 使用运动命令发出到运动完成；steady_motion 会裁掉运动前后各一段，更适合匀速段粗分析。
+# 本段选择“哪一段时间”作为主要分析对象。
+# 输入：完整时间序列和实验事件时间；输出：拿去算 RMS、主频、频带能量的时间窗口。
+# 实验作用：baseline 看静止噪声，motion 看整个运动过程，steady_motion 裁掉运动前后各一段以粗略聚焦匀速段。
 ANALYSIS_PRIMARY_WINDOW = "motion"
 VALID_ANALYSIS_PRIMARY_WINDOWS: Final[set[str]] = {
     "full",
@@ -384,23 +485,33 @@ VALID_ANALYSIS_PRIMARY_WINDOWS: Final[set[str]] = {
 }
 STEADY_MOTION_TRIM_FRACTION = 0.20
 
-# linear 适合直线恒速段；savgol 适合缓慢弯曲趋势；highpass 适合明确只关心某频率以上振动。
+# 本段选择如何从位移曲线中去掉慢变化趋势。
+# 输入：原始位移序列；输出：更接近“振动分量”的去趋势序列。
+# 实验作用：linear 适合直线匀速段，savgol 适合缓慢弯曲趋势，highpass 适合明确只关心某频率以上振动。
 DETREND_METHOD = "linear"
 VALID_DETREND_METHODS: Final[set[str]] = {"linear", "savgol", "highpass"}
 
-# Savitzky-Golay 趋势窗口按秒定义，程序会根据实际帧率换成奇数点数。
+# 本段只在 DETREND_METHOD="savgol" 时生效。
+# 输入：窗口秒数和多项式阶数；输出：从原始曲线估计出的慢变化趋势。
+# 实验作用：窗口太短会把振动也当趋势扣掉，窗口太长则可能跟不上路径缓慢弯曲。
 SAVGOL_WINDOW_SECONDS = 0.50
 SAVGOL_POLYORDER = 2
 
-# highpass 模式的截止频率和阶数。截止频率不应高于你希望保留的最低振动频率。
+# 本段只在 DETREND_METHOD="highpass" 时生效。
+# 输入：截止频率和滤波器阶数；输出：高通后的振动序列。
+# 实验作用：截止频率不应高于你希望保留的最低振动频率，否则真实低频振动会被滤掉。
 HIGHPASS_CUTOFF_HZ = 2.0
 HIGHPASS_ORDER = 4
 
-# 频谱只在这个范围内寻找主频，避开零频漂移和超过奈奎斯特频率的无效区。
+# 本段限制主频搜索范围。
+# 输入：去趋势后的频谱；输出：dominant_frequency_hz。
+# 实验作用：避开零频漂移，也避免在超过奈奎斯特频率的无效区里误找主频。
 DOMINANT_FREQ_MIN_HZ = 1.0
 DOMINANT_FREQ_MAX_HZ = 45.0
 
-# 这些频带用于汇总能量，可按后续实验关注范围调整。
+# 本段把频谱按实验关心的频带做能量汇总。
+# 输入：频谱功率；输出：每个频带的能量指标。
+# 实验作用：后续比较不同速度、姿态、负载时，可以比单一主频更稳定地观察某段频率能量变化。
 FREQUENCY_BANDS_HZ: Final[tuple[tuple[float, float], ...]] = (
     (1.0, 5.0),
     (5.0, 10.0),
@@ -408,8 +519,9 @@ FREQUENCY_BANDS_HZ: Final[tuple[tuple[float, float], ...]] = (
     (20.0, 40.0),
 )
 
-# 恢复时间阈值取“静止基线 RMS×倍数”和绝对阈值中的较大者。
-# 连续低于阈值达到 RECOVERY_HOLD_SECONDS 后，才算真正恢复而不是偶然穿过阈值。
+# 本段定义“运动结束后多久算振动恢复”。
+# 输入：post 窗口中的振动幅值和 baseline 噪声水平；输出：recovery_time_s。
+# 实验作用：阈值取“静止基线 RMS×倍数”和绝对阈值中的较大者；连续低于阈值一段时间才算真正恢复。
 RECOVERY_BASELINE_FACTOR = 3.0
 RECOVERY_ABSOLUTE_THRESHOLD_MM = 0.02
 RECOVERY_HOLD_SECONDS = 0.30
@@ -420,7 +532,13 @@ RECOVERY_HOLD_SECONDS = 0.30
 # =============================================================================
 
 def _check_pose(name: str, pose: list[float]) -> None:
-    """检查位姿必须恰好由 6 个有限数值组成，防止少抄或多抄一列。"""
+    """
+    检查机器人位姿是否能作为轨迹端点使用。
+
+    输入：POINT_A/B/C 这类 [x, y, z, rx, ry, rz] 列表。
+    输出：无返回值；发现长度错误、非数值或无穷值时直接抛错。
+    实验作用：提前拦住少抄、多抄或复制异常值的位姿，避免后续轨迹检查建立在坏数据上。
+    """
 
     import math
 
@@ -432,7 +550,13 @@ def _check_pose(name: str, pose: list[float]) -> None:
 
 
 def _check_vector(name: str, values: list[float] | None, length: int) -> None:
-    """检查标定向量是否完整填写。"""
+    """
+    检查空间坐标标定中的向量参数是否完整。
+
+    输入：平移向量、平面点或平面法向等一维数值列表。
+    输出：无返回值；缺失、长度不对或含非法数值时抛错。
+    实验作用：空间坐标一旦启用，就不能让“只填了一半的外参”继续参与计算。
+    """
 
     import math
 
@@ -443,7 +567,13 @@ def _check_vector(name: str, values: list[float] | None, length: int) -> None:
 
 
 def _check_matrix(name: str, values: list[list[float]] | None, rows: int, columns: int) -> None:
-    """检查标定矩阵是否完整填写。"""
+    """
+    检查空间坐标标定中的矩阵参数是否完整。
+
+    输入：相机内参或相机到机器人旋转矩阵。
+    输出：无返回值；维度不对或含非法数值时抛错。
+    实验作用：防止错误尺寸的标定矩阵进入像素到空间坐标的投影计算。
+    """
 
     import math
 
@@ -456,23 +586,22 @@ def _check_matrix(name: str, values: list[list[float]] | None, rows: int, column
 
 def validate_config(run_mode: str | None = None) -> None:
     """
-    在导入硬件库或创建子进程前检查明显配置错误。
+    启动前统一检查本文件是否足以支撑本次实验流程。
 
-    run_mode 允许 main.py 的命令行参数临时覆盖 RUN_MODE；不传时就检查文件顶部选择的模式。
+    输入：可选 run_mode。main.py 可用命令行参数临时覆盖文件顶部的 RUN_MODE。
+    输出：无返回值；配置可用时只创建输出目录，配置明显错误时抛出 ValueError。
 
-    初学者可以把这个函数理解成“开机前检查表”：
-    - 先检查模式名称有没有拼错；
-    - 再检查视觉、轨迹、控制器这些大方向是否在允许范围内；
-    - 然后检查数字参数是否明显不合理；
-    - 最后才创建输出目录。
-
-    它不会连接相机，也不会连接机器人，只做纯 Python 配置检查。
+    实验作用：它是“进入相机/机器人/分析流程之前的门卫”。它不会连接相机，
+    也不会连接机器人，只用纯 Python 检查模式名称、视觉参数、安全开关、
+    机器人轨迹参数和离线分析参数是否自相矛盾。
     """
 
     selected_mode = run_mode or RUN_MODE
 
-    # 第一组：检查“字符串选项”有没有写错。
-    # 这类错误最常见，例如把 vision_test 拼成 vison_test。
+    # 本段检查所有“选择题”式配置。
+    # 输入：RUN_MODE、视觉来源、视觉算法、轨迹类型、控制器模式等字符串。
+    # 输出：确认每个字符串都落在合法集合内；拼写错误会在这里停止。
+    # 实验作用：防止因为一个模式名拼错，程序进入错误分支或后续报出更难懂的异常。
     if selected_mode not in VALID_RUN_MODES:
         raise ValueError(
             f"未知 RUN_MODE={selected_mode!r}，可选值为 {sorted(VALID_RUN_MODES)}。"
@@ -506,8 +635,10 @@ def validate_config(run_mode: str | None = None) -> None:
     if EXECUTOR_MODE not in VALID_EXECUTOR_MODES:
         raise ValueError(f"未知 EXECUTOR_MODE={EXECUTOR_MODE!r}。")
 
-    # 第二组：检查会影响真机安全的大开关。
-    # 当前版本预留了 SFC 名称，但还没有实现真正在线控制，所以不能让它悄悄进入真机模式。
+    # 本段检查会影响真机安全的流程级开关。
+    # 输入：当前运行模式、控制模式、执行器模式和机器人地址。
+    # 输出：确认本版代码不会把“预留接口”误当成已经实现的正式在线控制。
+    # 实验作用：SFC/servo 相关名称目前只作为接口占位；真机模式下误选这些值必须提前停止。
     if selected_mode in {"robot_test", "experiment"} and CONTROL_MODE == "sfc":
         raise ValueError(
             "当前版本只预留了 SFC 接口，尚未实现在线控制。"
@@ -520,8 +651,10 @@ def validate_config(run_mode: str | None = None) -> None:
     if selected_mode in {"robot_test", "experiment"} and not ROBOT_HOST.strip():
         raise ValueError("真机模式必须填写非空 ROBOT_HOST。")
 
-    # 第三组：检查视觉算法参数。
-    # 这些值不会造成机器人运动，但写错会让图像识别结果完全不可信。
+    # 本段检查视觉识别、时间轴和空间坐标参数。
+    # 输入：棋盘格尺寸、圆点数量、滤波核、相机内参、fps 提示阈值、空间坐标开关等。
+    # 输出：确认每帧结果可以被解释为可信的像素/空间/时间数据。
+    # 实验作用：这些值不会让机器人运动，但会直接决定视觉结果是否有物理意义。
     if CHECKERBOARD_INNER_CORNERS[0] < 2 or CHECKERBOARD_INNER_CORNERS[1] < 2:
         raise ValueError("棋盘格横向和纵向内角点数都必须至少为 2。")
 
@@ -558,6 +691,10 @@ def validate_config(run_mode: str | None = None) -> None:
         )
 
     if SPATIAL_COORDINATES_ENABLED:
+        # 本段只在空间坐标启用后执行。
+        # 输入：像素到空间投影所需的内参、深度平面或机器人外参。
+        # 输出：允许 calibration.py 计算空间点，或在缺少关键标定值时停止。
+        # 实验作用：空间坐标是第二层结果，必须在标定参数完整时才生成。
         _check_matrix("CAMERA_MATRIX", CAMERA_MATRIX, 3, 3)
         if SPATIAL_COORDINATE_MODE == "camera_plane":
             if SPATIAL_CAMERA_PLANE_Z_M is None or SPATIAL_CAMERA_PLANE_Z_M <= 0:
@@ -569,13 +706,18 @@ def validate_config(run_mode: str | None = None) -> None:
             _check_vector("MEASUREMENT_PLANE_NORMAL_ROBOT", MEASUREMENT_PLANE_NORMAL_ROBOT, 3)
 
     if VISION_ROI is not None:
+        # 本段检查 ROI 是否真的是一个非空图像区域。
+        # 输入：VISION_ROI；输出：允许裁剪或提示 ROI 写法错误。
+        # 实验作用：避免宽高为 0 或负数时，后续识别算法拿到空图像。
         if len(VISION_ROI) != 4 or any(value < 0 for value in VISION_ROI):
             raise ValueError("VISION_ROI 必须是非负的 (x, y, width, height)。")
         if VISION_ROI[2] == 0 or VISION_ROI[3] == 0:
             raise ValueError("VISION_ROI 的 width 和 height 必须大于 0。")
 
-    # 第四组：检查机器人位姿和运动参数。
-    # 这里仍只是“数字合理性检查”，不能替代示教器和现场安全确认。
+    # 本段检查机器人轨迹数值是否基本合理。
+    # 输入：A/B/C 位姿、速度、加速度、交融半径、记录频率和记录时间。
+    # 输出：允许 robot.py 继续做更详细的轨迹/安全区检查，或在明显错误时停止。
+    # 实验作用：这里不能替代示教器和现场安全确认，只负责拦住代码层面一眼能看出的坏值。
     for name, pose in (("POINT_A", POINT_A), ("POINT_B", POINT_B), ("POINT_C", POINT_C)):
         _check_pose(name, pose)
 
@@ -591,8 +733,10 @@ def validate_config(run_mode: str | None = None) -> None:
     if PRE_RECORD_SECONDS < 0 or POST_RECORD_SECONDS < 0:
         raise ValueError("运动前后记录时间不能为负数。")
 
-    # 第五组：检查离线分析参数。
-    # 分析模式不碰硬件，但参数写错会让输出图表的含义变错。
+    # 本段检查离线分析会如何解读已有记录。
+    # 输入：视觉方法、分析方向和去趋势方法。
+    # 输出：确认 analyze.py 后续生成图表和指标时，使用的是明确且合法的解释方式。
+    # 实验作用：分析模式不碰硬件，但参数写错会让输出图表的含义变错。
     if ANALYSIS_VISION_METHOD not in {"circles", "checkerboard"}:
         raise ValueError("ANALYSIS_VISION_METHOD 只能是 circles 或 checkerboard。")
 
@@ -602,5 +746,7 @@ def validate_config(run_mode: str | None = None) -> None:
     if DETREND_METHOD not in VALID_DETREND_METHODS:
         raise ValueError(f"DETREND_METHOD 可选值为 {sorted(VALID_DETREND_METHODS)}。")
 
-    # 这里只创建程序自己的输出目录，不会创建假的输入数据。
+    # 本段是配置检查通过后的唯一文件系统动作。
+    # 输入：OUTPUT_ROOT；输出：确保结果根目录存在。
+    # 实验作用：只创建程序自己的输出目录，不会创建假的输入数据，也不会连接任何硬件。
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
