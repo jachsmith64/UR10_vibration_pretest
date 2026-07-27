@@ -346,32 +346,61 @@ def select_analysis_windows(
     events: dict[str, float],
 ) -> dict[str, np.ndarray]:
     """
-    依据事件拆出 baseline、motion、post 和 full 四个区间。
+    把完整视觉时间序列拆成实验分析窗口。
 
-    只有 vision_test 没有运动事件时，motion 会退化为全序列，仍可分析合成或手动移动数据。
+    输入：
+    - time_s：每帧视觉测量结果的时间；
+    - events：实验事件时间，例如 experiment_started、motion_command_sent、motion_finished。
+
+    输出：
+    - full：整段有效视觉记录；
+    - baseline：运动命令前的静止段；
+    - motion：机器人运动命令发出到运动完成；
+    - steady_motion：粗略裁掉 motion 两端后的中间段，用于匀速段预分析；
+    - post：运动完成后的残余振动段。
+
+    实验作用：
+    同一条位移曲线在不同工况下要分析不同片段。这里先把“可选片段”准备好，
+    后续 run_analysis() 再根据 config.ANALYSIS_PRIMARY_WINDOW 选择真正用于 RMS 和频谱的主窗口。
     """
 
-    # 读取关键事件；缺少实验开始/结束时用数据首尾兜底。
+    # 本段读取窗口边界事件。
+    # 输入来自日志里的 EVENT 记录；缺失实验开始/结束时用数据首尾兜底，避免离线视觉测试无法分析。
     experiment_start = events.get("experiment_started", float(time_s[0]))
     motion_start = events.get("motion_command_sent")
     motion_end = events.get("motion_finished")
     experiment_end = events.get("experiment_finished", float(time_s[-1]))
 
-    # vision_test 或合成图片通常没有运动事件。
-    # 这种情况下无法分 baseline/motion/post，就把全序列当作 motion。
+    # 本段处理没有机器人运动事件的离线数据。
+    # vision_test、合成图片或手动移动视频通常没有 motion_start/motion_end。
+    # 这种情况下无法可靠划分静止/运动/残余段，因此把完整序列作为 motion 和 steady_motion。
     if motion_start is None or motion_end is None:
         return {
             "full": np.ones_like(time_s, dtype=bool),
             "baseline": np.zeros_like(time_s, dtype=bool),
             "motion": np.ones_like(time_s, dtype=bool),
+            "steady_motion": np.ones_like(time_s, dtype=bool),
             "post": np.zeros_like(time_s, dtype=bool),
         }
 
-    # 正式 experiment 有运动事件时，按事件切分四个窗口。
+    # 本段从 motion 中粗略裁出 steady_motion。
+    # 输入是运动开始/结束事件；输出是去掉两端加减速影响后的中间窗口。
+    # 它不是精确的速度闭环识别，只是为“匀速段优先分析”提供一个保守的预实验窗口。
+    motion_duration = max(0.0, motion_end - motion_start)
+    trim = config.STEADY_MOTION_TRIM_FRACTION * motion_duration
+    steady_start = motion_start + trim
+    steady_end = motion_end - trim
+    if steady_start >= steady_end:
+        steady_start = motion_start
+        steady_end = motion_end
+
+    # 本段输出所有分析窗口的布尔掩码。
+    # 每个掩码和 time_s 一样长，True 表示该帧属于对应窗口。
     return {
         "full": _window_mask(time_s, experiment_start, experiment_end),
         "baseline": _window_mask(time_s, experiment_start, motion_start),
         "motion": _window_mask(time_s, motion_start, motion_end),
+        "steady_motion": _window_mask(time_s, steady_start, steady_end),
         "post": _window_mask(time_s, motion_end, experiment_end),
     }
 
@@ -443,32 +472,45 @@ def resample_uniform(
     values: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, float, dict[str, float]]:
     """
-    按原始中位采样周期建立均匀时间轴，供 FFT、Welch 和数字滤波使用。
+    把不完全等间隔的视觉位移数据转换成均匀时间轴。
 
-    原始样本仍保留用于时域图；插值不会声称增加真实测量带宽。
+    输入：
+    - time_s：原始时间戳，可能来自图片 timestamps.csv、视频时间戳或电脑时钟；
+    - values：对应时间上的位移序列。
 
-    为什么要重采样：
-    真实程序记录时间戳时，帧与帧之间可能不是严格 1/60 秒或 1/125 秒。
-    但 FFT 和很多滤波算法要求“等时间间隔”的数据，所以这里先插值到均匀时间轴。
+    输出：
+    - uniform_time：按中位采样间隔生成的均匀时间轴；
+    - uniform_values：插值到均匀时间轴上的位移；
+    - sample_rate_hz：由真实时间戳估计的采样率；
+    - timing：采样间隔质量指标，用于判断是否掉帧或帧率异常。
+
+    实验作用：
+    FFT、Welch 和数字滤波要求数据近似等间隔。这里不宣称增加真实带宽，
+    只是把已有测量点整理成后续频域算法能处理的形式。
     """
 
     if len(time_s) != len(values):
         raise ValueError("时间与位移数组长度不一致。")
 
-    # np.diff 会计算相邻时间戳的差值，例如 [0.00, 0.02, 0.04] -> [0.02, 0.02]。
+    # 本段从原始时间戳估计真实采样节奏。
+    # 使用相邻时间差而不是固定 config.IMAGE_FOLDER_FPS，是为了发现实际帧率是否偏离 132 fps。
     delta_t = np.diff(time_s)
     valid_delta = delta_t[delta_t > 0]
     if len(valid_delta) == 0:
         raise ValueError("时间戳没有递增，无法估计采样率。")
 
-    # 用中位数而不是平均数，是为了降低偶发卡顿/丢帧对采样率估计的影响。
+    # 本段用中位间隔作为重采样步长。
+    # 中位数比平均数更不容易被偶发卡顿或个别大间隔带偏。
     median_dt = float(np.median(valid_delta))
     sample_rate_hz = 1.0 / median_dt
 
-    # np.arange 建立均匀时间轴；np.interp 把原始位移插值到这条时间轴上。
+    # 本段生成频域分析使用的均匀序列。
+    # 输入是原始点；输出是同一物理量在均匀时间轴上的插值版本。
     uniform_time = np.arange(time_s[0], time_s[-1] + 0.5 * median_dt, median_dt)
     uniform_values = np.interp(uniform_time, time_s, values)
 
+    # 本段把采样质量写成机器可读指标。
+    # 后续 summary 会展示这些值；如果 max_gap 或估计帧率异常，会额外生成采样率警告。
     timing = {
         "sample_rate_hz": sample_rate_hz,
         "median_dt_s": median_dt,
@@ -478,6 +520,48 @@ def resample_uniform(
         "uniform_sample_count": int(len(uniform_time)),
     }
     return uniform_time, uniform_values, sample_rate_hz, timing
+
+
+def sampling_warnings(timing: dict[str, float]) -> list[str]:
+    """
+    根据实际采样时间判断是否需要提醒用户。
+
+    输入：resample_uniform() 估计出的采样时间质量；
+    输出：中文警告列表。正常接近 132 fps 时返回空列表，不打扰用户。
+
+    实验作用：
+    你的相机标称 132 fps，但真实采集可能略有偏差。这里不要求精确等于 132；
+    只有估计帧率明显偏离，或出现异常大间隔时，才提示你检查相机导出、timestamps.csv 或掉帧问题。
+    """
+
+    warnings: list[str] = []
+    expected = config.EXPECTED_VISION_FPS
+    actual = float(timing["sample_rate_hz"])
+
+    # 本段检查“整体采样率是否明显偏离标称值”。
+    # 输入是实际估计帧率和配置里的期望帧率；输出最多一条偏差警告。
+    if expected is not None:
+        tolerance = max(
+            float(config.FPS_WARNING_ABSOLUTE_TOLERANCE_HZ),
+            abs(float(expected)) * float(config.FPS_WARNING_RELATIVE_TOLERANCE),
+        )
+        if abs(actual - float(expected)) > tolerance:
+            warnings.append(
+                f"实测采样率约 {actual:.3f} Hz，和标称 {float(expected):.3f} Hz "
+                f"偏差超过 {tolerance:.3f} Hz。"
+            )
+
+    # 本段检查“局部是否出现异常大间隔”。
+    # 即使平均 fps 正常，个别大间隔也可能影响频谱和恢复时间，所以单独提醒。
+    median_dt = float(timing["median_dt_s"])
+    max_gap = float(timing["max_gap_s"])
+    if median_dt > 0 and max_gap > median_dt * float(config.FRAME_GAP_WARNING_FACTOR):
+        warnings.append(
+            f"最大相邻采样间隔 {max_gap:.6f} s，超过中位间隔 "
+            f"{median_dt:.6f} s 的 {float(config.FRAME_GAP_WARNING_FACTOR):.2f} 倍。"
+        )
+
+    return warnings
 
 
 def _savgol_window_points(sample_rate_hz: float, sample_count: int) -> int:
@@ -1198,6 +1282,9 @@ def write_summary(
     output_path: Path,
     loaded: LoadedRun,
     timing: dict[str, float],
+    timing_warnings: list[str],
+    selected_window: str,
+    window_counts: dict[str, int],
     time_metrics: dict[str, float],
     spectrum: dict[str, Any],
     recovery: dict[str, float | None],
@@ -1224,6 +1311,7 @@ def write_summary(
         f"源文件：{loaded.source_path}",
         f"视觉方法：{config.ANALYSIS_VISION_METHOD}",
         f"分析方向：{config.ANALYSIS_AXIS}",
+        f"主分析窗口：{selected_window}",
         f"去趋势方法：{config.DETREND_METHOD}",
         "",
 
@@ -1237,6 +1325,7 @@ def write_summary(
         f"错误记录数：{len(loaded.errors)}",
         f"无法解析的行：{loaded.malformed_lines or '无'}",
         f"平均识别质量：{_format_optional(float(np.nanmean(valid_quality)), 4)}",
+        f"窗口点数：{window_counts}",
         "",
 
         # 第二节记录采样时间质量。
@@ -1246,6 +1335,7 @@ def write_summary(
         f"中位采样间隔：{timing['median_dt_s']:.9f} s",
         f"采样间隔标准差：{timing['dt_std_s']:.9f} s",
         f"最大相邻间隔：{timing['max_gap_s']:.9f} s",
+        f"采样率警告：{'; '.join(timing_warnings) if timing_warnings else '无'}",
         "",
 
         # 第三节是时域振动强度指标。
@@ -1317,76 +1407,96 @@ def write_summary(
 
 def run_analysis(analysis_file: Path | None = None) -> Path:
     """
-    完成一次分析并返回新建的结果文件夹。
+    完成一次离线振动分析并返回新建的结果文件夹。
 
-    主指标使用 motion 区间；时域总图仍展示完整有效序列和运动事件。
+    输入：
+    - run_log.txt 或 vision_results.txt；
+    - config.py 中选择的视觉方法、分析方向、主窗口和去趋势方法。
 
-    这个函数是 analyze.py 的“总导演”。
-    它不亲自做每个数学细节，而是按顺序调用本文件前面的小函数：
-    读日志 -> 取视觉序列 -> 选分析窗口 -> 重采样 -> 去趋势 -> 算指标 -> 画图 -> 写摘要。
+    输出：
+    - 时域图、频谱图、方法对比图、视觉/机器人对齐图；
+    - analysis_summary.txt 给人快速复查；
+    - analysis_metrics.json 给后续批量比较。
+
+    实验作用：
+    这里把视觉模块输出的“逐帧位移数据”转换成“振动结论”。
+    主窗口用于计算 RMS、峰峰值和频谱；完整窗口用于展示全程和估计恢复时间。
     """
 
-    # 1. 找到要分析的日志文件，并把逐行 JSON 拆成不同类别。
-    #    analysis_file 来自命令行参数；如果为 None，就按 config 或最新日志自动选择。
+    # 本段读入已经保存的实验/视觉日志。
+    # 输入可以来自命令行，也可以由配置自动选择最新文件；输出 loaded 按记录类型拆好了 META/EVENT/VISION/ROBOT。
     source_path = resolve_analysis_file(analysis_file)
     loaded = load_run_file(source_path)
 
-    # 2. 从视觉记录中取出某一种方法、某一个方向的位移序列。
-    #    例如 circles + x 表示“圆点法测得的 x 方向位移”。
-    #    quality 会用于摘要中评估识别质量，但不直接参与位移计算。
+    # 本段从逐帧 VISION 记录中抽出要分析的位移曲线。
+    # 输入是完整视觉日志；输出是某一种方法、某一个方向的 time/value/quality 序列。
+    # 例如 circles + x 表示“圆点法测得的 x 方向位移”。
     vision_time, vision_values, quality = extract_vision_series(
         loaded.vision,
         config.ANALYSIS_VISION_METHOD,
         config.ANALYSIS_AXIS,
     )
-    # 3. 读取事件时间，并根据事件把数据分成 full、motion 等分析窗口。
-    #    full 是完整有效视觉序列，motion 是运动命令开始到结束之间的区间。
+
+    # 本段把同一条位移曲线切成不同实验阶段。
+    # 输入是视觉时间轴和 EVENT 事件；输出是 full/baseline/motion/steady_motion/post 等窗口掩码。
     events = event_times_seconds(loaded.events)
     windows = select_analysis_windows(vision_time, events)
 
-    # 4. 主分析优先使用运动阶段；如果运动阶段点数太少，就退回使用完整有效视觉数据。
-    #    这样 vision_test 这类没有真实机器人事件的离线数据也能被分析。
-    primary_mask = windows["motion"]
+    # 本段决定“哪一段真正拿去算主指标”。
+    # 输入是所有候选窗口；输出是 primary_time/primary_values。
+    # 如果所选窗口点数太少，会退回 full，避免用几帧数据硬算频谱。
+    selected_window = config.ANALYSIS_PRIMARY_WINDOW
+    primary_mask = windows[selected_window]
     if np.count_nonzero(primary_mask) < 8:
-        print("[分析警告] motion 区间有效点不足 8，改用全部有效视觉数据。")
+        print(f"[分析警告] {selected_window} 区间有效点不足 8，改用全部有效视觉数据。")
+        selected_window = "full"
         primary_mask = windows["full"]
 
-    # 根据布尔掩码真正切出主分析用的时间和位移。
+    window_counts = {
+        name: int(np.count_nonzero(mask))
+        for name, mask in windows.items()
+    }
+
     primary_time = vision_time[primary_mask]
     primary_values = vision_values[primary_mask]
 
-    # 少于 8 个点时，重采样、去趋势和频谱都会非常不可靠，因此直接报错。
+    # 本段保护主分析的最低数据量。
+    # 少于 8 个点时，重采样、去趋势和频谱都没有稳定意义，因此直接报错。
     if len(primary_time) < 8:
         raise ValueError("最终主分析区间仍少于 8 个有效点。")
 
-    # 5. 把主分析区间重采样到均匀时间轴，然后去掉慢趋势，得到振动残差。
-    #    sample_rate_hz 是后续滤波、Welch 频谱和恢复时间计算都会使用的采样率。
+    # 本段把主窗口位移转换成“振动残差”。
+    # 输入是原始位移曲线；输出是均匀时间轴、趋势项和 residual。
+    # residual 才是后续 RMS/频谱真正关心的抖动，不是机器人正常运动的大位移。
     uniform_time, uniform_values, sample_rate_hz, timing = resample_uniform(
         primary_time,
         primary_values,
     )
+    timing_warnings = sampling_warnings(timing)
+    for warning in timing_warnings:
+        print(f"[分析警告] {warning}")
 
-    # trend 是估计出的整体慢变化，residual 是 original - trend 后留下的振动。
     trend, residual = detrend_motion(uniform_values, sample_rate_hz)
 
-    # 6. 对残差计算时域指标和频域指标。
-    #    time_metrics 负责“振得多大”，spectrum 负责“主要以多少 Hz 振”。
+    # 本段把残差转换成主分析结论。
+    # time_metrics 描述“抖得多大”；spectrum 描述“主要以多少 Hz 在抖”。
     time_metrics = calculate_time_metrics(residual)
     spectrum = calculate_spectrum(residual, sample_rate_hz)
 
-    # 恢复时间需要运动前、运动后完整序列，因此单独对 full 区间进行同样的重采样和去趋势。
-    # 这里不用 primary 区间，是因为 primary 可能只包含 motion，缺少运动前基线和运动后尾段。
+    # 本段准备恢复时间所需的完整序列。
+    # 主窗口可能只包含 motion 或 steady_motion；恢复时间必须同时看运动前基线和运动后尾段。
     full_mask = windows["full"]
     full_time = vision_time[full_mask]
     full_values = vision_values[full_mask]
 
-    # full_uniform_time/full_uniform_values 是完整序列的均匀时间轴版本。
     full_uniform_time, full_uniform_values, full_rate, _ = resample_uniform(
         full_time,
         full_values,
     )
 
-    # detrend_piecewise 会优先按运动前、运动中、运动后分段去趋势，减少阶段间互相影响。
+    # 本段对完整序列分段去趋势。
+    # 输入是全程位移；输出是全程趋势和全程残差。
+    # 分段处理能减少“静止-运动-静止”三段互相拉扯趋势线的问题。
     full_trend, full_residual = detrend_piecewise(
         full_uniform_time,
         full_uniform_values,
@@ -1394,23 +1504,23 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         events,
     )
 
-    # baseline 指运动开始前的静止阶段，用于估计背景噪声。
+    # 本段提取运动前静止基线。
+    # 输入是实验开始和运动命令事件；输出 baseline_uniform_mask。
+    # 恢复时间阈值会参考基线 RMS，避免把静态视觉噪声误判成残余振动。
     baseline_start = events.get("experiment_started", float(full_uniform_time[0]))
     baseline_end = events.get("motion_command_sent")
-
-    # 根据 baseline 起止时间，在完整均匀时间轴上建立布尔掩码。
     baseline_uniform_mask = _window_mask(
         full_uniform_time,
         baseline_start,
         baseline_end,
     )
 
-    # 如果没有 motion_command_sent，就无法可靠区分“运动前静止区间”，因此不使用 baseline。
     if baseline_end is None:
         baseline_uniform_mask[:] = False
 
-    # 7. 恢复时间表示运动结束后，残差连续回到阈值以内需要多久。
-    #    没有足够事件或数据时，该函数会返回 None，而不是猜一个结果。
+    # 本段计算运动后的恢复时间。
+    # 输入是全程残差、事件时间和基线掩码；输出包含恢复时间、阈值和基线 RMS。
+    # 事件不足时函数返回 None，不会凭空猜一个恢复时间。
     recovery = calculate_recovery_time(
         full_uniform_time,
         full_residual,
@@ -1418,19 +1528,21 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         baseline_uniform_mask,
         full_rate,
     )
-    # 8. 如果日志里同时有圆点法、棋盘格法或机器人 TCP 记录，就额外生成对比图。
-    #    这里只提取数据，不连接机器人；所有信息都来自已经保存的日志。
+
+    # 本段准备辅助对比数据。
+    # 输入仍然只来自日志文件；输出用于画圆点/棋盘格一致性图，以及视觉/UR TCP 对齐图。
+    # 这里不会连接机器人，也不会读取相机。
     comparison = compare_vision_methods(loaded.vision, config.ANALYSIS_AXIS)
     robot_series = extract_robot_tcp_series(loaded.robot, config.ANALYSIS_AXIS)
 
-    # 9. 所有输出都放进源日志旁边的新 analysis_时间戳 文件夹，避免覆盖旧分析。
-    #    这样同一个日志可以反复用不同配置分析，旧结果不会被悄悄覆盖。
+    # 本段创建本次分析结果文件夹。
+    # 同一个原始日志可以反复用不同窗口、方向或去趋势参数分析；每次结果都单独保存。
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = source_path.parent / f"analysis_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 10. 依次保存图表和 summary.txt。
-    #     第一张图是最重要的时域总览图。
+    # 本段输出时域总览图。
+    # 输入是完整原始位移、完整趋势、完整残差和事件时间；输出用于检查抖动发生在哪个实验阶段。
     plot_time_domain(
         output_dir / "01_time_domain.png",
         full_time,
@@ -1443,21 +1555,24 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         config.ANALYSIS_AXIS,
     )
 
-    # 第二张图是频域图，用于查看主频和频带能量来源。
+    # 本段输出频域图。
+    # 输入是主窗口 residual 的频谱结果；输出用于查看主频和频带能量。
     plot_spectrum(
         output_dir / "02_spectrum.png",
         spectrum,
         sample_rate_hz,
     )
 
-    # 第三张图是两种视觉方法对比；如果数据不足，函数会返回 False 并跳过有效绘图。
+    # 本段输出圆点法/棋盘格法一致性图。
+    # 如果其中一种方法数据不足，绘图函数会跳过有效曲线，避免制造误导性对比。
     plot_method_comparison(
         output_dir / "03_circle_checker_comparison.png",
         loaded.vision,
         config.ANALYSIS_AXIS,
     )
 
-    # 第四张图是视觉与 UR TCP 日志对齐；没有 ROBOT 记录时不会生成有效图。
+    # 本段输出视觉与 UR TCP 对齐图。
+    # 没有 ROBOT 记录时不会生成有效曲线；这张图只用于时间关系和趋势对比，不代表已完成外参标定。
     plot_vision_robot_alignment(
         output_dir / "04_vision_robot_alignment.png",
         full_time,
@@ -1466,11 +1581,15 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         config.ANALYSIS_AXIS,
     )
 
-    # 写给人看的中文摘要，适合打开后快速判断本次结果是否可信。
+    # 本段输出给人看的中文摘要。
+    # 输入是本次分析的核心指标、采样率警告、窗口点数和错误记录；输出用于快速判断结果是否可信。
     write_summary(
         output_dir / "analysis_summary.txt",
         loaded,
         timing,
+        timing_warnings,
+        selected_window,
+        window_counts,
         time_metrics,
         spectrum,
         recovery,
@@ -1485,8 +1604,11 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         "source_file": str(source_path),
         "analysis_method": config.ANALYSIS_VISION_METHOD,
         "analysis_axis": config.ANALYSIS_AXIS,
+        "analysis_primary_window": selected_window,
+        "window_counts": window_counts,
         "detrend_method": config.DETREND_METHOD,
         "timing": timing,
+        "timing_warnings": timing_warnings,
         "time_metrics": time_metrics,
         "dominant_frequency_hz": spectrum["dominant_frequency_hz"],
         "band_energy_mm2": spectrum["band_energy_mm2"],

@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import importlib
+import csv
 import math
 import re
 import sys
@@ -39,6 +40,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 import config
+from calibration import image_points_to_spatial
 
 
 # =============================================================================
@@ -91,7 +93,20 @@ def _natural_sort_key(path: Path) -> list[int | str]:
 
 class ImageFolderSource:
     """
-    按顺序读取一个文件夹中的静态图片，不需要相机 SDK。
+    离线图片序列输入源。
+
+    输入：
+    - config.IMAGE_FOLDER 指向的图片文件夹；
+    - 可选 timestamps.csv，记录每张图片真实采集时间；
+    - 没有 timestamps.csv 时使用 config.IMAGE_FOLDER_FPS 生成兜底时间轴。
+
+    输出：
+    - for 循环每次产出一个 FramePacket；
+    - FramePacket 中包含图像数组、帧号、电脑读取时间、分析用时间和来源文件名。
+
+    实验作用：
+    这部分服务于预实验离线分析。它不连接相机，只把已经采集好的图片整理成和视频/相机一致的帧格式，
+    让后面的 VisionProcessor 不需要关心图像到底来自哪里。
 
     适用场景：
     - 你还没有连接相机；
@@ -105,24 +120,77 @@ class ImageFolderSource:
     """
 
     def __init__(self, folder: Path, fps: float) -> None:
-        # folder 是图片所在目录。
+        # 本段保存“离线图片输入源”的基础配置。
+        # folder 决定从哪里读图片；fps 只在没有真实时间戳时参与时间轴构造。
         self.folder = Path(folder)
-
-        # fps 用来把“第几张图片”换算成“第几秒”。
         self.fps = float(fps)
 
-        # __enter__ 中会扫描文件夹，把实际图片路径放进这里。
+        # 本段保存运行时发现的数据。
+        # paths 是按时间顺序排列的图片列表；timestamps_* 是可选真实采集时间索引。
         self.paths: list[Path] = []
+        self.timestamps_by_name: dict[str, float] = {}
+        self.timestamps_by_index: dict[int, float] = {}
+
+    @staticmethod
+    def _load_timestamps(path: Path) -> tuple[dict[str, float], dict[int, float]]:
+        """
+        读取离线图片时间戳表。
+
+        输入：timestamps.csv，支持 filename,time_s 或 frame_id,time_s。
+        输出：按文件名或帧号索引的秒级时间戳。
+        实验作用：让离线分析使用真实采集间隔，而不是强行假设每帧严格等于 1/fps。
+        """
+
+        by_name: dict[str, float] = {}
+        by_index: dict[int, float] = {}
+
+        with path.open("r", encoding="utf-8-sig", newline="") as file:
+            sample = file.read(2048)
+            file.seek(0)
+            try:
+                has_header = csv.Sniffer().has_header(sample) if sample.strip() else False
+            except csv.Error:
+                has_header = False
+
+            if has_header:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    time_text = row.get("time_s") or row.get("timestamp_s") or row.get("t")
+                    if not time_text:
+                        continue
+                    time_s = float(time_text)
+                    filename = row.get("filename") or row.get("file") or row.get("name")
+                    frame_id = row.get("frame_id") or row.get("index")
+                    if filename:
+                        by_name[filename] = time_s
+                    if frame_id not in (None, ""):
+                        by_index[int(frame_id)] = time_s
+            else:
+                reader = csv.reader(file)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    key = row[0].strip()
+                    time_s = float(row[1])
+                    if key.isdigit():
+                        by_index[int(key)] = time_s
+                    else:
+                        by_name[key] = time_s
+
+        return by_name, by_index
 
     def __enter__(self) -> "ImageFolderSource":
-        # 进入 with 时先确认文件夹存在。
+        # 本段完成离线输入源的启动检查。
+        # 输入是 config.py 中指定的文件夹；输出是 self.paths 和可选时间戳索引。
+        # 如果这里失败，说明后续视觉处理没有可靠图片序列可读，应在正式处理前直接停止。
         if not self.folder.exists():
             raise FileNotFoundError(
                 f"图片文件夹不存在：{self.folder}\n"
                 "请创建该文件夹并放入按时间排序的图片，或修改 config.py 的 IMAGE_FOLDER。"
             )
 
-        # 扫描所有支持扩展名的图片，并按自然顺序排序。
+        # 本段把文件夹中的图片整理成稳定的时间顺序。
+        # 自然排序让 frame2 排在 frame10 前面，避免文件名排序破坏位移-时间曲线。
         self.paths = sorted(
             (
                 path
@@ -132,35 +200,54 @@ class ImageFolderSource:
             key=_natural_sort_key,
         )
 
-        # 没有图片时直接报错，避免后面 for 循环静默什么都不做。
+        # 本段阻止“空输入”悄悄进入后续流程。
+        # 没有图片时，生成空结果比直接报错更难排查，所以这里立即说明问题。
         if not self.paths:
             raise FileNotFoundError(
                 f"图片文件夹中没有支持的图像：{self.folder}\n"
                 f"支持的扩展名为：{', '.join(config.IMAGE_EXTENSIONS)}。"
             )
 
+        # 本段尝试载入真实采集时间。
+        # 有 timestamps.csv 时，后续每帧使用真实时间；没有时按 IMAGE_FOLDER_FPS 兜底。
+        # 如果你明确要求时间戳文件，则缺失会在这里报错，避免后续频率分析使用错误时间轴。
+        timestamp_path = config.IMAGE_TIMESTAMPS_CSV
+        if timestamp_path is not None:
+            timestamp_path = Path(timestamp_path)
+            if timestamp_path.exists():
+                self.timestamps_by_name, self.timestamps_by_index = self._load_timestamps(
+                    timestamp_path
+                )
+                print(f"[视觉] 已读取图片时间戳：{timestamp_path}")
+            elif config.IMAGE_TIMESTAMPS_REQUIRED:
+                raise FileNotFoundError(f"要求使用图片时间戳，但文件不存在：{timestamp_path}")
+
         print(f"[视觉] 已找到 {len(self.paths)} 张图片：{self.folder}")
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        # 静态图片没有需要释放的设备句柄，这个方法只是让三种来源拥有统一用法。
+        # 图片文件夹没有相机句柄需要释放；保留该方法是为了和视频/相机输入源使用同一种 with 写法。
         return None
 
     def __iter__(self) -> Iterator[FramePacket]:
-        # enumerate 同时给出图片序号 index 和路径 path。
+        # 本循环是“离线图片 -> FramePacket”的转换流水线。
+        # 输入是已经排序好的图片路径；输出是后续视觉算法统一消费的 FramePacket。
+        # 每张图片只在即将处理时读取，不会一次性把所有图像加载进内存。
         for index, path in enumerate(self.paths):
-            # cv2.imread 返回 BGR 图像；读取失败时返回 None。
             frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
 
-            # host_ns 记录“电脑读到这一帧”的时间，方便和其他日志对齐。
+            # host_ns 表示电脑读取到这一帧的时间；camera_time_s 表示离线分析应使用的采集时间。
+            # 对图片文件夹来说，真正影响频谱的是 camera_time_s，而不是电脑解码这一帧花了多久。
             host_ns = time.perf_counter_ns()
 
             if frame is None:
                 print(f"[视觉警告] OpenCV 无法读取，已跳过：{path.name}")
                 continue
 
-            # 离线图片没有相机硬件时间，使用帧号和设定帧率构造相对秒数。
-            camera_time_s = index / self.fps
+            camera_time_s = self.timestamps_by_name.get(
+                path.name,
+                self.timestamps_by_index.get(index, index / self.fps),
+            )
             yield FramePacket(
                 frame,
                 index,
@@ -172,7 +259,19 @@ class ImageFolderSource:
 
 class VideoSource:
     """
-    用 OpenCV 解码普通视频；后续识别算法并不知道它与真实相机有什么区别。
+    离线视频输入源。
+
+    输入：
+    - config.VIDEO_PATH 指向的视频文件；
+    - 视频容器里的帧率和时间戳信息。
+
+    输出：
+    - for 循环每次产出一个 FramePacket；
+    - FramePacket 中包含当前视频帧、帧号、电脑读取时间和视频自身时间。
+
+    实验作用：
+    这部分用于把已录好的视频当成图片序列分析。它不连接真实相机，
+    但会尽量保留视频内部时间戳，让后续频谱分析使用采集时间，而不是电脑解码速度。
 
     它和 ImageFolderSource 的共同点：
     - 都会产出 FramePacket；
@@ -185,31 +284,28 @@ class VideoSource:
     """
 
     def __init__(self, video_path: Path) -> None:
-        # video_path 是要打开的视频文件。
+        # 本段保存视频输入源的基础配置。
+        # video_path 是离线视频文件；capture 和 fps 会在进入 with 时由 OpenCV 打开后确定。
         self.video_path = Path(video_path)
-
-        # capture 是 OpenCV 的视频读取对象；进入 with 后才真正创建。
         self.capture: cv2.VideoCapture | None = None
-
-        # fps 会在打开视频后读取；若视频没写帧率，就退回 30。
         self.fps = 0.0
 
     def __enter__(self) -> "VideoSource":
-        # 先检查路径，避免 OpenCV 给出不清楚的打开失败。
+        # 本段完成视频输入源的启动检查。
+        # 输入是 config.py 指定的视频路径；输出是可逐帧读取的 OpenCV VideoCapture。
+        # 如果这里失败，说明后续视觉处理没有可靠帧序列可读，应在正式处理前直接停止。
         if not self.video_path.exists():
             raise FileNotFoundError(
                 f"视频不存在：{self.video_path}\n"
                 "请修改 config.py 的 VIDEO_PATH，或切换回 image_folder。"
             )
 
-        # 创建 OpenCV 视频读取器。
+        # 本段打开视频文件并读取视频时间信息。
+        # fps 只作为兜底；若视频提供每帧时间戳，后续会优先用 CAP_PROP_POS_MSEC。
         self.capture = cv2.VideoCapture(str(self.video_path))
-
-        # isOpened() 为 False 说明文件不存在、格式不支持或解码器不可用。
         if not self.capture.isOpened():
             raise RuntimeError(f"OpenCV 无法打开视频：{self.video_path}")
 
-        # 读取视频标称帧率；有些视频容器可能返回 0 或 NaN。
         self.fps = float(self.capture.get(cv2.CAP_PROP_FPS))
         if not math.isfinite(self.fps) or self.fps <= 0:
             self.fps = 30.0
@@ -219,28 +315,29 @@ class VideoSource:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        # 退出 with 时释放视频文件句柄。
+        # 本段释放视频文件句柄。
+        # 输出是关闭后的 capture=None，避免下次运行仍占用文件或解码器资源。
         if self.capture is not None:
             self.capture.release()
         self.capture = None
 
     def __iter__(self) -> Iterator[FramePacket]:
-        # 如果用户没有放进 with 里使用，capture 还没创建，应立即报错。
+        # 本循环是“离线视频 -> FramePacket”的转换流水线。
+        # 输入是 OpenCV 解码出的下一帧；输出是后续视觉算法统一消费的 FramePacket。
+        # 和图片文件夹一样，这里逐帧读、逐帧交给后续处理，不一次性解码完整视频。
         if self.capture is None:
             raise RuntimeError("VideoSource 必须放在 with 语句中使用。")
 
         frame_id = 0
         while True:
-            # read() 读取下一帧；ok=False 表示读完或解码失败。
             ok, frame = self.capture.read()
             host_ns = time.perf_counter_ns()
             if not ok:
                 break
 
-            # 视频容器里的当前位置通常以毫秒表示。
+            # 本段决定视频帧用于离线分析的时间。
+            # 优先使用视频容器时间戳；取不到时才用 frame_id/fps 估算。
             position_ms = float(self.capture.get(cv2.CAP_PROP_POS_MSEC))
-
-            # 若当前位置无效，就用 frame_id/fps 估算相对秒数。
             camera_time_s = position_ms / 1000.0 if position_ms > 0 else frame_id / self.fps
 
             yield FramePacket(
@@ -255,31 +352,44 @@ class VideoSource:
 
 class HikCameraSource:
     """
-    海康 MVS Python 接口适配器。
+    海康 MVS 实时相机输入源。
+
+    输入：
+    - MVS SDK；
+    - config.py 中的相机序列号、曝光、增益和取帧超时；
+    - 相机连续取流返回的图像缓冲区。
+
+    输出：
+    - for 循环每次产出一个 FramePacket；
+    - FramePacket 中包含相机帧号、电脑接收时间、相机原始时间戳和图像数组。
+
+    实验作用：
+    这部分只负责把海康相机接入统一的视觉流水线。后面的识别算法仍然只看 FramePacket，
+    不需要知道 MVS 的设备枚举、句柄、缓冲区和像素格式细节。
 
     MVS 不同版本的包装类字段可能略有区别，因此所有厂商调用都集中在这里，算法部分无需跟着改。
     """
 
     def __init__(self) -> None:
-        # sdk 是 MvCameraControl_class 模块本身。
+        # 本段保存海康相机运行时资源。
+        # sdk/camera/device_info 属于 MVS 控制层；payload/buffer/frame_info 属于连续取帧层。
+        # 它们在 __enter__ 中创建，在 close() 中按顺序释放。
         self.sdk: Any = None
-
-        # camera 是 SDK 创建出来的相机句柄对象。
         self.camera: Any = None
-
-        # device_info 保存枚举到并最终选中的相机信息。
         self.device_info: Any = None
-
-        # payload_size 是每帧图像数据最大字节数，用来分配接收缓冲区。
         self.payload_size = 0
-
-        # data_buffer 和 frame_info 是 SDK 取帧时反复复用的底层结构。
         self.data_buffer: Any = None
         self.frame_info: Any = None
 
     @staticmethod
     def _decode_c_string(value: Any) -> str:
-        """把 SDK 的定长 C 字符数组安全转成普通字符串。"""
+        """
+        把 SDK 的定长 C 字符数组转换成 Python 字符串。
+
+        输入：MVS 设备信息结构里的序列号字段。
+        输出：普通字符串，用于显示和按序列号选择相机。
+        实验作用：多相机场景下必须能读出序列号，避免预实验连接到错误相机。
+        """
 
         try:
             raw = bytes(value)
@@ -288,16 +398,14 @@ class HikCameraSource:
         return raw.split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
 
     def _load_sdk(self) -> Any:
-        # 只有真正选择 hik_camera 才执行这里，所以没装 MVS 不会影响离线模式。
-        # 如果 config.py 写了 MVS 的 MvImport 路径，就临时加入 sys.path。
-        # 只有真正选择 hik_camera 才执行这里，所以没装 MVS 不会影响离线模式。
+        # 本段只在 VISION_SOURCE="hik_camera" 时加载 MVS。
+        # 输入是可选 HIK_MVS_IMPORT_PATH；输出是 MvCameraControl_class 模块。
+        # 离线图片/视频不会执行这里，因此没有安装 MVS 也不影响预实验离线分析。
         if config.HIK_MVS_IMPORT_PATH:
             import_path = str(Path(config.HIK_MVS_IMPORT_PATH).expanduser().resolve())
             if import_path not in sys.path:
                 sys.path.insert(0, import_path)
 
-        # MVS Python 示例通常提供 MvCameraControl_class.py。
-        # import_module 成功后，后续才可以枚举设备和取帧。
         try:
             return importlib.import_module("MvCameraControl_class")
         except ImportError as exc:
@@ -308,7 +416,13 @@ class HikCameraSource:
             ) from exc
 
     def _device_serial(self, device_info: Any) -> str:
-        """同时兼容 GigE 与 USB3 设备结构，尽量读取序列号用于防止连错相机。"""
+        """
+        从 MVS 设备结构中读取相机序列号。
+
+        输入：枚举得到的一台相机 device_info。
+        输出：序列号字符串，无法读取时返回空字符串。
+        实验作用：正式预实验中建议指定序列号，保证数据来自预期那台相机。
+        """
 
         transport = int(device_info.nTLayerType)
         gige_type = int(getattr(self.sdk, "MV_GIGE_DEVICE", -1))
@@ -321,7 +435,13 @@ class HikCameraSource:
         return ""
 
     def _select_device(self, device_list: Any) -> Any:
-        """按序列号选择相机；未填序列号时明确使用枚举到的第一台。"""
+        """
+        从枚举结果中选出本次要使用的相机。
+
+        输入：MVS 枚举到的设备列表，以及 config.HIK_CAMERA_SERIAL。
+        输出：被选中的 device_info。
+        实验作用：有序列号时严格匹配；没有序列号时给出警告后使用第一台，避免使用者误以为已经精确选机。
+        """
 
         from ctypes import POINTER, cast
 
@@ -352,13 +472,25 @@ class HikCameraSource:
         return candidates[0][1]
 
     def _check_ret(self, ret: int, action: str) -> None:
-        """MVS 通常用 0 表示成功；把十进制错误码转为更常见的十六进制便于查手册。"""
+        """
+        统一检查 MVS 调用返回值。
+
+        输入：MVS 返回码和当前动作名称。
+        输出：成功时不返回内容；失败时抛出包含十六进制错误码的异常。
+        实验作用：把硬件接口错误尽早变成可读报错，方便定位是枚举、打开、取流还是参数设置失败。
+        """
 
         if int(ret) != 0:
             raise RuntimeError(f"{action}失败，MVS 返回码 0x{int(ret) & 0xFFFFFFFF:08X}")
 
     def _try_set_float(self, node_name: str, value: float | None) -> None:
-        """曝光或增益节点不是每台相机都同名，设置失败时给出警告而不是静默忽略。"""
+        """
+        尝试设置相机浮点参数，例如曝光或增益。
+
+        输入：MVS 节点名和目标数值；value=None 表示保持相机当前配置。
+        输出：设置成功或打印警告。
+        实验作用：曝光/增益会影响识别质量，但不同相机节点范围不同，因此失败时提醒使用者去 MVS 客户端核对。
+        """
 
         if value is None:
             return
@@ -372,6 +504,8 @@ class HikCameraSource:
     def __enter__(self) -> "HikCameraSource":
         from ctypes import c_ubyte
 
+        # 本段完成“找到相机并独占打开”的硬件启动流程。
+        # 输入是 MVS SDK 和配置中的相机序列号；输出是可控制、可取流的 camera 句柄。
         self.sdk = self._load_sdk()
         device_list = self.sdk.MV_CC_DEVICE_INFO_LIST()
         transport_mask = int(self.sdk.MV_GIGE_DEVICE) | int(self.sdk.MV_USB_DEVICE)
@@ -388,13 +522,13 @@ class HikCameraSource:
         )
 
         try:
-            # GigE 使用合适包长可减少丢帧；USB 相机通常不会进入这个分支。
+            # 本段配置相机取流状态。
+            # 输出是连续自由运行的相机流；曝光/增益按配置尝试设置，PayloadSize 决定接收缓冲区大小。
             if int(self.device_info.nTLayerType) == int(self.sdk.MV_GIGE_DEVICE):
                 packet_size = int(self.camera.MV_CC_GetOptimalPacketSize())
                 if packet_size > 0:
                     self.camera.MV_CC_SetIntValue("GevSCPSPacketSize", packet_size)
 
-            # 本实验采用连续自由运行，不等待外部触发信号。
             self.camera.MV_CC_SetEnumValue("TriggerMode", int(self.sdk.MV_TRIGGER_MODE_OFF))
 
             if config.HIK_EXPOSURE_US is not None:
@@ -416,7 +550,8 @@ class HikCameraSource:
 
             self._check_ret(self.camera.MV_CC_StartGrabbing(), "开始取流")
         except Exception:
-            # 打开过程中任一步失败都要主动释放句柄，否则下一次运行可能显示设备正被占用。
+            # 本段处理半打开失败。
+            # 如果配置或取流启动中途失败，必须释放句柄，否则下一次运行可能显示设备仍被占用。
             self.close()
             raise
 
@@ -424,8 +559,16 @@ class HikCameraSource:
         return self
 
     def _convert_raw_frame(self, frame_info: Any) -> np.ndarray:
-        """把 MVS 缓冲区转换成 OpenCV 的灰度或 BGR 图像。"""
+        """
+        把 MVS 原始缓冲区转换成 OpenCV 图像。
 
+        输入：MVS 当前帧信息和 self.data_buffer 中的原始字节。
+        输出：灰度图或 BGR 图像数组，供 preprocess_frame() 继续处理。
+        实验作用：工业相机可能输出 Mono8、RGB/BGR 或 Bayer 格式；这里统一成 OpenCV 能识别的图像格式。
+        """
+
+        # 本段读取当前帧的尺寸、像素格式和原始字节范围。
+        # 输出 raw 仍然只是字节视图，后面会根据 pixel_type 解释成图像。
         width = int(frame_info.nWidth)
         height = int(frame_info.nHeight)
         pixel_type = int(frame_info.enPixelType)
@@ -435,6 +578,8 @@ class HikCameraSource:
         bgr8 = getattr(self.sdk, "PixelType_Gvsp_BGR8_Packed", None)
         rgb8 = getattr(self.sdk, "PixelType_Gvsp_RGB8_Packed", None)
 
+        # 本段处理已经是灰度或彩色打包的简单格式。
+        # 输出会 copy 一份，避免下一次相机取帧覆盖同一块底层缓冲区时影响当前图像。
         if mono8 is not None and pixel_type == int(mono8):
             return raw.reshape(height, width).copy()
 
@@ -445,7 +590,8 @@ class HikCameraSource:
             rgb = raw.reshape(height, width, 3)
             return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-        # Bayer 具体排列必须与相机 PixelFormat 一致；这里只处理 SDK 中能明确识别的常见类型。
+        # 本段处理常见 Bayer8 格式。
+        # 输入仍是单通道原始图；输出是插值得到的 BGR 图，用于和其他来源保持一致。
         bayer_codes = {
             getattr(self.sdk, "PixelType_Gvsp_BayerGR8", -101): cv2.COLOR_BayerGR2BGR,
             getattr(self.sdk, "PixelType_Gvsp_BayerRG8", -102): cv2.COLOR_BayerRG2BGR,
@@ -462,6 +608,9 @@ class HikCameraSource:
         )
 
     def __iter__(self) -> Iterator[FramePacket]:
+        # 本循环是“真实相机帧 -> FramePacket”的实时输入流水线。
+        # 输入是 MVS 连续取流；输出是统一格式的 FramePacket。
+        # 这里会阻塞等待下一帧，超过 HIK_FRAME_TIMEOUT_MS 就报错，避免实验长时间无声卡住。
         if self.camera is None:
             raise RuntimeError("HikCameraSource 必须放在 with 语句中使用。")
 
@@ -483,6 +632,8 @@ class HikCameraSource:
                     f"MVS 返回 0x{int(ret) & 0xFFFFFFFF:08X}。"
                 )
 
+            # 本段把相机帧变成后续视觉算法可消费的记录。
+            # host_ns 用于和 UR/事件日志对时；timestamp_raw 保留相机原始硬件时间供以后扩展。
             frame = self._convert_raw_frame(self.frame_info)
             timestamp_raw = (
                 (int(self.frame_info.nDevTimeStampHigh) << 32)
@@ -498,7 +649,13 @@ class HikCameraSource:
             )
 
     def close(self) -> None:
-        """按“停止取流→关闭设备→销毁句柄”顺序释放资源，并容忍只打开了一半的情况。"""
+        """
+        释放海康相机相关资源。
+
+        输入：当前可能已经打开到一半或完全打开的 camera 句柄。
+        输出：停止取流、关闭设备、销毁句柄后的空闲状态。
+        实验作用：无论正常结束还是异常退出，都尽量避免相机被上一次程序占用。
+        """
 
         if self.camera is None:
             return
@@ -519,7 +676,14 @@ class HikCameraSource:
 
 def open_image_source() -> ImageFolderSource | VideoSource | HikCameraSource:
     """
-    根据 config.py 只创建一种图像来源，未选择的硬件库不会被导入。
+    根据配置创建本次视觉流程唯一的图像来源。
+
+    输入：config.VISION_SOURCE。
+    输出：ImageFolderSource、VideoSource 或 HikCameraSource 中的一个。
+
+    实验作用：
+    后续代码只面对统一的 FramePacket，不关心帧来自图片、视频还是相机。
+    同时，未选择的硬件库不会被导入，避免离线分析因为缺 MVS SDK 而失败。
 
     初学者可以把它看成“开关分流器”：
     - VISION_SOURCE="image_folder"：从 input_images 逐张读图片；
@@ -542,27 +706,36 @@ def open_image_source() -> ImageFolderSource | VideoSource | HikCameraSource:
 
 def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], tuple[int, int]]:
     """
-    把原图变成识别用灰度图，并记录亮度、过曝比例和清晰度。
+    把原始图像转换成视觉识别输入。
 
-    返回的 ROI 原点用于把识别坐标画回原图；运动计算本身始终在同一 ROI 坐标系内完成。
+    输入：FramePacket.frame，即图片/视频/相机来源提供的原始 OpenCV 图像。
+    输出：
+    - gray：后续圆点和棋盘格算法使用的灰度图；
+    - metrics：亮度、模糊、过暗/过曝比例；
+    - roi_origin：ROI 左上角在原图中的位置，用于把识别点画回完整图像。
+
+    实验作用：
+    这里不计算位移，只做“让图像适合识别”和“记录图像质量”。
+    如果某帧识别失败，metrics 能帮助判断是算法问题，还是曝光/模糊/ROI 设置问题。
     """
 
     if frame is None or frame.size == 0:
         raise ValueError("收到空图像，无法预处理。")
 
-    # working 是后续真正拿去识别的图像副本/视图。
-    # 原始 frame 仍保留，用来把调试点画回完整图像。
+    # 本段建立识别工作图像。
+    # 输入是原始 frame；输出 working 可能经过畸变校正和 ROI 裁剪，但原始 frame 仍保留给调试图使用。
     working = frame
 
-    # 如果做过相机标定，就可以在这里消除镜头畸变。
-    # 没做标定时 CAMERA_MATRIX 为 None，这一步会被跳过。
+    # 本段可选做镜头畸变校正。
+    # 输入是相机内参/畸变；输出是几何上更接近真实投影的图像，有利于像素坐标和空间坐标一致。
     if config.CAMERA_MATRIX is not None:
         camera_matrix = np.asarray(config.CAMERA_MATRIX, dtype=np.float64)
         distortion = np.asarray(config.DISTORTION_COEFFICIENTS, dtype=np.float64)
         working = cv2.undistort(working, camera_matrix, distortion)
 
-    # ROI 是 Region Of Interest，意思是“只看图像中的某一小块”。
-    # 这样既能加快识别，也能避免背景中的其他圆形/棋盘格干扰。
+    # 本段可选裁剪 ROI。
+    # 输入是完整图像和 VISION_ROI；输出是只包含测量纸附近区域的 working。
+    # 实验中固定相机后，ROI 能减少背景误识别，也能加快离线批处理。
     roi_origin = (0, 0)
     if config.VISION_ROI is not None:
         x, y, width, height = config.VISION_ROI
@@ -574,15 +747,16 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
         working = working[y : y + height, x : x + width]
         roi_origin = (x, y)
 
-    # OpenCV 的很多识别函数更喜欢灰度图。
-    # 如果输入已经是灰度，就直接复制；如果是彩色 BGR，就转成灰度。
+    # 本段把工作图像统一成灰度图。
+    # 输出 gray 是后续棋盘格角点和圆点轮廓检测的共同输入。
     if working.ndim == 2:
         gray = working.copy()
     else:
         gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
 
-    # 轻微模糊可以压低传感器噪声，让阈值分割更稳定。
-    # 但模糊太强会吃掉圆点/角点边缘，所以核大小由 config.py 控制。
+    # 本段可选做轻微高斯滤波。
+    # 输入是灰度图；输出是噪声略低的灰度图。
+    # 这有助于阈值分割稳定，但核太大会吃掉边缘，所以由 config.py 控制。
     if config.GAUSSIAN_BLUR_KERNEL > 1:
         gray = cv2.GaussianBlur(
             gray,
@@ -590,8 +764,8 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
             0,
         )
 
-    # 这些 metrics 不直接决定结果，而是帮助你判断“为什么某帧识别失败”。
-    # 例如 blur_variance 很低通常说明图像糊了，bright_fraction 很高通常说明过曝。
+    # 本段生成图像质量指标。
+    # 输出写入每帧 VISION 记录，用于回头解释识别失败或位移异常。
     metrics = {
         "mean_brightness": float(np.mean(gray)),
         "blur_variance": float(cv2.Laplacian(gray, cv2.CV_64F).var()),
@@ -608,21 +782,31 @@ def _estimate_rigid_motion(
     residual_warning_px: float,
 ) -> dict[str, float | bool]:
     """
-    用多点最小二乘估计平移、平面转角和尺度变化。
+    用一组对应点估计当前帧相对参考帧的整体运动。
 
-    位移使用对应点质心差，避免“绕纸张中心旋转”被错误解释成额外平移。
+    输入：
+    - reference_points：参考帧中的点坐标；
+    - current_points：当前帧中与参考点一一对应的点坐标；
+    - mm_per_pixel：像素位移换算成毫米的比例；
+    - residual_warning_px：残差质量评分的参考阈值。
 
-    这里的“刚体运动”是指：测量纸整体移动、旋转、轻微缩放，但纸上点之间的相对布局基本不变。
-    如果某些点被误识别，RANSAC 会尽量剔除它们；如果有效点太少，就返回无效结果。
+    输出：
+    - dx_mm / dy_mm：当前帧相对参考帧的整体平移；
+    - angle_deg / scale：平面内转角和尺度变化；
+    - residual_px / quality：拟合残差和质量分。
+
+    实验作用：
+    棋盘格和圆点法最后都会走到这里。它把“多个点的像素坐标变化”压缩成
+    “测量纸整体在图像平面内怎么动”，这是后续振动分析的位移来源。
     """
 
-    # 不管外面传来的数组形状是什么，先强制整理成 N 行 2 列的浮点坐标。
-    # 每一行表示一个点：(x_pixel, y_pixel)。
+    # 本段统一输入点格式。
+    # 输出 ref/cur 都是 N×2 坐标数组，保证后续拟合函数看到的是同一种数据结构。
     ref = np.asarray(reference_points, dtype=np.float64).reshape(-1, 2)
     cur = np.asarray(current_points, dtype=np.float64).reshape(-1, 2)
 
-    # 至少 3 个点才能稳定估计二维平移、旋转和尺度。
-    # 两组点数量必须相同，因为第 i 个参考点要对应第 i 个当前点。
+    # 本段检查是否有足够点建立刚体运动。
+    # 少于 3 个点或点数不对应时，无法可靠估计平移/旋转/尺度，因此返回无效结果。
     if len(ref) < 3 or len(cur) != len(ref):
         return {
             "is_valid": False,
@@ -634,9 +818,9 @@ def _estimate_rigid_motion(
             "quality": 0.0,
         }
 
-    # estimateAffinePartial2D 会拟合一个“相似变换”：
-    # current ~= reference 经过平移 + 旋转 + 等比例缩放。
-    # RANSAC 参数让它能容忍少量错误点，而不是被一个坏点拖偏。
+    # 本段拟合参考点到当前点的相似变换。
+    # 输入是一一对应的像素点；输出 matrix 描述整体平移、旋转和等比例缩放。
+    # RANSAC 让少量误识别点不至于拖垮整帧结果。
     matrix, inliers = cv2.estimateAffinePartial2D(
         ref,
         cur,
@@ -657,12 +841,11 @@ def _estimate_rigid_motion(
             "quality": 0.0,
         }
 
-    # 用拟合出来的 matrix 把参考点变换到当前帧，再和真实当前点比较。
-    # 差值越小，说明本帧识别越可靠。
+    # 本段评估“拟合出来的整体运动”是否能解释当前点。
+    # 输出 errors 和 inlier_mask 用于计算质量分；残差大通常说明串点、漏点或图像质量差。
     predicted = cv2.transform(ref.reshape(1, -1, 2).astype(np.float32), matrix).reshape(-1, 2)
     errors = np.linalg.norm(predicted - cur, axis=1)
 
-    # inlier 是 RANSAC 认为“可信”的点。若 OpenCV 没有返回这个信息，就退回使用全部点。
     if inliers is None:
         inlier_mask = np.ones(len(ref), dtype=bool)
     else:
@@ -670,13 +853,15 @@ def _estimate_rigid_motion(
     if not np.any(inlier_mask):
         inlier_mask[:] = True
 
-    # 平移量用可信点的平均位移表示；再乘 mm_per_pixel 从像素换成毫米。
+    # 本段把像素级整体运动整理成实验记录字段。
+    # 平移量使用可信点平均位移，再乘 mm_per_pixel 换成毫米；角度和尺度从拟合矩阵读取。
     centroid_shift = np.mean(cur[inlier_mask] - ref[inlier_mask], axis=0)
     scale = float(math.hypot(matrix[0, 0], matrix[1, 0]))
     angle_deg = float(math.degrees(math.atan2(matrix[1, 0], matrix[0, 0])))
     residual = float(np.sqrt(np.mean(errors[inlier_mask] ** 2)))
 
-    # 质量分同时考虑内点比例和拟合残差，范围限制在 0～1 便于快速比较。
+    # 本段计算质量分。
+    # 内点比例反映“多少点支持同一个整体运动”；残差反映“这个整体运动解释点坐标的精度”。
     inlier_ratio = float(np.mean(inlier_mask))
     residual_score = math.exp(-residual / max(residual_warning_px, 1e-6))
     quality = float(np.clip(inlier_ratio * residual_score, 0.0, 1.0))
@@ -698,48 +883,50 @@ def _estimate_rigid_motion(
 
 class CheckerboardTracker:
     """
-    保存第一帧棋盘格作为固定参考，后续每帧都与同一参考比较。
+    棋盘格法的跨帧状态管理器。
 
-    为什么要保存第一帧：
-    程序关心的是“相对起始状态移动了多少”，不是棋盘格在图像中的绝对坐标。
-    第一帧角点就是参考坐标系，后续帧角点与它比较得到 dx/dy/转角。
+    输入：每帧预处理后的灰度图。
+    输出：checker_* 字段和当前帧角点像素坐标。
+
+    实验作用：
+    第一次成功识别到棋盘格时，把角点保存为参考状态；
+    后续帧都与这组参考角点比较，得到相对起始状态的二维位移、转角和质量分。
     """
 
     def __init__(self) -> None:
-        # reference_corners 保存第一帧识别到的角点。
+        # 本段保存棋盘格参考状态。
+        # reference_corners 是第一帧角点；mm_per_pixel 是由参考帧方格尺寸估计的像素/毫米关系。
         self.reference_corners: np.ndarray | None = None
-
-        # mm_per_pixel 保存第一帧估计出的毫米/像素比例。
         self.mm_per_pixel: float | None = None
 
     def _find_corners(self, gray: np.ndarray) -> np.ndarray | None:
         """
-        在灰度图中寻找棋盘格内角点。
+        在一帧灰度图中寻找棋盘格角点。
 
-        返回值：
-        - 找到时：形状为 (N, 2) 的角点坐标数组；
-        - 找不到时：None。
+        输入：preprocess_frame() 输出的灰度图。
+        输出：N×2 的角点像素坐标，找不到时返回 None。
+        实验作用：这是棋盘格法的原始检测步骤，后面的位移计算完全依赖这些角点是否稳定。
         """
 
-        # OpenCV 需要传入 (列数, 行数)，这些值来自 config.py。
+        # 本段准备棋盘格规格。
+        # 输入是 config.py 里的内角点数量；输出是 OpenCV 需要的 pattern。
         pattern = tuple(int(value) for value in config.CHECKERBOARD_INNER_CORNERS)
 
-        # SB 算法对光照和透视通常更稳；旧版 OpenCV 没有该函数时自动退回传统算法。
+        # 本段优先使用 OpenCV 的 SB 棋盘格检测。
+        # 输出是亚像素级角点坐标；如果当前 OpenCV 没有 SB 方法，后面会自动退回传统检测。
         if hasattr(cv2, "findChessboardCornersSB"):
-            # NORMALIZE_IMAGE 可减轻光照差异；EXHAUSTIVE 会更努力搜索，但稍慢。
             flags = cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE
             found, corners = cv2.findChessboardCornersSB(gray, pattern, flags=flags)
             if found:
-                # 统一整理成 N 行 2 列，并使用 float32，方便后续 OpenCV 函数处理。
                 return corners.reshape(-1, 2).astype(np.float32)
 
-        # 传统算法作为兜底，适配没有 SB 函数的 OpenCV 版本。
+        # 本段是传统棋盘格检测兜底。
+        # 输入仍是同一张灰度图；输出会再经过 cornerSubPix 细化，尽量减少角点量化误差。
         flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
         found, corners = cv2.findChessboardCorners(gray, pattern, flags=flags)
         if not found:
             return None
 
-        # 传统算法找到的是较粗略角点，cornerSubPix 会做亚像素级细化。
         criteria = (
             cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
             int(config.CHECKER_SUBPIX_MAX_ITER),
@@ -751,23 +938,23 @@ class CheckerboardTracker:
     @staticmethod
     def _calculate_mm_per_pixel(corners: np.ndarray) -> float:
         """
-        由相邻内角点间距与真实方格边长估计参考帧的毫米/像素比例。
+        由棋盘格角点估计图像平面的毫米/像素比例。
 
-        简单说：
-        - 已知真实棋盘格边长是 CHECKER_SQUARE_MM；
-        - 图像中相邻角点距离是 spacing_px；
-        - 所以 1 像素约等于 CHECKER_SQUARE_MM / spacing_px 毫米。
+        输入：参考帧中识别到的棋盘格角点。
+        输出：mm_per_pixel。
+        实验作用：把像素位移转换成纸面内毫米位移，让后续 dx/dy 不只是像素数。
         """
 
-        # corners 原本是 N 行 2 列；reshape 后变成“行、列、坐标”的网格结构。
+        # 本段把角点还原成棋盘格网格结构。
+        # 输出 grid 让横向/纵向相邻点间距都能参与比例尺估计。
         columns, rows = config.CHECKERBOARD_INNER_CORNERS
         grid = corners.reshape(rows, columns, 2)
 
-        # 横向相邻角点距离和纵向相邻角点距离都参与估计，提高稳健性。
         horizontal = np.linalg.norm(np.diff(grid, axis=1), axis=2).ravel()
         vertical = np.linalg.norm(np.diff(grid, axis=0), axis=2).ravel()
 
-        # 用中位数降低个别误差角点的影响。
+        # 本段用相邻角点距离的中位数建立比例尺。
+        # 中位数能降低个别角点抖动或局部模糊对比例尺的影响。
         spacing_px = float(np.median(np.concatenate((horizontal, vertical))))
 
         if spacing_px <= 0:
@@ -776,16 +963,20 @@ class CheckerboardTracker:
 
     def process(self, gray: np.ndarray) -> tuple[dict[str, Any], np.ndarray | None]:
         """
-        处理一帧灰度图，输出棋盘格法的结果字典和角点坐标。
+        完成一帧棋盘格法测量。
 
-        结果字典字段统一以 checker_ 开头，避免和圆点法字段混淆。
+        输入：当前帧灰度图。
+        输出：
+        - checker_* 结果字典；
+        - 当前帧角点坐标，用于日志保存和调试图绘制。
+
+        实验作用：
+        这里把“当前帧棋盘格角点”转换成“相对第一帧的位移/转角/质量”。
         """
 
-        # 第一步：尝试找棋盘格角点。
+        # 本段先做原始角点检测。
+        # 找不到角点时仍返回固定字段，保证逐帧 JSON 结构稳定，后续分析可以明确跳过无效帧。
         corners = self._find_corners(gray)
-
-        # 找不到角点时仍返回完整字段，只是标记 checker_is_valid=False。
-        # 这样日志每一行字段结构尽量一致，后续分析更容易。
         if corners is None:
             return {
                 "checker_is_valid": False,
@@ -798,19 +989,21 @@ class CheckerboardTracker:
                 "checker_corner_count": 0,
             }, None
 
-        # 第二步：第一帧成功识别时，把它保存为参考帧。
+        # 本段建立棋盘格参考状态。
+        # 第一次成功识别的角点就是位移零点；后续帧都和它比较。
         if self.reference_corners is None:
             self.reference_corners = corners.copy()
             self.mm_per_pixel = self._calculate_mm_per_pixel(corners)
 
-        # 第三步：取出参考点和比例尺。
-        # 这些检查主要是帮助静态分析器，也让异常状态下报错更明确。
+        # 本段读取参考状态并防御异常流程。
+        # 如果 reference 或比例尺缺失，说明初始化链路被破坏，应直接报错。
         reference_corners = self.reference_corners
         mm_per_pixel = self.mm_per_pixel
         if reference_corners is None or mm_per_pixel is None:
             raise RuntimeError("Checkerboard reference was not initialized.")
 
-        # 第四步：把当前角点与参考角点配对，估计整体位移和转角。
+        # 本段把角点坐标变化转换成整体运动。
+        # 输入是参考角点和当前角点；输出是毫米位移、转角、尺度和质量分。
         motion = _estimate_rigid_motion(
             reference_corners,
             corners,
@@ -818,7 +1011,8 @@ class CheckerboardTracker:
             config.CHECKER_RESIDUAL_WARNING_PX,
         )
 
-        # 第五步：整理成写日志用的普通字典。
+        # 本段整理当前帧棋盘格法日志。
+        # 输出字段统一以 checker_ 开头，避免和圆点法结果混淆。
         result = {
             "checker_is_valid": bool(motion["is_valid"]),
             "checker_dx_mm": motion["dx_mm"],
@@ -839,47 +1033,56 @@ class CheckerboardTracker:
 
 def _find_circle_candidates(gray: np.ndarray) -> list[dict[str, float]]:
     """
-    从黑底/白底不确定的灰度图中寻找近似圆或椭圆轮廓。
+    从一帧灰度图中寻找圆点候选。
 
-    棋盘方格会在多边形近似中呈现约 4 个顶点，因此要求轮廓至少 7 个顶点以降低误检。
+    输入：preprocess_frame() 输出的灰度图。
+    输出：候选圆点列表，每个候选包含圆心、面积、圆度、轴比和直径。
+
+    实验作用：
+    这里还没有决定圆点身份，也不计算位移；它只回答“这一帧里哪些黑色轮廓可能是圆点”。
+    后续 CircleTracker 会再根据第一帧参考和上一帧位置判断这些候选点是否可信。
     """
 
-    # Otsu 根据当前光照自动选阈值，THRESH_BINARY_INV 把黑色标记变成白色前景。
+    # 本段把灰度图转换成轮廓检测用的二值图。
+    # Otsu 会根据当前亮度自动选阈值；反色后黑色标记变成白色前景，方便 findContours。
     _, binary = cv2.threshold(
         gray,
         0,
         255,
         cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
     )
-    # findContours 会找出所有白色连通区域的边界。
-    # 每个 contour 都可能是一个圆点，也可能是噪声、反光或背景物体。
+    # 本段提取所有前景轮廓。
+    # 输出 contours 只是候选边界集合，里面可能混有噪声、反光、棋盘格边缘或背景圆形物。
     contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
 
     candidates: list[dict[str, float]] = []
     for contour in contours:
-        # 第一层筛选：面积。太小多半是噪声，太大多半不是目标圆点。
+        # 本段按尺寸排除明显不是目标圆点的轮廓。
+        # 面积阈值来自 config.py，通常需要根据相机距离和分辨率实拍调整。
         area = float(cv2.contourArea(contour))
         if area < config.CIRCLE_MIN_AREA_PX or area > config.CIRCLE_MAX_AREA_PX:
             continue
 
-        # 第二层筛选：周长。周长为 0 或点太少，无法可靠描述形状。
+        # 本段检查轮廓是否足够描述形状。
+        # 周长为 0 或轮廓点太少时，圆度和椭圆拟合都没有意义。
         perimeter = float(cv2.arcLength(contour, True))
         if perimeter <= 0 or len(contour) < 5:
             continue
 
-        # 第三层筛选：圆度。圆度公式 4*pi*面积/周长^2，越接近 1 越像圆。
+        # 本段按圆度筛选。
+        # 输出通过筛选的轮廓更接近圆形，但透视下允许它不是完美圆。
         circularity = float(4.0 * math.pi * area / (perimeter * perimeter))
         if circularity < config.CIRCLE_MIN_CIRCULARITY:
             continue
 
-        # 第四层筛选：多边形近似顶点数。
-        # 棋盘格方块通常近似为 4 个顶点，圆形边界会有更多顶点。
+        # 本段用多边形顶点数排除棋盘格方块。
+        # 方格边界通常近似为 4 个顶点，圆点边界会有更多顶点。
         polygon = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
         if len(polygon) < 7:
             continue
 
-        # 第五层筛选：椭圆拟合。
-        # 透视下圆点会变成椭圆，所以不要求完美圆，只要求长短轴比例别太极端。
+        # 本段用椭圆轴比保留透视下的圆点。
+        # 真实圆点在斜视时会变成椭圆，因此只排除过于细长的轮廓。
         ellipse = cast(
             tuple[tuple[float, float], tuple[float, float], float],
             cv2.fitEllipse(contour),
@@ -890,8 +1093,8 @@ def _find_circle_candidates(gray: np.ndarray) -> list[dict[str, float]]:
         if major <= 0 or minor / major < config.CIRCLE_MIN_AXIS_RATIO:
             continue
 
-        # 能走到这里的 contour 被认为是圆点候选。
-        # 这里保存的都是普通 float，方便后续转 JSON 或 NumPy 数组。
+        # 本段把通过筛选的轮廓整理成普通数值字段。
+        # 输出字段既用于后续圆心匹配，也方便未来需要时写入更详细的候选点调试日志。
         candidates.append(
             {
                 "x": float(cx),
@@ -903,115 +1106,134 @@ def _find_circle_candidates(gray: np.ndarray) -> list[dict[str, float]]:
             }
         )
 
-    # 若环境里还有圆孔或反光点，优先保留面积较大的预期数量，再交给跨帧匹配约束。
+    # 本段限制候选点数量。
+    # 若环境里有其他圆孔或反光点，先保留面积较大的预期数量，再交给跨帧匹配继续筛选。
     candidates.sort(key=lambda item: item["area"], reverse=True)
     return candidates[: config.CIRCLE_EXPECTED_COUNT]
 
 
 def _layout_span_mm() -> float:
     """
-    用理论布局中最远两点距离作为无需点身份的比例尺。
+    计算圆点理论布局的最大跨度。
 
-    圆点法没有像棋盘格那样的规则网格间距，
-    所以这里用“理论圆点布局中最远两点距离”与图像中的最远距离建立比例。
+    输入：config.CIRCLE_LAYOUT_MM 中的圆点纸真实坐标。
+    输出：最远两圆点之间的真实距离，单位 mm。
+    实验作用：圆点法没有棋盘格那种固定相邻间距，所以用布局跨度和图像跨度建立毫米/像素比例。
     """
 
-    # 从 config.py 读取预期圆点布局，只取当前启用的圆点数量。
+    # 本段读取当前启用的理论圆点布局。
+    # 输出 layout 是 N×2 的真实纸面坐标。
     layout = np.asarray(config.CIRCLE_LAYOUT_MM[: config.CIRCLE_EXPECTED_COUNT], dtype=float)
 
-    # deltas[i, j] 是第 i 个点到第 j 个点的二维向量。
+    # 本段计算所有两两距离并取最大值。
+    # 这个最大跨度会和第一帧图像中的最大像素跨度对应。
     deltas = layout[:, None, :] - layout[None, :, :]
-
-    # 所有两两距离中的最大值就是布局跨度。
     return float(np.max(np.linalg.norm(deltas, axis=2)))
 
 
 class CircleTracker:
     """
-    用上一帧位置预测当前点身份，再始终回到第一帧计算总位移。
+    圆点法的跨帧状态管理器。
 
-    这种设计适合高帧率连续视频；若两张离线图片之间跳得太远，应调大匹配距离或增加中间帧。
+    输入：每帧预处理后的灰度图。
+    输出：circle_* 字段和当前帧圆心像素坐标。
+
+    实验作用：
+    圆点法需要同时解决两个问题：
+    - 当前帧识别到了哪些圆点；
+    - 这些圆点分别对应第一帧中的哪个圆点身份。
+
+    因此它保存第一帧作为位移参考，又保存上一帧作为身份匹配参考。
     """
 
     def __init__(self) -> None:
-        # reference_points 是第一帧中各圆点的参考位置。
+        # 本段保存圆点法的跨帧状态。
+        # reference_points 是位移零点；last_points/last_step 用于下一帧身份匹配；mm_per_pixel 用于单位换算。
         self.reference_points: np.ndarray | None = None
-
-        # last_points 是上一帧成功匹配后的圆点位置，用来预测下一帧。
         self.last_points: np.ndarray | None = None
-
-        # last_step 是上一帧到当前帧的平均移动量，用来做简单预测。
         self.last_step = np.zeros(2, dtype=np.float32)
-
-        # mm_per_pixel 是圆点布局估计出的毫米/像素比例。
         self.mm_per_pixel: float | None = None
 
     @staticmethod
     def _initial_order(points: np.ndarray) -> np.ndarray:
         """
-        第一帧只需要给点一个稳定编号，按 y 后 x 排序即可。
+        给第一帧圆点建立初始身份顺序。
 
-        后续帧不再重新排序，因为振动时点会移动；
-        后续身份由 _match_to_previous() 使用最近邻/匈牙利算法持续保持。
+        输入：第一帧完整识别出的圆心坐标。
+        输出：按 y 后 x 排列的圆点坐标。
+        实验作用：第一帧排序结果会成为后续所有帧的身份编号基础。
+        后续帧不再重新排序，而是通过上一帧位置持续匹配，避免振动时身份跳变。
         """
 
-        # np.lexsort((x, y)) 表示主要按 y 排序，y 相同或接近时按 x 排序。
+        # 本段执行稳定的二维排序。
+        # 这不是几何标定，只是给第一帧检测点一个可重复的编号顺序。
         order = np.lexsort((points[:, 0], points[:, 1]))
         return points[order]
 
     def _initialize(self, points: np.ndarray) -> None:
         """
-        用第一帧完整圆点建立参考坐标和比例尺。
+        用第一帧完整圆点建立圆点法参考状态。
 
-        这一步只应在识别到全部预期圆点时执行。
-        如果第一帧缺点，后续很难知道缺的是哪个点，身份编号会不可靠。
+        输入：第一帧完整识别出的圆点坐标。
+        输出：reference_points、last_points 和 mm_per_pixel。
+        实验作用：第一帧是圆点法的位移零点。只有完整识别到全部预期圆点时才建立参考，
+        否则后续很难判断缺失的是哪个点，身份编号会不可靠。
         """
 
-        # 先给第一帧圆点一个稳定顺序，后面就把这个顺序当作身份编号。
+        # 本段先建立第一帧身份编号。
+        # 输出 ordered 后，后续第 i 个点就对应同一个物理圆点身份。
         ordered = self._initial_order(points)
 
-        # reference_points 永远代表“起始状态”，用于计算总位移。
+        # 本段保存位移参考和下一帧匹配参考。
+        # reference_points 不再变化；last_points 会随每帧匹配结果更新。
         self.reference_points = ordered.copy()
-
-        # last_points 代表“上一帧状态”，用于下一帧匹配。
         self.last_points = ordered.copy()
 
-        # 计算图像中最远两圆点的像素距离，用来和理论布局的毫米距离对应。
+        # 本段用第一帧图像跨度建立毫米/像素比例。
+        # 输入是已编号圆点；输出 span_px，与理论布局跨度共同得到 mm_per_pixel。
         pairwise = ordered[:, None, :] - ordered[None, :, :]
         span_px = float(np.max(np.linalg.norm(pairwise, axis=2)))
 
-        # 如果最远距离为 0，说明所有点重合或识别异常，比例尺没有意义。
         if span_px <= 0:
             raise ValueError("圆点中心重合，无法建立毫米比例。")
 
-        # 毫米/像素比例 = 真实布局跨度 / 图像跨度。
         self.mm_per_pixel = _layout_span_mm() / span_px
 
     def _match_to_previous(self, detected: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
-        匈牙利算法寻找“总体距离最小”的一一对应，避免多个旧点同时抢同一个新点。
+        将当前帧候选圆点匹配到已有圆点身份。
 
-        返回对应的参考点和当前点；超出最大允许距离的配对会被剔除。
+        输入：当前帧检测到的圆心候选。
+        输出：
+        - reference：这些圆点在第一帧中的参考坐标；
+        - current：这些圆点在当前帧中的坐标。
+
+        实验作用：
+        这里解决“当前帧每个圆点是谁”的问题。只有身份匹配稳定，
+        后面的相对第一帧位移才有物理意义。
         """
 
-        # 取出上一帧状态和第一帧参考状态。
-        # 如果还没初始化就调用匹配，说明代码流程错了，应立即报错。
+        # 本段读取身份匹配所需状态。
+        # reference_points 提供第一帧身份，last_points 提供上一帧位置预测基础。
         reference_points = self.reference_points
         last_points = self.last_points
         if reference_points is None or last_points is None:
             raise RuntimeError("Circle reference was not initialized.")
 
-        # 用上一帧位置 + 上一步平均位移，粗略预测这一帧每个点会在哪里。
-        # 这比直接拿上一帧位置匹配更能适应连续运动。
+        # 本段预测当前帧圆点位置。
+        # 输入是上一帧位置和上一帧平均移动量；输出 predicted，用来降低匀速运动中的匹配误差。
         predicted = last_points + self.last_step
 
-        # distances[i, j] 表示“第 i 个旧点预测位置”和“第 j 个新检测点”的距离。
+        # 本段建立匹配代价矩阵。
+        # distances[i, j] 越小，说明第 i 个旧身份越可能对应第 j 个新检测点。
         distances = np.linalg.norm(predicted[:, None, :] - detected[None, :, :], axis=2)
 
-        # 匈牙利算法会找出总体距离最小的一组一一配对。
+        # 本段用匈牙利算法选择全局最优一一匹配。
+        # 这能避免多个旧点同时抢同一个新点。
         previous_indices, detected_indices = linear_sum_assignment(distances)
 
-        # 下面再剔除距离过大的配对，避免把很远的错误点硬匹配上。
+        # 本段剔除距离过大的匹配。
+        # 输出 accepted_* 只保留合理范围内的身份对应关系，避免把背景误检硬配成圆点。
         accepted_previous: list[int] = []
         accepted_detected: list[int] = []
         for old_index, new_index in zip(previous_indices, detected_indices):
@@ -1019,47 +1241,52 @@ class CircleTracker:
                 accepted_previous.append(int(old_index))
                 accepted_detected.append(int(new_index))
 
-        # 可用点太少时，不做运动估计，返回空数组表示本帧圆点法无效。
+        # 本段保护圆点法最低有效点数。
+        # 匹配点太少时，当前帧不具备可靠刚体估计条件。
         if len(accepted_previous) < config.MIN_VALID_CIRCLES:
             return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
 
-        # 把 Python list 转成 NumPy 索引数组，方便一次性取出所有匹配点。
+        # 本段取出已接受匹配的当前点和参考点。
+        # current 是当前帧坐标；reference 是相同物理圆点在第一帧中的坐标。
         old_idx = np.asarray(accepted_previous, dtype=int)
         new_idx = np.asarray(accepted_detected, dtype=int)
-
-        # current 是当前帧成功匹配到的新点。
         current = detected[new_idx]
-
-        # reference 是这些点在第一帧里的对应位置，用于计算相对起始位移。
         reference = reference_points[old_idx]
 
-        # 更新成功匹配点的位置；没有匹配到的点保留旧预测，等待下一帧重新出现。
+        # 本段更新跨帧状态。
+        # 成功匹配的身份更新为当前坐标；未匹配身份保留旧位置，等待后续帧重新出现。
         old_positions = last_points[old_idx].copy()
         last_points[old_idx] = current
         self.last_points = last_points
 
-        # 用本帧匹配点的中位移动量估计下一帧整体移动方向。
-        # 中位数比平均数更不容易被个别坏点影响。
+        # 本段估计下一帧预测步长。
+        # 中位移动量比平均值更不容易被个别坏点影响。
         self.last_step = np.median(current - old_positions, axis=0).astype(np.float32)
         return reference, current
 
     def process(self, gray: np.ndarray) -> tuple[dict[str, Any], np.ndarray | None]:
         """
-        处理一帧灰度图，输出圆点法结果字典和当前圆心坐标。
+        完成一帧圆点法测量。
 
-        结果字典字段统一以 circle_ 开头。
+        输入：当前帧灰度图。
+        输出：
+        - circle_* 结果字典；
+        - 当前帧圆心坐标，用于日志保存和调试图绘制。
+
+        实验作用：
+        这里把“当前帧圆点检测与身份匹配”转换成“相对第一帧的位移/转角/质量”。
         """
 
-        # 第一步：从图像中找出所有“可能是圆点”的轮廓。
+        # 本段先做当前帧圆点候选检测。
+        # 输出 detected 只是候选圆心坐标，未必已经具备稳定身份。
         candidates = _find_circle_candidates(gray)
-
-        # 第二步：只取候选点中心坐标，转成 N 行 2 列数组。
         detected = np.asarray(
             [[item["x"], item["y"]] for item in candidates],
             dtype=np.float32,
         )
 
-        # 第三步：如果连最低有效点数都不够，本帧无法估计刚体位移。
+        # 本段处理候选点明显不足的帧。
+        # 输出仍保留检测到的点，方便调试图和日志显示“算法看见了什么”。
         if len(detected) < config.MIN_VALID_CIRCLES:
             return {
                 "circle_is_valid": False,
@@ -1070,11 +1297,12 @@ class CircleTracker:
                 "circle_residual_px": math.nan,
                 "circle_quality": 0.0,
                 "circle_valid_count": int(len(detected)),
+                "circle_points_ordered": False,
             }, detected if len(detected) else None
 
-        # 第四步：如果这是第一帧成功识别，需要建立参考。
+        # 本段建立或读取圆点身份参考。
+        # 第一帧必须完整识别，后续帧则用上一帧预测位置保持身份。
         if self.reference_points is None:
-            # 第一帧必须识别到完整数量，否则无法可靠编号。
             if len(detected) != config.CIRCLE_EXPECTED_COUNT:
                 return {
                     "circle_is_valid": False,
@@ -1085,21 +1313,22 @@ class CircleTracker:
                     "circle_residual_px": math.nan,
                     "circle_quality": 0.0,
                     "circle_valid_count": int(len(detected)),
+                    "circle_points_ordered": False,
                 }, detected
-            # 完整识别后，保存第一帧作为参考状态。
             self._initialize(detected)
             reference = self.reference_points
             current = self.last_points
         else:
-            # 后续帧使用上一帧位置预测并匹配，保持圆点身份。
             reference, current = self._match_to_previous(detected)
 
-        # 第五步：取出比例尺和当前/参考点。
+        # 本段读取比例尺和当前匹配点。
+        # 如果这里缺失，说明初始化或匹配流程异常，应立即报错。
         mm_per_pixel = self.mm_per_pixel
         if reference is None or current is None or mm_per_pixel is None:
             raise RuntimeError("Circle reference was not initialized.")
 
-        # 第六步：匹配后如果有效点不足，也不能计算位移。
+        # 本段处理匹配后有效点不足的情况。
+        # 这说明虽然检测到了候选点，但身份匹配不足以支撑刚体运动估计。
         if len(current) < config.MIN_VALID_CIRCLES:
             return {
                 "circle_is_valid": False,
@@ -1110,9 +1339,11 @@ class CircleTracker:
                 "circle_residual_px": math.nan,
                 "circle_quality": 0.0,
                 "circle_valid_count": int(len(current)),
+                "circle_points_ordered": False,
             }, detected
 
-        # 第七步：估计当前帧相对第一帧的平移、转角、尺度和残差。
+        # 本段把已匹配圆点转换成整体运动结果。
+        # 输入是同一批物理圆点的第一帧坐标和当前帧坐标；输出是毫米位移、转角、尺度和残差。
         motion = _estimate_rigid_motion(
             reference,
             current,
@@ -1120,11 +1351,13 @@ class CircleTracker:
             config.CIRCLE_RESIDUAL_WARNING_PX,
         )
 
-        # 点数分进一步惩罚丢点情况，使“5 点勉强可算”不会和“7 点完整识别”得到相同质量。
+        # 本段把匹配点数量纳入质量分。
+        # 5 点勉强可算不应和 7 点完整识别得到同样置信度。
         point_fraction = len(current) / config.CIRCLE_EXPECTED_COUNT
         quality = float(motion["quality"]) * point_fraction
 
-        # 第八步：整理成日志字段。
+        # 本段整理当前帧圆点法日志。
+        # circle_points_ordered=True 表示返回的圆心坐标已经按身份匹配后输出。
         result = {
             "circle_is_valid": bool(motion["is_valid"]),
             "circle_dx_mm": motion["dx_mm"],
@@ -1135,6 +1368,7 @@ class CircleTracker:
             "circle_quality": quality,
             "circle_valid_count": int(len(current)),
             "circle_mm_per_pixel": float(mm_per_pixel),
+            "circle_points_ordered": True,
         }
         return result, current
 
@@ -1145,24 +1379,97 @@ class CircleTracker:
 
 class VisionProcessor:
     """
-    把预处理、两种识别和结果打包集中在一个对象中，以便保存跨帧参考状态。
+    单帧视觉测量的统一入口。
 
-    为什么需要“对象”而不是普通函数？
-    因为棋盘格法和圆点法都要记住第一帧/上一帧的信息：
-    - 第一帧提供“参考位置”，后面所有位移都相对它计算；
-    - 圆点法还要记住上一帧圆点位置，防止不同圆点互相认错。
+    输入：FramePacket，包含一帧图像、帧号、时间戳和来源名称。
+    输出：result 字典和 debug 图像。
+
+    实验作用：
+    - 把每帧图像转换成机器可读的测量记录；
+    - 在同一个对象中保存第一帧参考点和上一帧圆点身份；
+    - 同时保留像素坐标、二维位移和可选空间坐标，方便判断问题发生在哪一步。
     """
 
     def __init__(self) -> None:
         self.checker_tracker = CheckerboardTracker()
         self.circle_tracker = CircleTracker()
 
+    @staticmethod
+    def _points_to_full_image(
+        points: np.ndarray | None,
+        roi_origin: tuple[int, int],
+    ) -> np.ndarray | None:
+        """
+        把 ROI 内识别坐标转回整幅图像坐标。
+
+        输入：识别器输出的点坐标，坐标系可能是 ROI 左上角；
+        输出：整张原图上的像素坐标，供日志、调试图和空间转换共用。
+        """
+
+        if points is None:
+            return None
+        return np.asarray(points, dtype=np.float64).reshape(-1, 2) + np.asarray(
+            roi_origin,
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _add_point_outputs(
+        result: dict[str, Any],
+        prefix: str,
+        points: np.ndarray | None,
+        roi_origin: tuple[int, int],
+    ) -> None:
+        """
+        将识别点坐标写入当前帧结果。
+
+        输入：某种算法识别出的像素点；
+        输出：
+        - {prefix}_points_px 或 {prefix}_corners_px：整幅图像中的原始像素坐标；
+        - {prefix}_points_spatial / {prefix}_corners_spatial：可选空间坐标结果。
+
+        这层输出不改变位移计算，只提供排错证据：先看像素坐标是否可信，再看空间坐标是否可信。
+        """
+
+        field = "corners" if prefix == "checker" else "points"
+        points_full = VisionProcessor._points_to_full_image(points, roi_origin)
+        if not config.SAVE_POINT_COORDINATES:
+            return
+
+        coordinate_key = f"{prefix}_{field}_px"
+        spatial_key = f"{prefix}_{field}_spatial"
+
+        if points_full is None:
+            result[coordinate_key] = []
+            result[spatial_key] = {
+                "enabled": bool(config.SPATIAL_COORDINATES_ENABLED),
+                "mode": config.SPATIAL_COORDINATE_MODE,
+                "camera_m": None,
+                "robot_m": None,
+            }
+            return
+
+        result[coordinate_key] = points_full.tolist()
+        try:
+            result[spatial_key] = image_points_to_spatial(points_full)
+        except Exception as exc:
+            result[spatial_key] = {
+                "enabled": bool(config.SPATIAL_COORDINATES_ENABLED),
+                "mode": config.SPATIAL_COORDINATE_MODE,
+                "camera_m": None,
+                "robot_m": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
     def process_frame(self, packet: FramePacket) -> tuple[dict[str, Any], np.ndarray]:
-        # 第一步：把原始图像变成灰度图，并得到亮度、模糊等质量指标。
+        # 本段把“原始图像帧”转换成“可识别的灰度图 + 图像质量记录”。
+        # 输入：FramePacket.frame，即 OpenCV 图像数组。
+        # 输出：gray 进入圆点/棋盘格识别；image_metrics 写入日志，帮助判断某帧失败是否由曝光或模糊导致。
         gray, image_metrics, roi_origin = preprocess_frame(packet.frame)
 
-        # 第二步：先建立一个基础结果字典。
-        # 后面棋盘格/圆点算法会继续往这个字典里添加自己的字段。
+        # 本段建立当前帧的基础日志记录。
+        # 输入：FramePacket 的帧号、时间戳、来源名称，以及上一步得到的图像质量指标。
+        # 输出：result 字典的公共字段；后续棋盘格法和圆点法只需要继续往里面补测量结果。
         result: dict[str, Any] = {
             "kind": "VISION",
             "host_ns": int(packet.host_ns),
@@ -1172,8 +1479,9 @@ class VisionProcessor:
             **image_metrics,
         }
 
-        # 离线图片/视频应按原始帧率分析，而不是按电脑“解码得有多快”分析。
-        # 真实相机的原始 tick 单位尚未标定，因此实时场景仍使用可与 UR 共同对齐的 host_ns。
+        # 本段决定这帧进入离线分析时使用哪个时间轴。
+        # 图片/视频优先使用采集或文件时间，避免把“电脑解码速度”误当成相机采样速度。
+        # 真实相机的硬件 tick 尚未统一换算时，预实验先使用电脑时钟，便于和 UR 日志放到同一时间轴。
         if (
             packet.source_name.startswith(("image_folder:", "video:"))
             and packet.camera_timestamp_raw is not None
@@ -1182,31 +1490,42 @@ class VisionProcessor:
         else:
             result["analysis_time_s"] = float(packet.host_ns) * 1e-9
 
-        # 这两个变量只用于画调试图。
-        # 如果某种算法没有开启或没有识别成功，就保持 None。
+        # 本段预留“算法看见的点”。
+        # 输入为空；输出在下面两个测量链路中被填充。
+        # 这些点既会进入日志成为排错证据，也会画到 debug 图上给人肉眼检查。
         checker_corners: np.ndarray | None = None
         circle_centers: np.ndarray | None = None
 
-        # 第三步：根据 VISION_METHOD 决定是否运行棋盘格法。
-        # compare 模式会同时运行两种方法，方便你后面对比稳定性。
+        # 本段运行棋盘格测量链路。
+        # 输入：灰度图和第一帧参考角点状态。
+        # 输出：checker_* 字段，包括角点像素坐标、相对参考帧位移、转角、比例尺和质量分。
         if config.VISION_METHOD in {"checkerboard", "compare"}:
             checker_result, checker_corners = self.checker_tracker.process(gray)
             result.update(checker_result)
+            self._add_point_outputs(result, "checker", checker_corners, roi_origin)
 
-        # 第四步：根据 VISION_METHOD 决定是否运行圆点法。
-        # 两种方法的结果字段名前缀不同，所以可以安全放进同一个 result。
+        # 本段运行圆点测量链路。
+        # 输入：灰度图、第一帧参考圆点、上一帧圆点身份状态。
+        # 输出：circle_* 字段，包括圆心像素坐标、身份匹配状态、相对参考帧位移、转角和质量分。
         if config.VISION_METHOD in {"circles", "compare"}:
             circle_result, circle_centers = self.circle_tracker.process(gray)
             result.update(circle_result)
+            self._add_point_outputs(result, "circle", circle_centers, roi_origin)
 
-        # 第五步：只要任意一种方法有效，就认为这一帧有可用视觉结果。
+        # 本段给整帧结果一个总有效性标记。
+        # 输入：checker_is_valid 和 circle_is_valid。
+        # 输出：is_valid，用于快速统计本次测试的整体可用帧比例。
+        # 后续严肃分析仍会检查具体方法自己的有效性，而不是只依赖这个总标记。
         valid_flags = [
             bool(result.get("checker_is_valid", False)),
             bool(result.get("circle_is_valid", False)),
         ]
         result["is_valid"] = any(valid_flags)
 
-        # 第六步：生成调试图。调试图不参与计算，只帮助人检查算法到底看见了什么。
+        # 本段生成给人看的调试图。
+        # 输入：原图、当前帧 result，以及两种算法识别到的点。
+        # 输出：debug 图像，只用于人工质检，不作为后续计算输入。
+        # 如果日志数值异常，先看这张图能快速判断是识别点错了、编号串了，还是图像质量本身有问题。
         debug = self._draw_debug(
             packet.frame,
             result,
@@ -1225,7 +1544,20 @@ class VisionProcessor:
         roi_origin: tuple[int, int],
     ) -> np.ndarray:
         """
-        把算法看见的点和最终数值画出来，便于判断是曝光问题、漏点还是串点。
+        生成当前帧的人工质检图。
+
+        输入：
+        - original：原始图像；
+        - result：当前帧机器可读测量结果；
+        - checker_corners / circle_centers：算法在 ROI 坐标系中识别到的点；
+        - roi_origin：ROI 在原图中的偏移。
+
+        输出：
+        - 带角点、圆心编号、位移和画质指标的 debug 图。
+
+        实验作用：
+        debug 图不参与识别和后续分析，只用于人眼检查。若某帧数值异常，
+        它能帮助判断问题来自漏点、串号、模糊、过曝，还是算法看见的点本身就不对。
 
         返回值是带标注的图像副本：
         - 绿色小点：棋盘格角点；
@@ -1233,24 +1565,26 @@ class VisionProcessor:
         - 左上角文字：位移、质量分、亮度和模糊指标。
         """
 
-        # 如果原图是灰度，先转成 BGR 彩色图，方便画彩色标记。
+        # 本段准备可绘制的画布。
+        # 输入可能是灰度或彩色图；输出统一为 BGR 彩色副本，避免标注修改原始 frame。
         if original.ndim == 2:
             canvas = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
         else:
-            # 如果原图已经是彩色，就复制一份，避免修改原始 frame。
             canvas = original.copy()
 
-        # 检测是在 ROI 坐标系里做的；画回原图时要加上 ROI 左上角偏移。
+        # 本段把 ROI 坐标转换回整幅图像坐标。
+        # 识别可能只在 ROI 内做，但人工质检图要画在原图上。
         offset = np.asarray(roi_origin, dtype=np.float32)
 
-        # 画棋盘格角点。
+        # 本段绘制棋盘格法看到的角点。
+        # 输出的绿色点用于检查角点是否落在真实棋盘格交点上。
         if checker_corners is not None:
             for point in checker_corners:
                 x, y = np.rint(point + offset).astype(int)
                 cv2.circle(canvas, (x, y), 3, (0, 180, 0), -1, cv2.LINE_AA)
 
-        # 画圆点中心和编号。
-        # 编号可以帮助你观察跨帧身份是否发生串号。
+        # 本段绘制圆点法看到的圆心和身份编号。
+        # 编号用于观察跨帧身份是否串号；位置用于检查圆心是否偏离真实标记。
         if circle_centers is not None:
             for index, point in enumerate(circle_centers):
                 x, y = np.rint(point + offset).astype(int)
@@ -1266,12 +1600,14 @@ class VisionProcessor:
                     cv2.LINE_AA,
                 )
 
-        # 从 result 字典取数值时统一兜底，避免 None 或缺字段导致调试图绘制失败。
+        # 本段提供调试图文字读取的兜底函数。
+        # 输入是 result 字段名；输出是可格式化的 float，避免缺字段导致整张调试图生成失败。
         def metric(name: str, default: float) -> float:
             value = result.get(name, default)
             return float(default if value is None else value)
 
-        # 左上角要显示的调试文字。
+        # 本段组织左上角质检文字。
+        # 输出让使用者快速看到帧号、有效性、两种方法位移/质量和图像亮度/模糊程度。
         lines = [
             f"frame={result['frame_id']} valid={result['is_valid']}",
             (
@@ -1292,7 +1628,8 @@ class VisionProcessor:
             ),
         ]
 
-        # 每行文字先画白色粗线，再画黑色细线，保证在亮/暗背景上都能看清。
+        # 本段把质检文字画到图像上。
+        # 先画白色粗线再画深色细线，是为了在亮背景或暗背景上都能读清。
         for line_index, text in enumerate(lines):
             y = 28 + line_index * 25
             cv2.putText(
@@ -1317,6 +1654,8 @@ class VisionProcessor:
             )
 
         if result["blur_variance"] < config.BLUR_WARNING_THRESHOLD:
+            # 本段把低清晰度帧显式标出来。
+            # 输出是红色 WARNING，帮助人工快速定位可能由运动模糊或失焦导致的异常帧。
             cv2.putText(
                 canvas,
                 "WARNING: image may be blurred",
@@ -1336,7 +1675,14 @@ class VisionProcessor:
 
 def generate_marker_sheet(output_path: Path | None = None) -> Path:
     """
-    生成按毫米定义的 SVG，避免普通 PNG 在打印时因 DPI 设置而缩放。
+    生成可打印的复合测量纸 SVG。
+
+    输入：可选输出路径；未传入时使用 config.MARKER_SHEET_PATH。
+    输出：一份按毫米定义尺寸的 SVG 文件。
+
+    实验作用：
+    测量纸同时包含棋盘格和不对称圆点阵列。棋盘格用于 checkerboard 方法，
+    圆点阵列用于 circles 方法；两种方法可以在预实验中互相对照。
 
     打印对话框必须选择 100%/实际大小；打印后应再用游标卡尺测量方格边长确认比例。
 
@@ -1346,13 +1692,13 @@ def generate_marker_sheet(output_path: Path | None = None) -> Path:
     - 外框：浅灰裁剪参考线，尽量不干扰黑色标记检测。
     """
 
-    # 如果调用方没给 output_path，就使用 config.py 中的默认 SVG 路径。
+    # 本段确定 SVG 输出位置。
+    # 输出目录会自动创建，避免首次运行时因 outputs 不存在而失败。
     output = Path(output_path or config.MARKER_SHEET_PATH)
-
-    # 输出目录可能还不存在，先创建。
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # 从 config.py 读取纸张尺寸、边距和棋盘格参数。
+    # 本段读取测量纸几何参数。
+    # 输入来自 config.py；输出是后续绘制棋盘格、圆点和外框所需的毫米坐标。
     width = float(config.MARKER_SHEET_WIDTH_MM)
     height = float(config.MARKER_SHEET_HEIGHT_MM)
     margin = float(config.MARKER_MARGIN_MM)
@@ -1361,28 +1707,30 @@ def generate_marker_sheet(output_path: Path | None = None) -> Path:
     board_columns = columns + 1
     board_rows = rows + 1
 
-    # 棋盘格实际方格数量 = 内角点数量 + 1。
+    # 本段计算棋盘格区域尺寸。
+    # OpenCV 配置的是内角点数量，真实黑白方格数量需要在行列方向各加 1。
     checker_width = board_columns * square
     checker_height = board_rows * square
 
-    # 棋盘格放在纸张左侧，垂直方向居中。
+    # 本段安排棋盘格和圆点区域在同一张纸上的位置。
+    # 输出 board_* 和 circle_* 坐标，确保两种图案分区清楚，减少互相干扰。
     board_x = margin
     board_y = (height - checker_height) / 2.0
 
-    # 圆点布局来自 config.CIRCLE_LAYOUT_MM，单位本来就是毫米。
     layout = np.asarray(
         config.CIRCLE_LAYOUT_MM[: config.CIRCLE_EXPECTED_COUNT],
         dtype=float,
     )
-    # 圆点区域放在纸张右侧，垂直方向也尽量居中。
     circle_x = width - margin - float(np.max(layout[:, 0]))
     circle_y = (height - float(np.max(layout[:, 1]))) / 2.0
 
-    # 如果纸张太窄，左右两种图案会重叠，此时直接报错，不生成错误图纸。
+    # 本段防止生成不可用测量纸。
+    # 如果两种图案会重叠，直接报错比生成一张误导性的 SVG 更安全。
     if board_x + checker_width + margin > circle_x:
         raise ValueError("当前测量纸太窄，棋盘格与圆点区域会重叠。")
 
-    # SVG 本质上是 XML 文本。这里逐行拼接，最后写入文件。
+    # 本段开始组织 SVG 文本。
+    # 输出 lines 是最终文件的 XML 行列表；使用 SVG 是为了避免 PNG 打印 DPI 带来的缩放问题。
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         (
@@ -1392,7 +1740,8 @@ def generate_marker_sheet(output_path: Path | None = None) -> Path:
         f'<rect x="0" y="0" width="{width}" height="{height}" fill="white"/>',
     ]
 
-    # 绘制棋盘格：只画黑色方块，白色区域由背景矩形提供。
+    # 本段绘制棋盘格黑色方块。
+    # 白色格子由背景提供，黑白交界处会成为 checkerboard 方法识别的内角点。
     for row in range(board_rows):
         for column in range(board_columns):
             if (row + column) % 2 == 0:
@@ -1403,7 +1752,8 @@ def generate_marker_sheet(output_path: Path | None = None) -> Path:
                     f'width="{square:.4f}" height="{square:.4f}" fill="black"/>'
                 )
 
-    # 绘制圆点：第 0 个点稍大，作为人工观察时的方向锚点。
+    # 本段绘制不对称圆点阵列。
+    # 第 0 个点稍大，用作人工观察方向锚点；算法当前仍主要依赖布局和跨帧匹配。
     for index, (x_mm, y_mm) in enumerate(layout):
         diameter = (
             config.CIRCLE_ANCHOR_DIAMETER_MM
@@ -1415,14 +1765,16 @@ def generate_marker_sheet(output_path: Path | None = None) -> Path:
             f'r="{diameter / 2.0:.4f}" fill="black"/>'
         )
 
-    # 外边界采用浅灰细线，帮助裁剪但尽量不参与黑色轮廓检测。
+    # 本段绘制浅灰裁剪外框。
+    # 颜色很浅，目的是给人裁剪参考，同时尽量不被圆点轮廓检测当成黑色目标。
     lines.append(
         f'<rect x="0.2" y="0.2" width="{width - 0.4}" height="{height - 0.4}" '
         'fill="none" stroke="#BBBBBB" stroke-width="0.2"/>'
     )
     lines.append("</svg>")
 
-    # SVG 是普通文本，使用 UTF-8 写入即可；这里不依赖额外 PDF 库。
+    # 本段写出 SVG 文件。
+    # 输出文件可直接打开或打印，后续 vision_test 会提示路径。
     output.write_text("\n".join(lines), encoding="utf-8")
     return output
 
@@ -1433,7 +1785,14 @@ def create_synthetic_demo_sequence(
     fps: float = 60.0,
 ) -> Path:
     """
-    生成仅用于检查代码链路的合成序列，不代表真实相机精度。
+    生成仅用于程序烟测的合成图片序列。
+
+    输入：输出文件夹、帧数和合成帧率。
+    输出：一组按 frame_0000.png 命名的 PNG 图片。
+
+    实验作用：
+    它只验证“读图 -> 识别 -> 写日志 -> 分析”链路能跑通，不代表真实相机精度、
+    真实噪声、真实标定或真实机械臂振动。
 
     它会给复合图案加入小幅正弦平移与转动，适合在没有设备时验证识别、日志和分析函数。
 
@@ -1443,20 +1802,24 @@ def create_synthetic_demo_sequence(
     - 它只是为了验证程序的输入/处理/输出链路能跑通。
     """
 
-    # 准备输出文件夹。
+    # 本段准备合成序列输出位置。
+    # 输出文件夹存在时会复用，生成的图片按帧号命名，便于 ImageFolderSource 自然排序。
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    # 先创建一张白色背景的大图。
+    # 本段创建一张包含棋盘格和圆点的基础图。
+    # 后续每一帧都从这张基础图变换而来，模拟测量纸整体运动。
     image = np.full((520, 960, 3), 255, dtype=np.uint8)
 
-    # 下面这些参数决定合成棋盘格在图像中的大小和位置。
+    # 本段定义合成棋盘格的像素尺寸和位置。
+    # 它只服务于代码链路测试，不用于真实实验标定。
     square_px = 46
     columns, rows = config.CHECKERBOARD_INNER_CORNERS
     board_columns, board_rows = columns + 1, rows + 1
     board_x, board_y = 70, 110
 
-    # 在白底图上画棋盘格黑色方块。
+    # 本段绘制合成棋盘格。
+    # 输出的黑白交界让 CheckerboardTracker 能检测角点。
     for row in range(board_rows):
         for column in range(board_columns):
             if (row + column) % 2 == 0:
@@ -1464,35 +1827,35 @@ def create_synthetic_demo_sequence(
                 p2 = (p1[0] + square_px, p1[1] + square_px)
                 cv2.rectangle(image, p1, p2, (0, 0, 0), -1)
 
-    # 读取理论圆点布局，再按固定比例换成像素坐标。
+    # 本段绘制合成圆点阵列。
+    # 输入是 config.CIRCLE_LAYOUT_MM；输出是可供 CircleTracker 检测的黑色圆点。
     layout = np.asarray(
         config.CIRCLE_LAYOUT_MM[: config.CIRCLE_EXPECTED_COUNT],
         dtype=float,
     )
     circle_origin = np.asarray([600.0, 135.0])
     circle_scale_px_per_mm = 9.0
-    # 在同一张合成图上画圆点阵列。
     for index, point in enumerate(layout):
         center = np.rint(circle_origin + point * circle_scale_px_per_mm).astype(int)
         radius = 19 if index == 0 else 13
         cv2.circle(image, tuple(center), radius, (0, 0, 0), -1, cv2.LINE_AA)
 
-    # 下面开始生成多帧：每一帧都对整张图做一个小幅平移和旋转。
+    # 本段生成多帧模拟运动。
+    # 输入是基础图；输出是带正弦平移/转角的图片序列，用于测试位移曲线是否能被恢复。
     center = (image.shape[1] / 2.0, image.shape[0] / 2.0)
     for frame_id in range(frame_count):
-        # t 是当前帧对应的时间，单位秒。
+        # 本段计算当前合成帧的运动状态。
+        # 三个正弦项分别模拟 x 位移、y 位移和平面内轻微转动。
         t = frame_id / fps
-
-        # 三个正弦项分别模拟 x 方向振动、y 方向振动和平面内轻微转动。
         dx_px = 3.2 * math.sin(2.0 * math.pi * 8.0 * t)
         dy_px = 2.2 * math.sin(2.0 * math.pi * 13.0 * t + 0.4)
         angle_deg = 0.12 * math.sin(2.0 * math.pi * 5.0 * t)
 
-        # getRotationMatrix2D 生成旋转矩阵；后面再手动叠加平移量。
+        # 本段把运动状态应用到基础图。
+        # 输出 moved 是当前帧图片，保存后即可被离线图片输入源读取。
         matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
         matrix[0, 2] += dx_px
         matrix[1, 2] += dy_px
-        # warpAffine 根据矩阵把原图变换成当前帧。
         moved = cv2.warpAffine(
             image,
             matrix,
@@ -1501,7 +1864,8 @@ def create_synthetic_demo_sequence(
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(255, 255, 255),
         )
-        # 保存为按序号命名的 PNG，方便 ImageFolderSource 按自然顺序读取。
+        # 本段保存当前合成帧。
+        # 文件名保持固定宽度，确保自然排序和普通字符串排序都能得到正确帧顺序。
         cv2.imwrite(str(output_folder / f"frame_{frame_id:04d}.png"), moved)
 
     return output_folder
@@ -1513,42 +1877,59 @@ def create_synthetic_demo_sequence(
 
 def _resize_for_preview(image: np.ndarray) -> np.ndarray:
     """
-    仅缩小显示副本，不改变送入算法和保存到磁盘的原始分辨率。
+    生成适合屏幕预览的图像副本。
 
-    OpenCV 预览窗口太大时会超出屏幕，所以这里只为显示缩小。
-    算法计算和调试图保存仍使用原始尺寸。
+    输入：debug 图或其他 OpenCV 图像。
+    输出：宽度不超过 config.PREVIEW_MAX_WIDTH 的显示副本。
+
+    实验作用：
+    只影响人眼预览窗口，不改变算法输入、不改变日志、不改变保存的原始调试图。
     """
 
-    # 如果图像宽度已经不超过限制，直接原样返回。
+    # 本段判断是否需要缩小。
+    # 图像本来就适合屏幕显示时，直接返回，避免无意义重采样。
     if image.shape[1] <= config.PREVIEW_MAX_WIDTH:
         return image
 
-    # 按宽度比例计算缩放倍数，高度按同一比例缩放，避免图像变形。
+    # 本段按比例缩放显示图。
+    # 输出只用于 cv2.imshow，保持宽高比例不变，避免预览图变形误导判断。
     scale = config.PREVIEW_MAX_WIDTH / image.shape[1]
     size = (int(image.shape[1] * scale), int(image.shape[0] * scale))
 
-    # INTER_AREA 适合缩小图像，视觉上更平滑。
     return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
 
 
 def _json_line(record: dict[str, Any]) -> str:
     """
-    把一条记录字典转成一行 JSON 文本。
+    把一条视觉记录转换成一行 JSON 文本。
 
-    ensure_ascii=False 让中文字段和中文报错保持可读；
-    allow_nan=True 允许 math.nan 写入日志，后续分析会按无效值处理。
+    输入：META 或 VISION 字典。
+    输出：不带换行符的 JSON 字符串。
+
+    实验作用：
+    vision_results.txt 和正式 run_log.txt 都采用“一行一条记录”的形式。
+    这样文件既能被记事本查看，也能被 analyze.py 稳定逐行恢复。
     """
 
-    # json 是标准库，但只在写日志时需要，所以放在这里也可以。
+    # 本段执行 JSON 序列化。
+    # ensure_ascii=False 让中文保持可读；allow_nan=True 保留无效测量的 NaN 状态供后续分析跳过。
     import json
-
-    # 返回值不带换行；调用方负责追加 "\n"。
     return json.dumps(record, ensure_ascii=False, allow_nan=True)
 
 
 def run_vision_test() -> Path:
     """
-    单进程运行视觉模块，保存逐帧结果和可选调试图。
+    离线单进程运行视觉模块，保存逐帧结果和可选调试图。
+    
+    已有图片/视频
+    ↓
+    程序按顺序逐帧读取
+    ↓
+    每帧识别圆点/棋盘格
+    ↓
+    输出位移、质量指标、调试图
+    ↓
+    后续再分析振动
 
     该函数不会导入 robot.py，也不会检查 UR IP，更不会创建机器人连接。
     """
@@ -1567,35 +1948,56 @@ def run_vision_test() -> Path:
     if config.SAVE_DEBUG_IMAGE:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # Processor 会记住第一帧参考点，所以一次测试只创建一个实例，并连续处理所有帧。
+    # 本段建立“逐帧视觉测量”的工作状态。
+    # 输入来自 source 产生的一帧帧图像；输出是每帧像素坐标、二维位移、可选空间坐标和调试图。
+    # VisionProcessor 会在第一次成功识别标记点时建立参考状态，因此一次测试只创建一个实例。
     processor = VisionProcessor()
+
+    # vision_results.txt 是离线分析的主要输入。
+    # 第一行写本次测试说明，后续每行写一帧测量结果，供 analyze.py 继续做振动分析。
     result_path = run_dir / "vision_results.txt"
+
+    # 这些计数器用于结束时给出本组数据的可用性摘要，不参与视觉计算。
     processed_count = 0
     valid_count = 0
     saved_debug_count = 0
 
     try:
+        # 本段同时打开“图像来源”和“结果文件”。
+        # source 负责按顺序产出 FramePacket；file 负责接收每帧处理后的 JSON 记录。
         with open_image_source() as source, result_path.open("w", encoding="utf-8") as file:
+            # META 是本次视觉测试的运行说明，只写一次。
+            # 它让后续分析知道这些逐帧结果来自什么图像来源、使用了什么视觉方法。
             meta = {
                 "kind": "META",
                 "host_ns": time.perf_counter_ns(),
                 "mode": "vision_test",
                 "vision_source": config.VISION_SOURCE,
                 "vision_method": config.VISION_METHOD,
+                "image_folder_fps": config.IMAGE_FOLDER_FPS,
+                "expected_vision_fps": config.EXPECTED_VISION_FPS,
+                "save_point_coordinates": config.SAVE_POINT_COORDINATES,
+                "spatial_coordinates_enabled": config.SPATIAL_COORDINATES_ENABLED,
+                "spatial_coordinate_mode": config.SPATIAL_COORDINATE_MODE,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
             file.write(_json_line(meta) + "\n")
 
-            # source 可以是图片文件夹、视频或相机。
-            # 不管来源是什么，for 循环拿到的都是统一的 FramePacket。
+            # 本循环是离线视觉测试的主流水线。
+            # 输入：一帧 FramePacket；输出：一行机器可读测量结果，以及可选调试图。
+            # 本函数只把原始图像序列转换成逐帧视觉测量结果，不做频谱和恢复时间分析。
             for packet in source:
                 result, debug = processor.process_frame(packet)
+
+                # 当前帧 result 写入一行 JSON。
+                # 后续 analyze.py 会读取这些行，继续完成去趋势、频谱和指标计算。
                 file.write(_json_line(result) + "\n")
                 processed_count += 1
                 valid_count += int(bool(result["is_valid"]))
 
-                # 调试图很有用，但每帧都保存会很占硬盘。
-                # 因此这里按帧间隔和最大张数两个条件限制保存数量。
+                # 本段控制调试图保存量。
+                # 调试图用于人工检查识别点、编号和图像质量；它不是后续算法输入。
+                # 为避免批量离线数据产生过多图片，只按固定间隔和最大张数保存。
                 should_save = (
                     config.SAVE_DEBUG_IMAGE
                     and packet.frame_id % config.DEBUG_IMAGE_EVERY_N_FRAMES == 0
@@ -1608,8 +2010,8 @@ def run_vision_test() -> Path:
                     )
                     saved_debug_count += 1
 
-                # 预览窗口只影响人眼查看，不影响保存的结果。
-                # 按 Esc 或 q 会提前结束当前视觉测试。
+                # 本段只负责人眼预览。
+                # 预览窗口不改变已经写入的测量结果；按 Esc 或 q 只是提前结束本次离线测试。
                 if config.SHOW_PREVIEW:
                     cv2.imshow("UR10 vibration vision test", _resize_for_preview(debug))
                     key = cv2.waitKey(1) & 0xFF
@@ -1632,18 +2034,26 @@ def run_vision_test() -> Path:
 
 def _put_record(record_queue: Any, record: dict[str, Any], stop_event: Any) -> bool:
     """
-    把相机结果放入记录队列。
+    将相机测量结果送入正式实验记录队列。
 
-    返回 True 表示写入成功；返回 False 表示队列满了，并且已经设置 stop_event。
-    队列满通常意味着写盘或主流程跟不上实时数据，继续采集会造成时间对齐失真。
+    输入：当前帧 VISION 记录、主程序提供的 record_queue 和 stop_event。
+    输出：
+    - True：记录已交给 writer 进程；
+    - False：队列满，已经请求整套实验停止。
+
+    实验作用：
+    正式预实验中相机进程不直接写文件，而是把结果交给 main.py 的 writer 进程统一落盘。
+    队列满通常意味着写盘或主流程跟不上，继续采集会破坏时间对齐，因此主动停止。
     """
 
     try:
-        # timeout=1.0 防止队列满时永远卡住。
+        # 本段尝试把当前帧结果交给 writer。
+        # timeout 防止队列满时相机进程永久卡住。
         record_queue.put(record, timeout=1.0)
         return True
     except Full:
-        # 写不进去时主动通知其他进程停下来。
+        # 本段处理记录队列拥塞。
+        # 输出 stop_event，让机器人和主程序也尽快进入安全收尾。
         stop_event.set()
         return False
 
@@ -1656,32 +2066,43 @@ def camera_worker(
     camera_ready: Any,
 ) -> None:
     """
-    完整实验中的相机子进程。
+    正式预实验中的相机子进程入口。
 
-    它打开相机后先报告 ready，等主程序发出 start_event 才正式把 VISION 结果送入记录队列。
+    输入：
+    - record_queue：把 VISION 记录送给 writer 进程；
+    - error_queue：把相机异常报告给主程序；
+    - start_event：主程序确认相机和机器人都 ready 后发出的统一开始信号；
+    - stop_event：任一进程要求停止时亮起；
+    - camera_ready：相机完成真实取帧和第一帧处理后置位。
 
-    这个函数和 run_vision_test() 的区别：
-    - run_vision_test() 自己写 vision_results.txt；
-    - camera_worker() 不直接写文件，而是把结果放到 record_queue；
-    - 真正写文件的是 main.py 创建的 record_writer_worker。
+    输出：
+    - 连续 VISION 记录进入 record_queue；
+    - 异常文本进入 error_queue；
+    - 必要时设置 stop_event。
+
+    实验作用：
+    这里服务于“相机 + 机器人 + writer”三进程正式预实验。
+    它复用 VisionProcessor 的逐帧算法，但不自己写文件；所有正式日志由 main.py 的 writer 统一写入。
     """
 
     try:
-        # 正式实验中的相机进程也使用同一个 VisionProcessor。
-        # 这样第一帧参考点和跨帧圆点身份可以连续保存。
+        # 本段建立正式实验相机测量状态。
+        # 输出 processor 会保存第一帧参考点和圆点跨帧身份，保证完整实验期间位移序列连续。
         processor = VisionProcessor()
         with open_image_source() as source:
             iterator = iter(source)
 
-            # 先真正取到并处理一帧，才能说明“相机和算法都已就绪”，而不是仅仅创建了对象。
+            # 本段完成相机 ready 前的真实检查。
+            # 只有成功取到并处理第一帧，才说明“图像来源 + 视觉算法”都能工作，而不是只创建了对象。
             first_packet = next(iterator)
             first_result, _ = processor.process_frame(first_packet)
             first_result["analysis_time_s"] = first_result["host_ns"] * 1e-9
             camera_ready.set()
 
             if config.VISION_SOURCE == "hik_camera":
-                # 人工确认可能持续数秒；真实相机必须持续取流，避免启动后先读到缓冲区里的旧帧。
-                # 这里只保留最新结果，不写正式记录，直到主程序发出统一 start_event。
+                # 本段处理真实相机等待操作者确认的时间。
+                # 输入是连续相机流；输出只保留最新一帧结果。
+                # 这样 start_event 到来时，正式日志不会从几秒前的相机缓冲旧帧开始。
                 while not start_event.is_set():
                     if stop_event.is_set():
                         return
@@ -1689,32 +2110,37 @@ def camera_worker(
                     first_result, _ = processor.process_frame(warmup_packet)
                     first_result["analysis_time_s"] = first_result["host_ns"] * 1e-9
             else:
-                # 离线图片或视频若在等待期间高速解码会提前耗尽，所以只等待而不继续取下一帧。
+                # 本段处理离线图片/视频作为实验输入的等待时间。
+                # 离线来源不能在等待确认时提前高速消耗帧，所以这里只等待 start_event，不继续取下一帧。
                 while not start_event.is_set():
                     if stop_event.wait(0.05):
                         return
 
-            # start_event 到来后，先把等待期间保留的第一条/最新一条结果写入正式日志。
+            # 本段写入正式开始后的第一条视觉记录。
+            # 对真实相机来说，这是等待期间保留的最新帧；对离线来源来说，是第一帧。
             if not _put_record(record_queue, first_result, stop_event):
                 raise RuntimeError("记录队列已满，相机结果无法写入。")
 
-            # 正式开始后持续处理后续帧，直到 stop_event 亮起或来源耗尽。
+            # 本循环是正式预实验相机记录主流程。
+            # 输入是 start_event 后的连续帧；输出是逐帧 VISION 记录进入 record_queue。
+            # 循环直到主程序要求停止、其他进程出错，或图像来源提前耗尽。
             for packet in iterator:
-                # 其他进程要求停止时，相机进程应尽快退出循环。
                 if stop_event.is_set():
                     break
 
-                # 处理当前帧，得到结果字典和调试图。
+                # 本段处理当前实验帧。
+                # 输出 result 是正式日志数据；debug 只在 SHOW_PREVIEW=True 时用于人眼预览。
                 result, debug = processor.process_frame(packet)
 
-                # 完整实验必须与 EVENT 和 ROBOT 共用电脑时基，不能改用视频内部的相对零点。
+                # 本段统一正式实验时间轴。
+                # 正式 run_log 中 VISION、EVENT、ROBOT 必须共用电脑时基，不能使用离线视频自己的相对零点。
                 result["analysis_time_s"] = result["host_ns"] * 1e-9
 
-                # 把视觉结果交给记录进程。
                 if not _put_record(record_queue, result, stop_event):
                     raise RuntimeError("记录队列已满，相机结果无法写入。")
 
-                # 正式实验中一般不建议开预览；如果开启，按 q/Esc 会请求停止整套实验。
+                # 本段处理正式实验预览。
+                # 预览不是算法输入；若操作者按 q/Esc，视为请求整套实验停止。
                 if config.SHOW_PREVIEW:
                     cv2.imshow("UR10 vibration experiment", _resize_for_preview(debug))
                     key = cv2.waitKey(1) & 0xFF
@@ -1722,21 +2148,25 @@ def camera_worker(
                         stop_event.set()
                         break
 
-            # 如果不是收到 stop_event，而是图像来源自己结束了，说明实验数据长度不够。
+            # 本段处理图像来源提前结束。
+            # 正式实验应由主程序 stop_event 收尾；若相机/离线序列自己先结束，说明实验数据覆盖时间不足。
             if not stop_event.is_set():
                 raise RuntimeError(
                     "图像来源在实验停止信号到来前已经结束。"
                     "正式实验应使用连续相机流，离线文件需保证长度覆盖全部运动和后记录。"
                 )
     except StopIteration:
-        # 连第一帧都没有读到时会进入这里。
+        # 本段处理连第一帧都没有的输入源。
+        # 输出错误给主程序，并请求其他进程停止。
         error_queue.put("相机来源没有返回任何一帧。")
         stop_event.set()
     except Exception as exc:
-        # 把错误文本发给主程序，让主程序统一停止其他子进程。
+        # 本段把相机进程异常汇报给主程序。
+        # 主程序会据此停止机器人和 writer，避免相机失败后实验仍继续运动或记录。
         error_queue.put(f"相机进程异常：{type(exc).__name__}: {exc}")
         stop_event.set()
     finally:
-        # 如果打开了 OpenCV 窗口，退出前关闭窗口资源。
+        # 本段释放 OpenCV 预览窗口资源。
+        # 无论正常结束还是异常退出，打开过窗口都应关闭。
         if config.SHOW_PREVIEW:
             cv2.destroyAllWindows()

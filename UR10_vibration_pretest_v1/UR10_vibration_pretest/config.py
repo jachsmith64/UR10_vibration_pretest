@@ -72,9 +72,24 @@ IMAGE_EXTENSIONS: Final[tuple[str, ...]] = (
     ".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"
 )
 
-# 离线图片没有可靠的相机时间戳，因此用这个帧率把帧号换算成相对时间。
-# 如果图片是从 60 fps 视频逐帧导出的，这里就填 60.0。
-IMAGE_FOLDER_FPS = 60.0
+# 本段控制“离线图片序列的时间轴从哪里来”。
+# 输入：可选 timestamps.csv，格式可为 filename,time_s 或 frame_id,time_s。
+# 输出：每张图片进入 vision_results.txt 时使用的 analysis_time_s。
+# 实验作用：真实时间戳优先；没有时间戳时才用 IMAGE_FOLDER_FPS 兜底，避免误把电脑解码速度当采样速度。
+IMAGE_TIMESTAMPS_CSV: Path | None = IMAGE_FOLDER / "timestamps.csv"
+IMAGE_TIMESTAMPS_REQUIRED = False
+
+# 本段是没有 timestamps.csv 时的兜底采样率。
+# 对 132 fps 相机导出的连续图片，程序会用 frame_id / 132.0 生成相对秒数。
+IMAGE_FOLDER_FPS = 132.0
+
+# 本段控制“采样率偏差是否提示”。
+# 输入：分析阶段从 analysis_time_s 估计出的真实 fps。
+# 输出：正常接近 132 fps 时不提示；偏差超过容差或出现大间隔时写入摘要并在终端提醒。
+EXPECTED_VISION_FPS: float | None = 132.0
+FPS_WARNING_RELATIVE_TOLERANCE = 0.03
+FPS_WARNING_ABSOLUTE_TOLERANCE_HZ = 1.0
+FRAME_GAP_WARNING_FACTOR = 2.5
 
 # 是否弹出 OpenCV 预览窗口。服务器或无桌面环境应设为 False，Windows 本地调试可设为 True。
 SHOW_PREVIEW = True
@@ -82,9 +97,11 @@ SHOW_PREVIEW = True
 # 按 q 或 Esc 可提前结束预览；不显示预览时，程序会自动处理完全部输入。
 PREVIEW_MAX_WIDTH = 1400
 
-# 调试图会画出角点、圆心、位移和质量指标；每帧都保存会很占硬盘，所以允许间隔保存。
+# 本段控制人工质检图的保存节奏。
+# 输入：VisionProcessor 生成的 debug 图；输出：debug_images 文件夹中的抽样 jpg。
+# 实验作用：调试图只帮助人检查识别点、编号和画质，不参与后续分析；132 fps 下每 66 帧约半秒一张。
 SAVE_DEBUG_IMAGE = True
-DEBUG_IMAGE_EVERY_N_FRAMES = 10
+DEBUG_IMAGE_EVERY_N_FRAMES = 66
 MAX_DEBUG_IMAGES = 300
 
 # 完整实验中不建议保存大量调试图，因为磁盘写入可能干扰实时取图。
@@ -108,6 +125,30 @@ GAUSSIAN_BLUR_KERNEL = 3
 # 这两个参数必须同时填写或同时保持 None，配置检查会阻止只填一半。
 CAMERA_MATRIX: list[list[float]] | None = None
 DISTORTION_COEFFICIENTS: list[float] | None = None
+
+# 本段控制是否保存识别点的原始像素坐标。
+# 输入：圆点法/棋盘格法识别出的点；输出：每帧 JSON 中的 circle_points_px / checker_corners_px。
+# 实验作用：先检查像素坐标是否可靠，再判断二维位移或空间坐标是否可信。
+SAVE_POINT_COORDINATES = True
+
+# 本段控制是否把像素点进一步投影为空间点。
+# 输入：像素坐标、相机内参，以及下面所选模式需要的平面/外参参数。
+# 输出：每帧 JSON 中的 *_spatial 字段。
+# 实验作用：空间坐标作为第二层结果和像素坐标并列保存；如果空间结果异常，可以回头先看像素坐标是否已经异常。
+SPATIAL_COORDINATES_ENABLED = False
+SPATIAL_COORDINATE_MODE = "camera_plane"
+VALID_SPATIAL_COORDINATE_MODES: Final[set[str]] = {"camera_plane", "robot_plane"}
+
+# camera_plane 模式输入：目标点所在平面到相机的固定 Z 深度，单位 m。
+# 输出：相机坐标系下的三维点；不输出机器人坐标。
+SPATIAL_CAMERA_PLANE_Z_M: float | None = None
+
+# robot_plane 模式输入：相机到机器人外参，以及测量平面在机器人坐标系中的点和法向。
+# 输出：同一批点的相机坐标和机器人坐标。
+CAMERA_TO_ROBOT_ROTATION: list[list[float]] | None = None
+CAMERA_TO_ROBOT_TRANSLATION_M: list[float] | None = None
+MEASUREMENT_PLANE_POINT_ROBOT_M: list[float] | None = None
+MEASUREMENT_PLANE_NORMAL_ROBOT: list[float] | None = None
 
 # 清晰度使用拉普拉斯方差衡量。它只用于报警和质量记录，不会因为低于阈值就擅自删掉一帧。
 BLUR_WARNING_THRESHOLD = 60.0
@@ -331,6 +372,18 @@ ANALYSIS_VISION_METHOD = "circles"
 ANALYSIS_AXIS = "x"
 VALID_ANALYSIS_AXES: Final[set[str]] = {"x", "y", "magnitude"}
 
+# 主分析窗口决定“哪一段数据拿去算 RMS 和频谱”。
+# motion 使用运动命令发出到运动完成；steady_motion 会裁掉运动前后各一段，更适合匀速段粗分析。
+ANALYSIS_PRIMARY_WINDOW = "motion"
+VALID_ANALYSIS_PRIMARY_WINDOWS: Final[set[str]] = {
+    "full",
+    "baseline",
+    "motion",
+    "steady_motion",
+    "post",
+}
+STEADY_MOTION_TRIM_FRACTION = 0.20
+
 # linear 适合直线恒速段；savgol 适合缓慢弯曲趋势；highpass 适合明确只关心某频率以上振动。
 DETREND_METHOD = "linear"
 VALID_DETREND_METHODS: Final[set[str]] = {"linear", "savgol", "highpass"}
@@ -378,6 +431,29 @@ def _check_pose(name: str, pose: list[float]) -> None:
         raise ValueError(f"{name} 中存在非数值或无穷值。")
 
 
+def _check_vector(name: str, values: list[float] | None, length: int) -> None:
+    """检查标定向量是否完整填写。"""
+
+    import math
+
+    if values is None or len(values) != length:
+        raise ValueError(f"{name} 必须填写 {length} 个数值。")
+    if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in values):
+        raise ValueError(f"{name} 中存在非数值或无穷值。")
+
+
+def _check_matrix(name: str, values: list[list[float]] | None, rows: int, columns: int) -> None:
+    """检查标定矩阵是否完整填写。"""
+
+    import math
+
+    if values is None or len(values) != rows or any(len(row) != columns for row in values):
+        raise ValueError(f"{name} 必须填写 {rows}×{columns} 个数值。")
+    for row in values:
+        if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in row):
+            raise ValueError(f"{name} 中存在非数值或无穷值。")
+
+
 def validate_config(run_mode: str | None = None) -> None:
     """
     在导入硬件库或创建子进程前检查明显配置错误。
@@ -410,6 +486,12 @@ def validate_config(run_mode: str | None = None) -> None:
     if VISION_METHOD not in VALID_VISION_METHODS:
         raise ValueError(
             f"未知 VISION_METHOD={VISION_METHOD!r}，可选值为 {sorted(VALID_VISION_METHODS)}。"
+        )
+
+    if SPATIAL_COORDINATE_MODE not in VALID_SPATIAL_COORDINATE_MODES:
+        raise ValueError(
+            f"未知 SPATIAL_COORDINATE_MODE={SPATIAL_COORDINATE_MODE!r}，"
+            f"可选值为 {sorted(VALID_SPATIAL_COORDINATE_MODES)}。"
         )
 
     if TRAJECTORY_TYPE not in VALID_TRAJECTORY_TYPES:
@@ -457,6 +539,34 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if (CAMERA_MATRIX is None) != (DISTORTION_COEFFICIENTS is None):
         raise ValueError("CAMERA_MATRIX 与 DISTORTION_COEFFICIENTS 必须同时填写。")
+
+    if IMAGE_FOLDER_FPS <= 0:
+        raise ValueError("IMAGE_FOLDER_FPS 必须为正数。")
+
+    if EXPECTED_VISION_FPS is not None and EXPECTED_VISION_FPS <= 0:
+        raise ValueError("EXPECTED_VISION_FPS 必须为正数或 None。")
+
+    if FPS_WARNING_RELATIVE_TOLERANCE < 0 or FPS_WARNING_ABSOLUTE_TOLERANCE_HZ < 0:
+        raise ValueError("FPS 警告容差不能为负数。")
+
+    if not 0 <= STEADY_MOTION_TRIM_FRACTION < 0.5:
+        raise ValueError("STEADY_MOTION_TRIM_FRACTION 必须在 [0, 0.5) 范围内。")
+
+    if ANALYSIS_PRIMARY_WINDOW not in VALID_ANALYSIS_PRIMARY_WINDOWS:
+        raise ValueError(
+            f"ANALYSIS_PRIMARY_WINDOW 可选值为 {sorted(VALID_ANALYSIS_PRIMARY_WINDOWS)}。"
+        )
+
+    if SPATIAL_COORDINATES_ENABLED:
+        _check_matrix("CAMERA_MATRIX", CAMERA_MATRIX, 3, 3)
+        if SPATIAL_COORDINATE_MODE == "camera_plane":
+            if SPATIAL_CAMERA_PLANE_Z_M is None or SPATIAL_CAMERA_PLANE_Z_M <= 0:
+                raise ValueError("camera_plane 模式必须填写正数 SPATIAL_CAMERA_PLANE_Z_M。")
+        if SPATIAL_COORDINATE_MODE == "robot_plane":
+            _check_matrix("CAMERA_TO_ROBOT_ROTATION", CAMERA_TO_ROBOT_ROTATION, 3, 3)
+            _check_vector("CAMERA_TO_ROBOT_TRANSLATION_M", CAMERA_TO_ROBOT_TRANSLATION_M, 3)
+            _check_vector("MEASUREMENT_PLANE_POINT_ROBOT_M", MEASUREMENT_PLANE_POINT_ROBOT_M, 3)
+            _check_vector("MEASUREMENT_PLANE_NORMAL_ROBOT", MEASUREMENT_PLANE_NORMAL_ROBOT, 3)
 
     if VISION_ROI is not None:
         if len(VISION_ROI) != 4 or any(value < 0 for value in VISION_ROI):
