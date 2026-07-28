@@ -72,6 +72,37 @@ class LoadedRun:
     malformed_lines: list[int]
 
 
+@dataclass(slots=True)
+class AnalysisSegment:
+    """
+    描述一段已经被自动切出来的实验阶段。
+
+    输入来源：EVENT 时间戳、ROBOT TCP 速度，或视觉位移变化。
+    输出去向：select_analysis_windows() 把它转换成布尔窗口，run_analysis() 再分别计算单段和合并指标。
+
+    实验作用：把“整条曲线”拆成更接近真实工况的静止段、运动段和匀速段。
+    例如反复启停实验中会出现 motion_001、static_002、motion_002，而不是只剩一段笼统 motion。
+    """
+
+    name: str
+    kind: str
+    start_s: float
+    end_s: float
+    source: str
+
+    def to_json(self) -> dict[str, float | str]:
+        """把片段对象转换成 JSON 摘要能直接保存的字典。"""
+
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "start_s": self.start_s,
+            "end_s": self.end_s,
+            "duration_s": self.end_s - self.start_s,
+            "source": self.source,
+        }
+
+
 def _find_latest_run_file() -> Path:
     """
     在 outputs 中自动寻找最近一次可分析记录。
@@ -350,6 +381,26 @@ def event_times_seconds(events: list[dict[str, Any]]) -> dict[str, float]:
     return result
 
 
+def event_times_sequence(events: list[dict[str, Any]]) -> dict[str, list[float]]:
+    """
+    把 EVENT 记录转换成“事件名 -> 所有发生时间”的字典。
+
+    输入：load_run_file() 得到的 EVENT 记录。
+    输出：每种事件的完整时间列表，单位秒，并按发生顺序排列。
+
+    实验作用：event_times_seconds() 只保留第一次事件，适合旧版单段实验；
+    本函数保留重复事件，适合反复启停、L 形多段运动和以后更复杂的预实验。
+    """
+
+    result: dict[str, list[float]] = {}
+    for event in sorted(events, key=lambda item: _finite_float(item.get("host_ns"))):
+        name = str(event.get("name", ""))
+        host_ns = _finite_float(event.get("host_ns"))
+        if name and math.isfinite(host_ns):
+            result.setdefault(name, []).append(host_ns * 1e-9)
+    return result
+
+
 def _window_mask(
     time_s: np.ndarray,
     start_s: float | None,
@@ -373,68 +424,571 @@ def _window_mask(
     return (time_s >= start) & (time_s <= end)
 
 
+def extract_robot_speed_series(
+    robot_records: list[dict[str, Any]],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    从 ROBOT 记录中提取 TCP 线速度大小。
+
+    输入：robot_worker 写入的 ROBOT 状态记录。
+    输出：时间数组和 TCP 线速度模长，单位 m/s；没有足够速度记录时返回 None。
+
+    实验作用：用于自动识别机器人是否真的在运动。它比只看“有没有发过运动命令”更适合
+    反复启停、加减速、路径转弯或机器人还没真正开始动的情况。
+    """
+
+    time_values: list[float] = []
+    speed_values: list[float] = []
+
+    for record in robot_records:
+        host_ns = _finite_float(record.get("host_ns"))
+        tcp_speed = record.get("actual_tcp_speed")
+        if not math.isfinite(host_ns) or not isinstance(tcp_speed, list) or len(tcp_speed) < 3:
+            continue
+
+        linear_speed = [_finite_float(value) for value in tcp_speed[:3]]
+        if all(math.isfinite(value) for value in linear_speed):
+            time_values.append(host_ns * 1e-9)
+            speed_values.append(float(np.linalg.norm(linear_speed)))
+
+    if len(time_values) < 2:
+        return None
+
+    time_array = np.asarray(time_values, dtype=float)
+    speed_array = np.asarray(speed_values, dtype=float)
+    order = np.argsort(time_array)
+    sorted_time = time_array[order]
+    sorted_speed = speed_array[order]
+    unique_time, unique_indices = np.unique(sorted_time, return_index=True)
+    return unique_time, sorted_speed[unique_indices]
+
+
+def _merge_intervals(
+    intervals: list[tuple[float, float]],
+    max_gap_s: float,
+) -> list[tuple[float, float]]:
+    """
+    合并间隔很小的同类时间段。
+
+    输入：若干起止时间，以及允许忽略的短暂停顿时间。
+    输出：合并后的起止时间。
+
+    实验作用：机器人速度在零附近短暂抖一下，不应把一次连续运动切成很多碎片。
+    """
+
+    if not intervals:
+        return []
+
+    intervals = sorted(intervals)
+    merged: list[tuple[float, float]] = [intervals[0]]
+    for start_s, end_s in intervals[1:]:
+        previous_start, previous_end = merged[-1]
+        if start_s - previous_end <= max_gap_s:
+            merged[-1] = (previous_start, max(previous_end, end_s))
+        else:
+            merged.append((start_s, end_s))
+    return merged
+
+
+def _motion_intervals_from_robot_speed(
+    robot_records: list[dict[str, Any]],
+    data_start_s: float,
+    data_end_s: float,
+) -> list[tuple[float, float]]:
+    """
+    用机器人 TCP 速度把全程切出运动段。
+
+    输入：ROBOT 速度记录和视觉数据覆盖的时间范围。
+    输出：若干 motion 起止时间。
+
+    实验作用：这一步回答“机器人实际什么时候在动”。反复加速、减速、停止时，
+    它会按真实速度切出多段 motion，而不是只相信第一条 motion_command_sent 和 motion_finished。
+    """
+
+    speed_series = extract_robot_speed_series(robot_records)
+    if speed_series is None:
+        return []
+
+    robot_time, robot_speed = speed_series
+    on_threshold = float(config.ROBOT_MOTION_ON_SPEED_M_S)
+    off_threshold = float(config.ROBOT_MOTION_OFF_SPEED_M_S)
+
+    intervals: list[tuple[float, float]] = []
+    in_motion = False
+    start_s = data_start_s
+
+    for current_time, current_speed in zip(robot_time, robot_speed):
+        if current_time < data_start_s or current_time > data_end_s:
+            continue
+
+        if not in_motion and current_speed >= on_threshold:
+            start_s = float(current_time)
+            in_motion = True
+        elif in_motion and current_speed <= off_threshold:
+            end_s = float(current_time)
+            if end_s - start_s >= float(config.SEGMENT_MIN_MOTION_SECONDS):
+                intervals.append((start_s, end_s))
+            in_motion = False
+
+    if in_motion:
+        end_s = data_end_s
+        if end_s - start_s >= float(config.SEGMENT_MIN_MOTION_SECONDS):
+            intervals.append((start_s, end_s))
+
+    return _merge_intervals(intervals, float(config.SEGMENT_MERGE_GAP_SECONDS))
+
+
+def _motion_intervals_from_events(
+    event_sequence: dict[str, list[float]],
+    data_start_s: float,
+    data_end_s: float,
+) -> list[tuple[float, float]]:
+    """
+    用运动命令事件把全程切出运动段。
+
+    输入：所有 motion_command_sent 和 motion_finished 时间。
+    输出：按顺序配对后的 motion 起止时间。
+
+    实验作用：当没有机器人速度记录时，事件仍然能提供“程序计划中的运动区间”。
+    它不判断机器人速度是否稳定，只负责把命令发出到完成之间视作运动段。
+    """
+
+    starts = event_sequence.get("motion_command_sent", [])
+    ends = event_sequence.get("motion_finished", [])
+    intervals: list[tuple[float, float]] = []
+    end_index = 0
+
+    for start_s in starts:
+        while end_index < len(ends) and ends[end_index] <= start_s:
+            end_index += 1
+        if end_index >= len(ends):
+            break
+
+        end_s = ends[end_index]
+        end_index += 1
+        start_s = max(float(start_s), data_start_s)
+        end_s = min(float(end_s), data_end_s)
+        if end_s - start_s >= float(config.SEGMENT_MIN_MOTION_SECONDS):
+            intervals.append((start_s, end_s))
+
+    return _merge_intervals(intervals, float(config.SEGMENT_MERGE_GAP_SECONDS))
+
+
+def _motion_intervals_from_vision_velocity(
+    time_s: np.ndarray,
+    values: np.ndarray | None,
+) -> list[tuple[float, float]]:
+    """
+    用视觉位移变化速度粗略切出运动段。
+
+    输入：视觉时间和位移曲线。
+    输出：基于位移速度异常升高得到的候选 motion 段。
+
+    实验作用：这是没有 ROBOT、没有 EVENT 时的兜底方法。它只能用于离线辅助复查，
+    因为真实振动也会改变视觉位移速度，不能像机器人速度那样明确代表运动指令。
+    """
+
+    if values is None or len(time_s) < 8 or len(values) != len(time_s):
+        return []
+
+    delta_t = np.diff(time_s)
+    delta_v = np.diff(values)
+    valid = delta_t > 0
+    if np.count_nonzero(valid) < 4:
+        return []
+
+    velocity_time = (time_s[:-1] + time_s[1:]) * 0.5
+    velocity = np.zeros_like(delta_v, dtype=float)
+    velocity[valid] = np.abs(delta_v[valid] / delta_t[valid])
+
+    baseline = float(np.nanmedian(velocity[valid]))
+    spread = float(np.nanmedian(np.abs(velocity[valid] - baseline)))
+    threshold = baseline + float(config.VISION_MOTION_VELOCITY_FACTOR) * max(spread, 1e-9)
+    moving = velocity > threshold
+
+    intervals: list[tuple[float, float]] = []
+    start_s: float | None = None
+    for current_time, is_moving in zip(velocity_time, moving):
+        if is_moving and start_s is None:
+            start_s = float(current_time)
+        elif not is_moving and start_s is not None:
+            end_s = float(current_time)
+            if end_s - start_s >= float(config.SEGMENT_MIN_MOTION_SECONDS):
+                intervals.append((start_s, end_s))
+            start_s = None
+
+    if start_s is not None:
+        end_s = float(time_s[-1])
+        if end_s - start_s >= float(config.SEGMENT_MIN_MOTION_SECONDS):
+            intervals.append((start_s, end_s))
+
+    return _merge_intervals(intervals, float(config.SEGMENT_MERGE_GAP_SECONDS))
+
+
+def _steady_interval_from_robot_speed(
+    robot_records: list[dict[str, Any]],
+    motion_start_s: float,
+    motion_end_s: float,
+) -> tuple[float, float] | None:
+    """
+    在一个运动段内部，用 TCP 速度寻找更像匀速的子段。
+
+    输入：ROBOT 速度记录和一个 motion 起止时间。
+    输出：steady_motion 起止时间；无法可靠判断时返回 None。
+
+    实验作用：运动段两端常包含加减速，抖动分析时可能想单独看中间匀速部分。
+    这里用“速度接近中位速度、加速度较小”判断，而不是固定裁掉一段时间。
+    """
+
+    speed_series = extract_robot_speed_series(robot_records)
+    if speed_series is None:
+        return None
+
+    robot_time, robot_speed = speed_series
+    mask = (robot_time >= motion_start_s) & (robot_time <= motion_end_s)
+    if np.count_nonzero(mask) < 5:
+        return None
+
+    segment_time = robot_time[mask]
+    segment_speed = robot_speed[mask]
+    valid_speed = segment_speed[segment_speed > float(config.ROBOT_MOTION_OFF_SPEED_M_S)]
+    if len(valid_speed) < 5:
+        return None
+
+    target_speed = float(np.median(valid_speed))
+    speed_band = max(
+        target_speed * float(config.ROBOT_STEADY_SPEED_RELATIVE_TOLERANCE),
+        float(config.ROBOT_MOTION_ON_SPEED_M_S),
+    )
+
+    acceleration = np.gradient(segment_speed, segment_time)
+    steady_mask = (
+        (segment_speed > float(config.ROBOT_MOTION_OFF_SPEED_M_S))
+        & (np.abs(segment_speed - target_speed) <= speed_band)
+        & (np.abs(acceleration) <= float(config.ROBOT_STEADY_ACCELERATION_M_S2))
+    )
+
+    if np.count_nonzero(steady_mask) < 3:
+        return None
+
+    steady_times = segment_time[steady_mask]
+    steady_start = float(steady_times[0])
+    steady_end = float(steady_times[-1])
+    if steady_end - steady_start < float(config.SEGMENT_MIN_MOTION_SECONDS):
+        return None
+    return steady_start, steady_end
+
+
+def _trimmed_steady_interval(
+    motion_start_s: float,
+    motion_end_s: float,
+) -> tuple[float, float]:
+    """
+    在没有可靠速度匀速判断时，按比例裁掉运动段两端。
+
+    输入：motion 起止时间。
+    输出：粗略 steady_motion 起止时间。
+
+    实验作用：这是旧逻辑的保守兜底。它不能真正识别匀速，只是假设中间段比两端更接近匀速。
+    """
+
+    duration = max(0.0, motion_end_s - motion_start_s)
+    trim = float(config.STEADY_MOTION_TRIM_FRACTION) * duration
+    steady_start = motion_start_s + trim
+    steady_end = motion_end_s - trim
+    if steady_start >= steady_end:
+        return motion_start_s, motion_end_s
+    return steady_start, steady_end
+
+
+def _build_segments_from_motion_intervals(
+    motion_intervals: list[tuple[float, float]],
+    data_start_s: float,
+    data_end_s: float,
+    source: str,
+    robot_records: list[dict[str, Any]] | None,
+) -> list[AnalysisSegment]:
+    """
+    把 motion 起止时间扩展成静止段、运动段和匀速段。
+
+    输入：已经识别出的 motion 区间，以及全程数据边界。
+    输出：AnalysisSegment 列表。
+
+    实验作用：它把“机器人动过哪些时间”整理成分析真正需要的窗口：
+    每段运动单独算、所有运动合并算、运动之间的静止段也保留下来供对照。
+    """
+
+    segments: list[AnalysisSegment] = []
+    cursor = data_start_s
+    static_index = 1
+    motion_index = 1
+
+    for motion_start_s, motion_end_s in sorted(motion_intervals):
+        motion_start_s = max(motion_start_s, data_start_s)
+        motion_end_s = min(motion_end_s, data_end_s)
+        if motion_end_s <= motion_start_s:
+            continue
+
+        if motion_start_s - cursor >= float(config.SEGMENT_MIN_STATIC_SECONDS):
+            segments.append(
+                AnalysisSegment(
+                    name=f"static_{static_index:03d}",
+                    kind="static",
+                    start_s=cursor,
+                    end_s=motion_start_s,
+                    source=source,
+                )
+            )
+            static_index += 1
+
+        segments.append(
+            AnalysisSegment(
+                name=f"motion_{motion_index:03d}",
+                kind="motion",
+                start_s=motion_start_s,
+                end_s=motion_end_s,
+                source=source,
+            )
+        )
+
+        steady_interval = None
+        if robot_records:
+            steady_interval = _steady_interval_from_robot_speed(
+                robot_records,
+                motion_start_s,
+                motion_end_s,
+            )
+        if steady_interval is None:
+            steady_interval = _trimmed_steady_interval(motion_start_s, motion_end_s)
+
+        steady_start_s, steady_end_s = steady_interval
+        if steady_end_s > steady_start_s:
+            segments.append(
+                AnalysisSegment(
+                    name=f"steady_motion_{motion_index:03d}",
+                    kind="steady_motion",
+                    start_s=steady_start_s,
+                    end_s=steady_end_s,
+                    source=source,
+                )
+            )
+
+        cursor = max(cursor, motion_end_s)
+        motion_index += 1
+
+    if data_end_s - cursor >= float(config.SEGMENT_MIN_STATIC_SECONDS):
+        segments.append(
+            AnalysisSegment(
+                name=f"static_{static_index:03d}",
+                kind="static",
+                start_s=cursor,
+                end_s=data_end_s,
+                source=source,
+            )
+        )
+
+    return segments
+
+
 def select_analysis_windows(
     time_s: np.ndarray,
     events: dict[str, float],
+    *,
+    event_sequence: dict[str, list[float]] | None = None,
+    robot_records: list[dict[str, Any]] | None = None,
+    vision_values: np.ndarray | None = None,
+    return_segments: bool = False,
 ) -> dict[str, np.ndarray]:
     """
     把完整视觉时间序列拆成实验分析窗口。
 
     输入：
     - time_s：每帧视觉测量结果的时间；
-    - events：实验事件时间，例如 experiment_started、motion_command_sent、motion_finished。
+    - events：每种事件第一次出现的时间，保留旧版单段分析兼容；
+    - event_sequence：每种事件的完整时间列表，用于多段运动命令配对；
+    - robot_records：机器人状态记录，用于按真实 TCP 速度分段；
+    - vision_values：视觉位移曲线，只在没有机器人速度和事件时兜底。
 
     输出：
     - full：整段有效视觉记录；
-    - baseline：运动命令前的静止段；
-    - motion：机器人运动命令发出到运动完成；
-    - steady_motion：粗略裁掉 motion 两端后的中间段，用于匀速段预分析；
-    - post：运动完成后的残余振动段。
+    - motion_001/static_001/steady_motion_001：自动切出的单个实验片段；
+    - motion_all/static_all/steady_motion_all：同类片段合并窗口；
+    - baseline/motion/steady_motion/post：保留旧名字，方便已有配置继续使用。
 
     实验作用：
-    同一条位移曲线在不同工况下要分析不同片段。这里先把“可选片段”准备好，
-    后续 run_analysis() 再根据 config.ANALYSIS_PRIMARY_WINDOW 选择真正用于 RMS 和频谱的主窗口。
+    同一条位移曲线在不同工况下要分析不同片段。这里优先用机器人速度识别真实启停；
+    没有速度时用事件配对；再没有事件时才用视觉位移变化兜底。
+    后续 run_analysis() 会对主窗口、单段窗口和合并窗口分别输出指标。
     """
 
-    # 本段读取窗口边界事件。
-    # 输入来自日志里的 EVENT 记录；缺失实验开始/结束时用数据首尾兜底，避免离线视觉测试无法分析。
-    experiment_start = events.get("experiment_started", float(time_s[0]))
-    motion_start = events.get("motion_command_sent")
-    motion_end = events.get("motion_finished")
-    experiment_end = events.get("experiment_finished", float(time_s[-1]))
+    # 本段先确定可分析的全程边界。
+    # 输入是视觉数据首尾和 experiment_started/experiment_finished；输出是 full 窗口范围。
+    data_start_s = float(time_s[0])
+    data_end_s = float(time_s[-1])
+    experiment_start = events.get("experiment_started", data_start_s)
+    experiment_end = events.get("experiment_finished", data_end_s)
+    data_start_s = max(data_start_s, experiment_start)
+    data_end_s = min(data_end_s, experiment_end)
 
-    # 本段处理没有机器人运动事件的离线数据。
-    # vision_test、合成图片或手动移动视频通常没有 motion_start/motion_end。
-    # 这种情况下无法可靠划分静止/运动/残余段，因此把完整序列作为 motion 和 steady_motion。
-    if motion_start is None or motion_end is None:
-        return {
-            "full": np.ones_like(time_s, dtype=bool),
+    event_sequence = event_sequence or {}
+    robot_records = robot_records or []
+    source_choice = str(config.ANALYSIS_SEGMENTATION_SOURCE)
+
+    # 本段决定用哪一种证据切分运动段。
+    # auto 的优先级是：机器人真实速度 -> 运动事件 -> 视觉位移速度兜底。
+    motion_intervals: list[tuple[float, float]] = []
+    segmentation_source = "none"
+
+    if source_choice in {"auto", "robot_speed"}:
+        motion_intervals = _motion_intervals_from_robot_speed(
+            robot_records,
+            data_start_s,
+            data_end_s,
+        )
+        if motion_intervals:
+            segmentation_source = "robot_speed"
+
+    if not motion_intervals and source_choice in {"auto", "events"}:
+        motion_intervals = _motion_intervals_from_events(
+            event_sequence,
+            data_start_s,
+            data_end_s,
+        )
+        if motion_intervals:
+            segmentation_source = "events"
+
+    if not motion_intervals and source_choice in {"auto", "vision_velocity"}:
+        motion_intervals = _motion_intervals_from_vision_velocity(time_s, vision_values)
+        if motion_intervals:
+            segmentation_source = "vision_velocity"
+
+    full_mask = _window_mask(time_s, data_start_s, data_end_s)
+
+    # 本段处理完全切不出运动段的离线数据。
+    # 输入可能是纯静止视觉测试；输出保持旧版 motion/steady_motion 可用，避免分析流程中断。
+    if not motion_intervals:
+        windows = {
+            "full": full_mask,
             "baseline": np.zeros_like(time_s, dtype=bool),
-            "motion": np.ones_like(time_s, dtype=bool),
-            "steady_motion": np.ones_like(time_s, dtype=bool),
+            "motion": full_mask.copy(),
+            "steady_motion": full_mask.copy(),
             "post": np.zeros_like(time_s, dtype=bool),
         }
+        segments: list[AnalysisSegment] = [
+            AnalysisSegment(
+                name="motion_001",
+                kind="motion",
+                start_s=data_start_s,
+                end_s=data_end_s,
+                source=segmentation_source,
+            )
+        ]
+    else:
+        # 本段把 motion 区间扩展成静止、运动、匀速三类片段，再转成窗口掩码。
+        # 输出既有 motion_001 这种单段窗口，也有 motion_all 这种合并窗口。
+        segments = _build_segments_from_motion_intervals(
+            motion_intervals,
+            data_start_s,
+            data_end_s,
+            segmentation_source,
+            robot_records,
+        )
+        windows = {"full": full_mask}
 
-    # 本段从 motion 中粗略裁出 steady_motion。
-    # 输入是运动开始/结束事件；输出是去掉两端加减速影响后的中间窗口。
-    # 它不是精确的速度闭环识别，只是为“匀速段优先分析”提供一个保守的预实验窗口。
-    motion_duration = max(0.0, motion_end - motion_start)
-    trim = config.STEADY_MOTION_TRIM_FRACTION * motion_duration
-    steady_start = motion_start + trim
-    steady_end = motion_end - trim
-    if steady_start >= steady_end:
-        steady_start = motion_start
-        steady_end = motion_end
+        for segment in segments:
+            windows[segment.name] = _window_mask(time_s, segment.start_s, segment.end_s)
 
-    # 本段输出所有分析窗口的布尔掩码。
-    # 每个掩码和 time_s 一样长，True 表示该帧属于对应窗口。
-    return {
-        "full": _window_mask(time_s, experiment_start, experiment_end),
-        "baseline": _window_mask(time_s, experiment_start, motion_start),
-        "motion": _window_mask(time_s, motion_start, motion_end),
-        "steady_motion": _window_mask(time_s, steady_start, steady_end),
-        "post": _window_mask(time_s, motion_end, experiment_end),
-    }
+        for kind in ("static", "motion", "steady_motion"):
+            masks = [
+                windows[segment.name]
+                for segment in segments
+                if segment.kind == kind
+            ]
+            windows[f"{kind}_all"] = (
+                np.logical_or.reduce(masks)
+                if masks
+                else np.zeros_like(time_s, dtype=bool)
+            )
+
+        # 本段保留旧窗口名。
+        # baseline 是第一段运动前静止，post 是最后一段运动后静止；motion/steady_motion 是同类合并。
+        static_segments = [segment for segment in segments if segment.kind == "static"]
+        motion_segments = [segment for segment in segments if segment.kind == "motion"]
+        steady_segments = [
+            segment for segment in segments if segment.kind == "steady_motion"
+        ]
+
+        first_motion = motion_segments[0] if motion_segments else None
+        last_motion = motion_segments[-1] if motion_segments else None
+
+        baseline_segment = next(
+            (
+                segment
+                for segment in static_segments
+                if first_motion is not None and segment.end_s <= first_motion.start_s
+            ),
+            None,
+        )
+        post_segment = next(
+            (
+                segment
+                for segment in reversed(static_segments)
+                if last_motion is not None and segment.start_s >= last_motion.end_s
+            ),
+            None,
+        )
+
+        windows["baseline"] = (
+            windows[baseline_segment.name]
+            if baseline_segment is not None
+            else np.zeros_like(time_s, dtype=bool)
+        )
+        windows["post"] = (
+            windows[post_segment.name]
+            if post_segment is not None
+            else np.zeros_like(time_s, dtype=bool)
+        )
+        windows["motion"] = windows.get("motion_all", full_mask.copy())
+        windows["steady_motion"] = (
+            windows["steady_motion_all"]
+            if steady_segments
+            else windows["motion"]
+        )
+
+    if return_segments:
+        return cast(Any, (windows, segments))
+    return windows
+
+
+def select_analysis_segments(
+    time_s: np.ndarray,
+    events: dict[str, float],
+    *,
+    event_sequence: dict[str, list[float]] | None = None,
+    robot_records: list[dict[str, Any]] | None = None,
+    vision_values: np.ndarray | None = None,
+) -> tuple[dict[str, np.ndarray], list[AnalysisSegment]]:
+    """
+    返回分析窗口和窗口背后的片段说明。
+
+    输入：和 select_analysis_windows() 相同。
+    输出：窗口掩码字典，以及 motion/static/steady_motion 片段清单。
+
+    实验作用：run_analysis() 需要窗口来计算，也需要片段说明写进摘要和 JSON，
+    这样你能看见程序到底把哪几段判断成运动、静止或匀速。
+    """
+
+    return cast(
+        tuple[dict[str, np.ndarray], list[AnalysisSegment]],
+        select_analysis_windows(
+            time_s,
+            events,
+            event_sequence=event_sequence,
+            robot_records=robot_records,
+            vision_values=vision_values,
+            return_segments=True,
+        ),
+    )
 
 
 def extract_robot_tcp_series(
@@ -874,6 +1428,62 @@ def calculate_time_metrics(residual: np.ndarray) -> dict[str, float]:
         "std_mm": float(np.std(residual)),
         "max_abs_mm": float(np.max(np.abs(residual))),
         "mean_mm": float(np.mean(residual)),
+    }
+
+
+def calculate_window_metric_summary(
+    time_s: np.ndarray,
+    values: np.ndarray,
+    mask: np.ndarray,
+) -> dict[str, Any]:
+    """
+    对某一个分析窗口单独计算简版振动指标。
+
+    输入：完整视觉时间、完整位移和一个窗口掩码。
+    输出：该窗口的点数、时长、RMS、峰峰值、主频和频带能量；点数不足时说明 unavailable。
+
+    实验作用：run_analysis() 的主指标只对应一个主窗口；本函数让 motion_001、motion_002、
+    steady_motion_all、static_all 等窗口也能各自输出结果，方便比较不同启停段是否表现一致。
+    """
+
+    sample_count = int(np.count_nonzero(mask))
+    if sample_count < 8:
+        return {
+            "available": False,
+            "sample_count": sample_count,
+            "reason": "窗口有效点少于 8，无法稳定计算频谱和 RMS。",
+        }
+
+    window_time = time_s[mask]
+    window_values = values[mask]
+    duration_s = float(window_time[-1] - window_time[0]) if len(window_time) else 0.0
+
+    try:
+        uniform_time, uniform_values, sample_rate_hz, timing = resample_uniform(
+            window_time,
+            window_values,
+        )
+        _, residual = detrend_motion(uniform_values, sample_rate_hz)
+        time_metrics = calculate_time_metrics(residual)
+        spectrum = calculate_spectrum(residual, sample_rate_hz)
+    except ValueError as exc:
+        return {
+            "available": False,
+            "sample_count": sample_count,
+            "duration_s": duration_s,
+            "reason": str(exc),
+        }
+
+    return {
+        "available": True,
+        "sample_count": sample_count,
+        "duration_s": duration_s,
+        "timing": timing,
+        "time_metrics": time_metrics,
+        "dominant_frequency_hz": spectrum["dominant_frequency_hz"],
+        "frequency_resolution_hz": spectrum["frequency_resolution_hz"],
+        "band_energy_mm2": spectrum["band_energy_mm2"],
+        "uniform_sample_count": int(len(uniform_time)),
     }
 
 
@@ -1413,6 +2023,8 @@ def write_summary(
     comparison: dict[str, float | int | None],
     valid_quality: np.ndarray,
     primary_count: int,
+    segments: list[AnalysisSegment] | None = None,
+    window_metric_summaries: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """
     写出一份中文分析摘要 TXT，方便人工快速复查本次实验结果。
@@ -1508,6 +2120,43 @@ def write_summary(
                 "两方法相关系数："
                 f"{_format_optional(comparison['circle_checker_correlation'], 6)}"
             ),
+        ]
+    )
+
+    lines.extend(["", "七、自动分段", f"分段来源：{segments[0].source if segments else '无'}"])
+    if segments:
+        for segment in segments:
+            lines.append(
+                f"{segment.name} [{segment.kind}]："
+                f"{segment.start_s:.6f} s -> {segment.end_s:.6f} s，"
+                f"时长 {segment.end_s - segment.start_s:.6f} s"
+            )
+    else:
+        lines.append("无")
+
+    lines.extend(["", "八、分段指标"])
+    if window_metric_summaries:
+        for name in sorted(window_metric_summaries):
+            summary = window_metric_summaries[name]
+            if not bool(summary.get("available")):
+                lines.append(
+                    f"{name}：不可用，点数 {summary.get('sample_count', 0)}，"
+                    f"原因：{summary.get('reason', '未说明')}"
+                )
+                continue
+
+            metrics = cast(dict[str, float], summary["time_metrics"])
+            lines.append(
+                f"{name}：点数 {summary['sample_count']}，"
+                f"峰峰值 {metrics['peak_to_peak_mm']:.6f} mm，"
+                f"RMS {metrics['rms_mm']:.6f} mm，"
+                f"主频 {_format_optional(summary['dominant_frequency_hz'], 6)} Hz"
+            )
+    else:
+        lines.append("无")
+
+    lines.extend(
+        [
             "",
             "解释提醒",
             "1. 去趋势残差不是相机原始位移，低频结果会受到所选趋势模型影响。",
@@ -1562,7 +2211,19 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
     # 本段把同一条位移曲线切成不同实验阶段。
     # 输入是视觉时间轴和 EVENT 事件；输出是 full/baseline/motion/steady_motion/post 等窗口掩码。
     events = event_times_seconds(loaded.events)
-    windows = select_analysis_windows(vision_time, events)
+    event_sequence = event_times_sequence(loaded.events)
+    timeline_events = dict(events)
+    if event_sequence.get("motion_command_sent"):
+        timeline_events["motion_command_sent"] = event_sequence["motion_command_sent"][0]
+    if event_sequence.get("motion_finished"):
+        timeline_events["motion_finished"] = event_sequence["motion_finished"][-1]
+    windows, segments = select_analysis_segments(
+        vision_time,
+        events,
+        event_sequence=event_sequence,
+        robot_records=loaded.robot,
+        vision_values=vision_values,
+    )
 
     # 本段决定“哪一段真正拿去算主指标”。
     # 输入是所有候选窗口；输出是 primary_time/primary_values。
@@ -1576,6 +2237,14 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
 
     window_counts = {
         name: int(np.count_nonzero(mask))
+        for name, mask in windows.items()
+    }
+
+    # 本段对每个自动窗口单独计算简版指标。
+    # 输入是同一条视觉位移曲线和所有窗口掩码；输出是单段/合并窗口的 RMS、峰峰值和主频。
+    # 实验作用：反复启停时可以分别看 motion_001、motion_002，也可以看 motion_all 的总体表现。
+    window_metric_summaries = {
+        name: calculate_window_metric_summary(vision_time, vision_values, mask)
         for name, mask in windows.items()
     }
 
@@ -1623,14 +2292,14 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         full_uniform_time,
         full_uniform_values,
         full_rate,
-        events,
+        timeline_events,
     )
 
     # 本段提取运动前静止基线。
     # 输入是实验开始和运动命令事件；输出 baseline_uniform_mask。
     # 恢复时间阈值会参考基线 RMS，避免把静态视觉噪声误判成残余振动。
-    baseline_start = events.get("experiment_started", float(full_uniform_time[0]))
-    baseline_end = events.get("motion_command_sent")
+    baseline_start = timeline_events.get("experiment_started", float(full_uniform_time[0]))
+    baseline_end = timeline_events.get("motion_command_sent")
     baseline_uniform_mask = _window_mask(
         full_uniform_time,
         baseline_start,
@@ -1646,7 +2315,7 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
     recovery = calculate_recovery_time(
         full_uniform_time,
         full_residual,
-        events,
+        timeline_events,
         baseline_uniform_mask,
         full_rate,
     )
@@ -1672,7 +2341,7 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         full_uniform_time,
         full_trend,
         full_residual,
-        events,
+        timeline_events,
         config.ANALYSIS_VISION_METHOD,
         config.ANALYSIS_AXIS,
     )
@@ -1718,6 +2387,8 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         comparison,
         quality,
         len(primary_time),
+        segments,
+        window_metric_summaries,
     )
 
     # 本段输出机器可读指标。
@@ -1729,6 +2400,8 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         "analysis_axis": config.ANALYSIS_AXIS,
         "analysis_primary_window": selected_window,
         "window_counts": window_counts,
+        "segments": [segment.to_json() for segment in segments],
+        "window_metric_summaries": window_metric_summaries,
         "detrend_method": config.DETREND_METHOD,
         "timing": timing,
         "timing_warnings": timing_warnings,

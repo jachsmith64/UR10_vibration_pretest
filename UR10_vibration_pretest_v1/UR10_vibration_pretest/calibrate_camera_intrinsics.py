@@ -8,6 +8,25 @@
 - detection_debug/：每张标定图的角点识别检查图；
 - undistort_preview.jpg：用求出的内参去畸变后的预览图。
 
+main()
+脚本总入口。读取命令行参数，收集标定图片，调用标定流程，输出结果文件夹。
+
+_parse_arguments()
+解析命令行参数，比如图片文件夹、棋盘格内角点数量、小格边长。
+
+_collect_images()
+从 calibration_images 或指定文件夹里收集标定图片。
+
+_find_corners()
+在每张标定图里找棋盘格内角点。
+
+_calibrate()
+真正调用 OpenCV 标定，计算 CAMERA_MATRIX 和 DISTORTION_COEFFICIENTS。
+
+_write_outputs()
+保存 camera_intrinsics.json、config_snippet.txt、调试图和去畸变预览图。
+
+
 推荐操作流程：
 1. 打印棋盘格标定板。
    - 使用普通平整纸张或更硬的板材固定，标定板必须尽量平整。

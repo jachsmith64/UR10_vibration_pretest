@@ -810,6 +810,22 @@ def _estimate_rigid_motion(
     - dx_mm / dy_mm：当前帧相对参考帧的整体平移；
     - angle_deg / scale：平面内转角和尺度变化；
     - residual_px / quality：拟合残差和质量分。
+    
+    
+    我已经拿到了两组对应点了吗？
+    输入来自：
+    - CheckerboardTracker.process() 传入的 reference_corners 和 corners
+    或者
+    - CircleTracker.process() 传入的 reference_points 和 current_points
+    ↓
+    把输入点统一整理成 N×2 数组
+    ↓
+    调用opencv2, 根据标定图案移动距离，计算移动量（像素）
+    ↓
+    用camera.py 的 CheckerboardTracker._calculate_mm_per_pixel()把像素位移换成毫米位移
+    ↓
+    返回 dx_mm / dy_mm / angle_deg旋转角度 / scale尺度变化 / residual_px拟合误差(可以理解为置信度) / quality可信点比例
+
 
     实验作用：
     棋盘格和圆点法最后都会走到这里。它把“多个点的像素坐标变化”压缩成
@@ -1289,6 +1305,18 @@ class CircleTracker:
         - circle_* 结果字典；
         - 当前帧圆心坐标，用于日志保存和调试图绘制。
 
+        我这一帧看到棋盘格了吗? 调用camera.py的_find_corners()检测棋盘格角点 (calibrate_camera_intrinsics.py也有find_corners, 不过是给内参用的）
+        ↓
+        没看到：返回 checker_is_valid=False
+        ↓
+        看到了：
+            如果这是第一次看到，就把这帧当参考零点
+        ↓
+        拿当前帧角点和参考帧角点，调用camera.py的calculate_mm_per_pixel()去算位移
+        ↓
+        把算出来的位移、角度、质量分整理成 checker_* 结果
+
+
         实验作用：
         这里把“当前帧圆点检测与身份匹配”转换成“相对第一帧的位移/转角/质量”。
         """
@@ -1487,9 +1515,9 @@ class VisionProcessor:
         #↓
         #决定这一帧的分析时间 analysis_time_s
         #↓
-        #按配置运行棋盘格法
+        #按配置运行棋盘格法 CheckerboardTracker.process--estimate_rigid_motion()
         #↓
-        #按配置运行圆点法
+        #按配置运行圆点法 CircleTracker.process--estimate_rigid_motion()
         #↓
         #汇总这一帧是否有效
         #↓

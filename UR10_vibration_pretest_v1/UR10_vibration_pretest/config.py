@@ -485,6 +485,41 @@ VALID_ANALYSIS_PRIMARY_WINDOWS: Final[set[str]] = {
 }
 STEADY_MOTION_TRIM_FRACTION = 0.20
 
+# 本段选择 analyze.py 如何把一长串数据切成“静止-运动-静止”的实验片段。
+# 输入：EVENT 时间戳、ROBOT 速度记录、VISION 位移曲线；输出：motion_001、static_001、steady_motion_001 等窗口。
+# 实验作用：auto 会优先使用机器人真实速度分段，适合反复启停和多段轨迹；没有机器人速度时再退回事件或视觉位移变化。
+ANALYSIS_SEGMENTATION_SOURCE = "auto"
+VALID_ANALYSIS_SEGMENTATION_SOURCES: Final[set[str]] = {
+    "auto",
+    "robot_speed",
+    "events",
+    "vision_velocity",
+}
+
+# 本段定义“机器人到底算不算正在运动”的速度迟滞阈值，单位 m/s。
+# 输入：ROBOT 记录中的 actual_tcp_speed；输出：运动段起止时间。
+# 实验作用：开阈值高、关阈值低，可以避免速度在零附近轻微抖动时把一段静止误切成很多小段。
+ROBOT_MOTION_ON_SPEED_M_S = 0.002
+ROBOT_MOTION_OFF_SPEED_M_S = 0.001
+
+# 本段定义“运动段里面哪一小段更像匀速段”。
+# 输入：TCP 速度和由速度变化估算的加速度；输出：steady_motion_* 窗口。
+# 实验作用：速度基本稳定、加速度接近零时才作为匀速段；如果判断失败，仍会用 STEADY_MOTION_TRIM_FRACTION 兜底裁剪。
+ROBOT_STEADY_ACCELERATION_M_S2 = 0.02
+ROBOT_STEADY_SPEED_RELATIVE_TOLERANCE = 0.08
+
+# 本段清理过短的自动分段。
+# 输入：自动识别出的候选静止段/运动段；输出：去掉明显过短、缺乏分析意义的小片段。
+# 实验作用：避免一次采样毛刺或极短停顿被当成一个完整工况写进摘要。
+SEGMENT_MIN_MOTION_SECONDS = 0.20
+SEGMENT_MIN_STATIC_SECONDS = 0.20
+SEGMENT_MERGE_GAP_SECONDS = 0.10
+
+# 本段只在没有机器人速度且要求视觉兜底分段时使用。
+# 输入：视觉位移的一阶变化速度；输出：粗略运动/静止判断。
+# 实验作用：视觉兜底只能辅助离线复查，正式分段仍建议依赖机器人速度或明确事件。
+VISION_MOTION_VELOCITY_FACTOR = 6.0
+
 # 本段选择如何从位移曲线中去掉慢变化趋势。
 # 输入：原始位移序列；输出：更接近“振动分量”的去趋势序列。
 # 实验作用：linear 适合直线匀速段，savgol 适合缓慢弯曲趋势，highpass 适合明确只关心某频率以上振动。
@@ -684,6 +719,34 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if not 0 <= STEADY_MOTION_TRIM_FRACTION < 0.5:
         raise ValueError("STEADY_MOTION_TRIM_FRACTION 必须在 [0, 0.5) 范围内。")
+
+    if ANALYSIS_SEGMENTATION_SOURCE not in VALID_ANALYSIS_SEGMENTATION_SOURCES:
+        raise ValueError(
+            "ANALYSIS_SEGMENTATION_SOURCE 可选值为 "
+            f"{sorted(VALID_ANALYSIS_SEGMENTATION_SOURCES)}。"
+        )
+
+    if ROBOT_MOTION_ON_SPEED_M_S <= 0 or ROBOT_MOTION_OFF_SPEED_M_S < 0:
+        raise ValueError("机器人运动速度阈值必须为正数或非负数。")
+
+    if ROBOT_MOTION_OFF_SPEED_M_S >= ROBOT_MOTION_ON_SPEED_M_S:
+        raise ValueError("ROBOT_MOTION_OFF_SPEED_M_S 必须小于 ROBOT_MOTION_ON_SPEED_M_S。")
+
+    if ROBOT_STEADY_ACCELERATION_M_S2 <= 0:
+        raise ValueError("ROBOT_STEADY_ACCELERATION_M_S2 必须为正数。")
+
+    if ROBOT_STEADY_SPEED_RELATIVE_TOLERANCE < 0:
+        raise ValueError("ROBOT_STEADY_SPEED_RELATIVE_TOLERANCE 不能为负数。")
+
+    if (
+        SEGMENT_MIN_MOTION_SECONDS < 0
+        or SEGMENT_MIN_STATIC_SECONDS < 0
+        or SEGMENT_MERGE_GAP_SECONDS < 0
+    ):
+        raise ValueError("分段最小时长和合并间隔不能为负数。")
+
+    if VISION_MOTION_VELOCITY_FACTOR <= 0:
+        raise ValueError("VISION_MOTION_VELOCITY_FACTOR 必须为正数。")
 
     if ANALYSIS_PRIMARY_WINDOW not in VALID_ANALYSIS_PRIMARY_WINDOWS:
         raise ValueError(
