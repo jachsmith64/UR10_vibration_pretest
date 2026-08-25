@@ -45,6 +45,56 @@ from calibration import image_points_to_spatial
 
 
 _FONT_CACHE: dict[int, Any] = {}
+VISION_TIMING_FIELDS: tuple[str, ...] = (
+    "camera_wait_ms",
+    "frame_convert_ms",
+    "camera_source_total_ms",
+    "gray_prepare_ms",
+    "gaussian_blur_ms",
+    "image_metrics_ms",
+    "preprocess_total_ms",
+    "checker_sb_ms",
+    "checker_legacy_ms",
+    "checker_subpix_ms",
+    "checker_motion_fit_ms",
+    "checker_total_ms",
+    "point_output_ms",
+    "debug_draw_ms",
+    "process_frame_total_ms",
+    "json_serialize_ms",
+    "txt_write_ms",
+    "debug_image_save_ms",
+    "preview_resize_ms",
+    "preview_display_ms",
+    "full_loop_total_ms",
+)
+
+
+def _elapsed_ms(start_ns: int, end_ns: int | None = None) -> float:
+    """把 perf_counter_ns() 的差值转换成毫秒。"""
+
+    if end_ns is None:
+        end_ns = time.perf_counter_ns()
+    return (end_ns - start_ns) / 1_000_000.0
+
+
+def _empty_timing() -> dict[str, float | None]:
+    """生成包含所有计时字段、默认值为 None 的字典。"""
+
+    return {field: None for field in VISION_TIMING_FIELDS}
+
+
+def _merge_timing(
+    target: dict[str, float | None],
+    source: dict[str, float | None] | None,
+) -> None:
+    """把 source 中已有的计时字段合并进 target。"""
+
+    if not source:
+        return
+    for key, value in source.items():
+        if key in target:
+            target[key] = value
 
 
 # =============================================================================
@@ -64,6 +114,7 @@ class FramePacket:
     - host_ns：电脑本地高精度时间戳，单位纳秒。
     - camera_timestamp_raw：图片/视频的相对时间，或真实相机的原始时间戳。
     - source_name：这一帧来自哪里，例如 image_folder:xxx.png 或 video:test.mp4。
+    - source_timing_ms：图像来源阶段的可选耗时，实时相机用于记录取流和原始帧转换耗时。
 
     为什么要把这些信息放在一起：
     后面的视觉算法不仅需要图像本身，还需要知道这帧对应哪个时间点，
@@ -75,6 +126,7 @@ class FramePacket:
     host_ns: int
     camera_timestamp_raw: float | int | None
     source_name: str
+    source_timing_ms: dict[str, float | None] | None = None
 
 
 def _natural_sort_key(path: Path) -> list[int | str]:
@@ -710,13 +762,16 @@ class HikCameraSource:
         from ctypes import byref, memset, sizeof
 
         while True:
+            source_start_ns = time.perf_counter_ns()
             memset(byref(self.frame_info), 0, sizeof(self.frame_info))
+            wait_start_ns = time.perf_counter_ns()
             ret = self.camera.MV_CC_GetOneFrameTimeout(
                 self.data_buffer,
                 self.payload_size,
                 self.frame_info,
                 int(config.HIK_FRAME_TIMEOUT_MS),
             )
+            wait_end_ns = time.perf_counter_ns()
             host_ns = time.perf_counter_ns()
 
             if int(ret) != 0:
@@ -727,11 +782,22 @@ class HikCameraSource:
 
             # 本段把相机帧变成后续视觉算法可消费的记录。
             # host_ns 用于和 UR/事件日志对时；timestamp_raw 保留相机原始硬件时间供以后扩展。
+            convert_start_ns = time.perf_counter_ns()
             frame = self._convert_raw_frame(self.frame_info)
+            convert_end_ns = time.perf_counter_ns()
             timestamp_raw = (
                 (int(self.frame_info.nDevTimeStampHigh) << 32)
                 | int(self.frame_info.nDevTimeStampLow)
             )
+            source_end_ns = time.perf_counter_ns()
+
+            source_timing: dict[str, float | None] | None = None
+            if config.ENABLE_VISION_TIMING:
+                source_timing = {
+                    "camera_wait_ms": _elapsed_ms(wait_start_ns, wait_end_ns),
+                    "frame_convert_ms": _elapsed_ms(convert_start_ns, convert_end_ns),
+                    "camera_source_total_ms": _elapsed_ms(source_start_ns, source_end_ns),
+                }
 
             yield FramePacket(
                 frame=frame,
@@ -739,6 +805,7 @@ class HikCameraSource:
                 host_ns=host_ns,
                 camera_timestamp_raw=timestamp_raw,
                 source_name="hik_camera",
+                source_timing_ms=source_timing,
             )
 
     def close(self) -> None:
@@ -797,7 +864,9 @@ def open_image_source() -> ImageFolderSource | VideoSource | HikCameraSource:
 # 2. 图像预处理与通用运动拟合
 # =============================================================================
 
-def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], tuple[int, int]]:
+def preprocess_frame(
+    frame: np.ndarray,
+) -> tuple[np.ndarray, dict[str, float], tuple[int, int], dict[str, float | None]]:
     """
     把原始图像转换成视觉识别输入。
 
@@ -827,6 +896,10 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
     这里不计算位移，只做“让图像适合识别”和“记录图像质量”。
     如果某帧识别失败，metrics 能帮助判断是算法问题，还是曝光/模糊/ROI 设置问题。
     """
+
+    timing_enabled = bool(config.ENABLE_VISION_TIMING)
+    total_start_ns = time.perf_counter_ns()
+    gray_start_ns = total_start_ns
 
     if frame is None or frame.size == 0:
         raise ValueError("收到空图像，无法预处理。")
@@ -862,6 +935,7 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
         gray = working.copy()
     else:
         gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+    gray_end_ns = time.perf_counter_ns()
 
     # 本段保留一份“未做高斯模糊”的灰度图，专门用于计算清晰度。
     # 如果在已经模糊后的 gray 上计算 Laplacian 方差，清晰度数值会被人为压低，
@@ -872,21 +946,36 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
     # 输入是灰度图；输出是噪声略低的灰度图。
     # 这有助于阈值分割稳定，但核太大会吃掉边缘，所以由 config.py 控制。
     if config.GAUSSIAN_BLUR_KERNEL > 1:
+        blur_start_ns = time.perf_counter_ns()
         gray = cv2.GaussianBlur(
             gray,
             (config.GAUSSIAN_BLUR_KERNEL, config.GAUSSIAN_BLUR_KERNEL),
             0,
         )
+        gaussian_blur_ms: float | None = _elapsed_ms(blur_start_ns)
+    else:
+        gaussian_blur_ms = None
 
     # 本段生成图像质量指标。
     # 输出写入每帧 VISION 记录，以后如果某一帧识别失败，用于回头解释识别失败或位移异常。
+    metrics_start_ns = time.perf_counter_ns()
     metrics = {
         "mean_brightness": float(np.mean(gray)),#平均亮度
         "blur_variance": float(cv2.Laplacian(sharpness_gray, cv2.CV_64F).var()),#清晰度指标
         "dark_fraction": float(np.mean(gray <= config.DARK_PIXEL_THRESHOLD)),#过暗的像素的比例
         "bright_fraction": float(np.mean(gray >= config.BRIGHT_PIXEL_THRESHOLD)),#过亮的像素的比例
     }
-    return gray, metrics, roi_origin
+    metrics_end_ns = time.perf_counter_ns()
+
+    timing: dict[str, float | None] = {}
+    if timing_enabled:
+        timing = {
+            "gray_prepare_ms": _elapsed_ms(gray_start_ns, gray_end_ns),
+            "gaussian_blur_ms": gaussian_blur_ms,
+            "image_metrics_ms": _elapsed_ms(metrics_start_ns, metrics_end_ns),
+            "preprocess_total_ms": _elapsed_ms(total_start_ns, metrics_end_ns),
+        }
+    return gray, metrics, roi_origin, timing
 
 
 def _estimate_rigid_motion(
@@ -1029,7 +1118,10 @@ class CheckerboardTracker:
         self.reference_corners: np.ndarray | None = None
         self.mm_per_pixel: float | None = None
 
-    def _find_corners(self, gray: np.ndarray) -> np.ndarray | None:
+    def _find_corners(
+        self,
+        gray: np.ndarray,
+    ) -> tuple[np.ndarray | None, dict[str, float | None], str]:
         """
         在一帧灰度图中寻找棋盘格角点。
 
@@ -1037,6 +1129,13 @@ class CheckerboardTracker:
         输出：N×2 的角点像素坐标，找不到时返回 None。
         实验作用：这是棋盘格法的原始检测步骤，后面的位移计算完全依赖这些角点是否稳定。
         """
+
+        timing_enabled = bool(config.ENABLE_VISION_TIMING)
+        timing: dict[str, float | None] = {
+            "checker_sb_ms": None,
+            "checker_legacy_ms": None,
+            "checker_subpix_ms": None,
+        }
 
         # 本段准备棋盘格规格。
         # 输入是 config.py 里的内角点数量；输出是 OpenCV 需要的 pattern。
@@ -1046,24 +1145,36 @@ class CheckerboardTracker:
         # 输出是亚像素级角点坐标；如果当前 OpenCV 没有 SB 方法，后面会自动退回传统检测。
         if hasattr(cv2, "findChessboardCornersSB"):
             flags = cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE
+            sb_start_ns = time.perf_counter_ns()
             found, corners = cv2.findChessboardCornersSB(gray, pattern, flags=flags)
-            if found:
-                return corners.reshape(-1, 2).astype(np.float32)
+            sb_end_ns = time.perf_counter_ns()
+            if timing_enabled:
+                timing["checker_sb_ms"] = _elapsed_ms(sb_start_ns, sb_end_ns)
+            if found and corners is not None:
+                return corners.reshape(-1, 2).astype(np.float32), timing, "sb"
 
         # 本段是传统棋盘格检测兜底。
         # 输入仍是同一张灰度图；输出会再经过 cornerSubPix 细化，尽量减少角点量化误差。
         flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+        legacy_start_ns = time.perf_counter_ns()
         found, corners = cv2.findChessboardCorners(gray, pattern, flags=flags)
-        if not found:
-            return None
+        legacy_end_ns = time.perf_counter_ns()
+        if timing_enabled:
+            timing["checker_legacy_ms"] = _elapsed_ms(legacy_start_ns, legacy_end_ns)
+        if not found or corners is None:
+            return None, timing, "none"
 
         criteria = (
             cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
             int(config.CHECKER_SUBPIX_MAX_ITER),
             float(config.CHECKER_SUBPIX_EPS),
         )
+        subpix_start_ns = time.perf_counter_ns()
         refined = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
-        return refined.reshape(-1, 2).astype(np.float32)
+        subpix_end_ns = time.perf_counter_ns()
+        if timing_enabled:
+            timing["checker_subpix_ms"] = _elapsed_ms(subpix_start_ns, subpix_end_ns)
+        return refined.reshape(-1, 2).astype(np.float32), timing, "legacy"
 
     @staticmethod
     def _calculate_mm_per_pixel(corners: np.ndarray) -> float:
@@ -1091,7 +1202,10 @@ class CheckerboardTracker:
             raise ValueError("棋盘格角点间距为零，无法建立毫米比例。")
         return float(config.CHECKER_SQUARE_MM / spacing_px)
 
-    def process(self, gray: np.ndarray) -> tuple[dict[str, Any], np.ndarray | None]:
+    def process(
+        self,
+        gray: np.ndarray,
+    ) -> tuple[dict[str, Any], np.ndarray | None, dict[str, float | None]]:
         """
         完成一帧棋盘格法测量。
 
@@ -1104,10 +1218,17 @@ class CheckerboardTracker:
         这里把“当前帧棋盘格角点”转换成“相对第一帧的位移/转角/质量”。
         """
 
+        timing_enabled = bool(config.ENABLE_VISION_TIMING)
+        checker_start_ns = time.perf_counter_ns()
+
         # 本段先做原始角点检测。
         # 找不到角点时仍返回固定字段，保证逐帧 JSON 结构稳定，后续分析可以明确跳过无效帧。
-        corners = self._find_corners(gray)
+        corners, timing, found_by = self._find_corners(gray)
         if corners is None:
+            checker_end_ns = time.perf_counter_ns()
+            if timing_enabled:
+                timing["checker_motion_fit_ms"] = None
+                timing["checker_total_ms"] = _elapsed_ms(checker_start_ns, checker_end_ns)
             return {
                 "checker_is_valid": False,
                 "checker_dx_mm": math.nan,
@@ -1117,10 +1238,12 @@ class CheckerboardTracker:
                 "checker_residual_px": math.nan,
                 "checker_quality": 0.0,
                 "checker_corner_count": 0,
-            }, None
+                "checker_found_by": found_by,
+            }, None, timing
 
         # 本段建立棋盘格参考状态。
         # 第一次成功识别的角点就是位移零点；后续帧都和它比较。
+        motion_start_ns = time.perf_counter_ns()
         if self.reference_corners is None:
             self.reference_corners = corners.copy()
             self.mm_per_pixel = self._calculate_mm_per_pixel(corners)
@@ -1140,6 +1263,11 @@ class CheckerboardTracker:
             float(mm_per_pixel),
             config.CHECKER_RESIDUAL_WARNING_PX,
         )
+        motion_end_ns = time.perf_counter_ns()
+        checker_end_ns = motion_end_ns
+        if timing_enabled:
+            timing["checker_motion_fit_ms"] = _elapsed_ms(motion_start_ns, motion_end_ns)
+            timing["checker_total_ms"] = _elapsed_ms(checker_start_ns, checker_end_ns)
 
         # 本段整理当前帧棋盘格法日志。
         # 输出字段统一以 checker_ 开头，避免和圆点法结果混淆。
@@ -1153,8 +1281,9 @@ class CheckerboardTracker:
             "checker_quality": motion["quality"],
             "checker_corner_count": int(len(corners)),
             "checker_mm_per_pixel": float(mm_per_pixel),
+            "checker_found_by": found_by,
         }
-        return result, corners
+        return result, corners, timing
 
 
 # =============================================================================
@@ -1623,9 +1752,17 @@ class VisionProcessor:
         #↓
         #返回 result, debug
 
+        timing_enabled = bool(config.ENABLE_VISION_TIMING)
+        process_start_ns = time.perf_counter_ns()
+        timing = _empty_timing() if timing_enabled else {}
+        if timing_enabled:
+            _merge_timing(timing, packet.source_timing_ms)
+
         # 输入：FramePacket.frame，即 OpenCV 图像数组。
         # 输出：gray 进入圆点/棋盘格识别；image_metrics 写入日志，帮助判断某帧失败是否由曝光或模糊导致。
-        gray, image_metrics, roi_origin = preprocess_frame(packet.frame)
+        gray, image_metrics, roi_origin, preprocess_timing = preprocess_frame(packet.frame)
+        if timing_enabled:
+            _merge_timing(timing, preprocess_timing)
 
         # 本段建立当前帧的基础日志记录。
         # 输入：FramePacket 的帧号、时间戳、来源名称，以及上一步得到的图像质量指标。
@@ -1653,14 +1790,21 @@ class VisionProcessor:
         # 这些点既会进入日志成为排错证据，也会画到 debug 图上给人肉眼检查。
         checker_corners: np.ndarray | None = None
         circle_centers: np.ndarray | None = None
+        point_output_total_ms = 0.0
+        point_output_called = False
 
         # 本段运行棋盘格测量链路。
         # 输入：灰度图和第一帧参考角点状态。
         # 输出：checker_* 字段，包括角点像素坐标、相对参考帧位移、转角、比例尺和质量分。
         if config.VISION_METHOD in {"checkerboard", "compare"}:
-            checker_result, checker_corners = self.checker_tracker.process(gray)
+            checker_result, checker_corners, checker_timing = self.checker_tracker.process(gray)
             result.update(checker_result)
+            if timing_enabled:
+                _merge_timing(timing, checker_timing)
+            point_start_ns = time.perf_counter_ns()
             self._add_point_outputs(result, "checker", checker_corners, roi_origin)
+            point_output_total_ms += _elapsed_ms(point_start_ns)
+            point_output_called = True
 
         # 本段运行圆点测量链路。
         # 输入：灰度图、第一帧参考圆点、上一帧圆点身份状态。
@@ -1668,7 +1812,13 @@ class VisionProcessor:
         if config.VISION_METHOD in {"circles", "compare"}:
             circle_result, circle_centers = self.circle_tracker.process(gray)
             result.update(circle_result)
+            point_start_ns = time.perf_counter_ns()
             self._add_point_outputs(result, "circle", circle_centers, roi_origin)
+            point_output_total_ms += _elapsed_ms(point_start_ns)
+            point_output_called = True
+
+        if timing_enabled:
+            timing["point_output_ms"] = point_output_total_ms if point_output_called else None
 
         # 本段给整帧结果一个总有效性标记。只要棋盘格法或圆点法有一种有效，就认为这一帧总体有效。
         # 后续严肃分析仍会检查具体方法自己的有效性，而不是只依赖这个总标记。
@@ -1682,6 +1832,7 @@ class VisionProcessor:
         # 输入：原图、当前帧 result，以及两种算法识别到的点。
         # 输出：debug 图像，只用于人工质检，不作为后续计算输入。
         # 如果日志数值异常，先看这张图能快速判断是识别点错了、编号串了，还是图像质量本身有问题。
+        debug_start_ns = time.perf_counter_ns()
         debug = self._draw_debug(
             packet.frame,
             result,
@@ -1689,6 +1840,11 @@ class VisionProcessor:
             circle_centers,
             roi_origin,
         )
+        debug_end_ns = time.perf_counter_ns()
+        if timing_enabled:
+            timing["debug_draw_ms"] = _elapsed_ms(debug_start_ns, debug_end_ns)
+            timing["process_frame_total_ms"] = _elapsed_ms(process_start_ns, debug_end_ns)
+            result["timing_ms"] = timing
         return result, debug
 
     @staticmethod
@@ -2054,6 +2210,245 @@ def _json_line(record: dict[str, Any]) -> str:
     return json.dumps(record, ensure_ascii=False, allow_nan=True)
 
 
+def _finite_timing_values(
+    records: list[dict[str, Any]],
+    field: str,
+) -> list[float]:
+    """从记录中提取某个计时字段的有效数值，跳过 None/NaN/inf。"""
+
+    values: list[float] = []
+    for record in records:
+        timing = record.get("timing_ms")
+        if not isinstance(timing, dict):
+            continue
+        value = timing.get(field)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            values.append(float(value))
+    return values
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    """计算百分位数；没有有效样本时返回 None。"""
+
+    if not values:
+        return None
+    return float(np.percentile(np.asarray(values, dtype=float), percentile))
+
+
+def _format_ms(value: float | None) -> str:
+    """把毫秒数格式化为摘要中的字符串。"""
+
+    if value is None or not math.isfinite(value):
+        return "N/A"
+    return f"{value:.3f}"
+
+
+def _run_basic_timing_stats(
+    records: list[dict[str, Any]],
+    run_elapsed_s: float,
+) -> dict[str, float | int | None]:
+    """计算帧号、帧率、跳帧和棋盘格成功率等运行级统计。"""
+
+    if not records:
+        return {
+            "processed_count": 0,
+            "first_frame_id": None,
+            "last_frame_id": None,
+            "camera_fps_by_frame_id_host": None,
+            "processing_fps": None,
+            "skipped_frames": None,
+            "skip_rate": None,
+            "gap_one_ratio": None,
+            "checker_success_rate": None,
+            "sb_success_count": 0,
+            "legacy_call_count": 0,
+            "legacy_success_count": 0,
+        }
+
+    processed_count = len(records)
+    first_frame = int(records[0]["frame_id"])
+    last_frame = int(records[-1]["frame_id"])
+    first_host = int(records[0]["host_ns"])
+    last_host = int(records[-1]["host_ns"])
+    host_span_s = (last_host - first_host) / 1_000_000_000.0
+
+    camera_fps = None
+    if host_span_s > 0 and last_frame > first_frame:
+        camera_fps = (last_frame - first_frame) / host_span_s
+
+    processing_fps = None
+    if host_span_s > 0 and processed_count > 1:
+        processing_fps = (processed_count - 1) / host_span_s
+    elif run_elapsed_s > 0:
+        processing_fps = processed_count / run_elapsed_s
+    frame_span_count = max(0, last_frame - first_frame + 1)
+    skipped_frames = max(0, frame_span_count - processed_count)
+    skip_rate = skipped_frames / frame_span_count if frame_span_count > 0 else None
+
+    gaps = [
+        int(records[index]["frame_id"]) - int(records[index - 1]["frame_id"])
+        for index in range(1, len(records))
+    ]
+    gap_one_ratio = (
+        sum(1 for gap in gaps if gap == 1) / len(gaps)
+        if gaps
+        else None
+    )
+
+    checker_success_count = sum(bool(record.get("checker_is_valid")) for record in records)
+    checker_success_rate = checker_success_count / processed_count if processed_count else None
+    sb_success_count = sum(record.get("checker_found_by") == "sb" for record in records)
+    legacy_success_count = sum(record.get("checker_found_by") == "legacy" for record in records)
+    legacy_call_count = len(_finite_timing_values(records, "checker_legacy_ms"))
+
+    return {
+        "processed_count": processed_count,
+        "first_frame_id": first_frame,
+        "last_frame_id": last_frame,
+        "camera_fps_by_frame_id_host": camera_fps,
+        "processing_fps": processing_fps,
+        "skipped_frames": skipped_frames,
+        "skip_rate": skip_rate,
+        "gap_one_ratio": gap_one_ratio,
+        "checker_success_rate": checker_success_rate,
+        "sb_success_count": sb_success_count,
+        "legacy_call_count": legacy_call_count,
+        "legacy_success_count": legacy_success_count,
+    }
+
+
+def _timing_table_lines(records: list[dict[str, Any]], title: str) -> list[str]:
+    """生成某一组记录的计时分布表。"""
+
+    lines = [
+        "",
+        title,
+        "-" * 120,
+        (
+            "字段 | 有效样本 | 调用率 | 总耗时ms | 平均ms | P50 | P90 | P95 | P99 | "
+            "最大ms | 占full_loop均值"
+        ),
+        "-" * 120,
+    ]
+    total_count = len(records)
+    full_values = _finite_timing_values(records, "full_loop_total_ms")
+    full_average = float(np.mean(full_values)) if full_values else None
+
+    for field in VISION_TIMING_FIELDS:
+        values = _finite_timing_values(records, field)
+        valid_count = len(values)
+        call_rate = valid_count / total_count if total_count else 0.0
+        total_ms = float(np.sum(values)) if values else None
+        average = float(np.mean(values)) if values else None
+        ratio = (
+            average / full_average
+            if average is not None and full_average not in (None, 0.0)
+            else None
+        )
+        lines.append(
+            " | ".join(
+                [
+                    field,
+                    str(valid_count),
+                    f"{call_rate:.1%}",
+                    _format_ms(total_ms),
+                    _format_ms(average),
+                    _format_ms(_percentile(values, 50)),
+                    _format_ms(_percentile(values, 90)),
+                    _format_ms(_percentile(values, 95)),
+                    _format_ms(_percentile(values, 99)),
+                    _format_ms(max(values) if values else None),
+                    "N/A" if ratio is None else f"{ratio:.1%}",
+                ]
+            )
+        )
+    return lines
+
+
+def _write_vision_timing_summary(
+    output_path: Path,
+    records: list[dict[str, Any]],
+    run_elapsed_s: float,
+) -> None:
+    """写出 vision_test 的性能计时汇总文件。"""
+
+    warmup = int(config.VISION_TIMING_WARMUP_FRAMES)
+    stable_records = records[warmup:] if warmup > 0 else list(records)
+    all_stats = _run_basic_timing_stats(records, run_elapsed_s)
+    stable_stats = _run_basic_timing_stats(stable_records, run_elapsed_s)
+
+    def pct(value: float | int | None) -> str:
+        if value is None or not math.isfinite(float(value)):
+            return "N/A"
+        return f"{float(value):.2%}"
+
+    def num(value: float | int | None, digits: int = 3) -> str:
+        if value is None or not math.isfinite(float(value)):
+            return "N/A"
+        if isinstance(value, int):
+            return str(value)
+        return f"{float(value):.{digits}f}"
+
+    lines = [
+        "UR10 视觉链路性能计时汇总",
+        "=" * 80,
+        f"生成时间：{datetime.now().isoformat(timespec='seconds')}",
+        f"计时开关：{config.ENABLE_VISION_TIMING}",
+        f"逐帧保存计时：{config.SAVE_PER_FRAME_TIMING}",
+        f"warmup 帧数：{warmup}",
+        f"本次运行总时间：{run_elapsed_s:.3f} s",
+        "",
+        "一、全部帧运行概况",
+        f"处理帧数：{all_stats['processed_count']}",
+        f"相机帧号首值：{all_stats['first_frame_id']}",
+        f"相机帧号末值：{all_stats['last_frame_id']}",
+        f"相机推算帧率：{num(all_stats['camera_fps_by_frame_id_host'])} fps",
+        f"程序实际处理帧率：{num(all_stats['processing_fps'])} fps",
+        f"跳过帧数：{all_stats['skipped_frames']}",
+        f"跳帧率：{pct(all_stats['skip_rate'])}",
+        f"frame_id_gap 等于 1 的比例：{pct(all_stats['gap_one_ratio'])}",
+        f"棋盘格识别成功率：{pct(all_stats['checker_success_rate'])}",
+        f"SB 成功次数：{all_stats['sb_success_count']}",
+        f"传统方法调用次数：{all_stats['legacy_call_count']}",
+        f"传统方法成功次数：{all_stats['legacy_success_count']}",
+        "",
+        "二、排除 warmup 后运行概况",
+        f"处理帧数：{stable_stats['processed_count']}",
+        f"相机帧号首值：{stable_stats['first_frame_id']}",
+        f"相机帧号末值：{stable_stats['last_frame_id']}",
+        f"相机推算帧率：{num(stable_stats['camera_fps_by_frame_id_host'])} fps",
+        f"程序实际处理帧率：{num(stable_stats['processing_fps'])} fps",
+        f"跳过帧数：{stable_stats['skipped_frames']}",
+        f"跳帧率：{pct(stable_stats['skip_rate'])}",
+        f"frame_id_gap 等于 1 的比例：{pct(stable_stats['gap_one_ratio'])}",
+        f"棋盘格识别成功率：{pct(stable_stats['checker_success_rate'])}",
+        f"SB 成功次数：{stable_stats['sb_success_count']}",
+        f"传统方法调用次数：{stable_stats['legacy_call_count']}",
+        f"传统方法成功次数：{stable_stats['legacy_success_count']}",
+    ]
+    lines.extend(_timing_table_lines(records, "三、全部帧计时分布"))
+    lines.extend(_timing_table_lines(stable_records, "四、排除 warmup 后计时分布"))
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _top_average_timing_fields(
+    records: list[dict[str, Any]],
+    limit: int = 5,
+) -> list[tuple[str, float]]:
+    """按平均耗时找出最慢的若干计时字段。"""
+
+    excluded = {"full_loop_total_ms"}
+    averages: list[tuple[str, float]] = []
+    for field in VISION_TIMING_FIELDS:
+        if field in excluded:
+            continue
+        values = _finite_timing_values(records, field)
+        if values:
+            averages.append((field, float(np.mean(values))))
+    averages.sort(key=lambda item: item[1], reverse=True)
+    return averages[:limit]
+
+
 def run_vision_test() -> Path:
     """
     离线单进程运行视觉模块，保存逐帧结果和可选调试图。
@@ -2093,11 +2488,16 @@ def run_vision_test() -> Path:
     # vision_results.txt 是离线分析的主要输入。
     # 第一行写本次测试说明，后续每行写一帧测量结果，供 analyze.py 继续做振动分析。
     result_path = run_dir / "vision_results.txt"
+    timing_summary_path = run_dir / "vision_timing_summary.txt"
 
     # 这些计数器用于结束时给出本组数据的可用性摘要，不参与视觉计算。
     processed_count = 0
     valid_count = 0
     saved_debug_count = 0
+    timing_records: list[dict[str, Any]] = []
+    previous_frame_id: int | None = None
+    previous_host_ns: int | None = None
+    run_start_ns = time.perf_counter_ns()
 
     try:
         # 本段同时打开“图像来源”和“结果文件”。
@@ -2113,6 +2513,9 @@ def run_vision_test() -> Path:
                 "vision_method": config.VISION_METHOD,
                 "image_folder_fps": config.IMAGE_FOLDER_FPS,
                 "expected_vision_fps": config.EXPECTED_VISION_FPS,
+                "enable_vision_timing": config.ENABLE_VISION_TIMING,
+                "vision_timing_warmup_frames": config.VISION_TIMING_WARMUP_FRAMES,
+                "save_per_frame_timing": config.SAVE_PER_FRAME_TIMING,
                 "save_point_coordinates": config.SAVE_POINT_COORDINATES,
                 "spatial_coordinates_enabled": config.SPATIAL_COORDINATES_ENABLED,
                 "spatial_coordinate_mode": config.SPATIAL_COORDINATE_MODE,
@@ -2126,41 +2529,108 @@ def run_vision_test() -> Path:
             # 一个是机器可读的测量结果 result，一个是给人看的标注图 debug。然后把 result 写成一行 JSON。
             # 本函数只把原始图像序列转换成逐帧视觉测量结果，不做频谱和恢复时间分析。
             for packet in source:
+                loop_start_ns = time.perf_counter_ns()
                 result, debug = processor.process_frame(packet)
 
-                # 当前帧 result 写入一行 JSON。
-                # 后续 analyze.py 会读取这些行，继续完成去趋势、频谱和指标计算。
-                file.write(_json_line(result) + "\n")
                 processed_count += 1
                 valid_count += int(bool(result["is_valid"]))
+
+                if config.ENABLE_VISION_TIMING:
+                    frame_id_gap = (
+                        None
+                        if previous_frame_id is None
+                        else int(packet.frame_id) - previous_frame_id
+                    )
+                    host_interval_ms = (
+                        None
+                        if previous_host_ns is None
+                        else (int(packet.host_ns) - previous_host_ns) / 1_000_000.0
+                    )
+                    result["frame_id_gap"] = frame_id_gap
+                    result["host_interval_ms"] = host_interval_ms
+
+                previous_frame_id = int(packet.frame_id)
+                previous_host_ns = int(packet.host_ns)
 
                 # 本段控制调试图保存量。
                 # 调试图用于人工检查识别点、编号和图像质量；它不是后续算法输入。
                 # 为避免批量离线数据产生过多图片，只按相机原始帧号间隔和最大张数保存。
                 # 对在线相机来说，若 frame_id 大幅跳跃，说明当前程序处理链路没有跟上相机实际帧率。
+                debug_image_save_ms: float | None = None
                 should_save = (
                     config.SAVE_DEBUG_IMAGE
                     and packet.frame_id % config.DEBUG_IMAGE_EVERY_N_FRAMES == 0
                     and saved_debug_count < config.MAX_DEBUG_IMAGES
                 )
                 if should_save:
+                    save_start_ns = time.perf_counter_ns()
                     cv2.imwrite(
                         str(debug_dir / f"frame_{packet.frame_id:08d}.jpg"),
                         debug,
                     )
+                    debug_image_save_ms = _elapsed_ms(save_start_ns)
                     saved_debug_count += 1
 
                 # 本段只负责人眼预览。
                 # 预览窗口不改变已经写入的测量结果；按 Esc 或 q 只是提前结束本次离线测试。
+                preview_resize_ms: float | None = None
+                preview_display_ms: float | None = None
+                stop_requested = False
                 if config.SHOW_PREVIEW:
-                    cv2.imshow("UR10 vibration vision test", _resize_for_preview(debug))
+                    resize_start_ns = time.perf_counter_ns()
+                    preview = _resize_for_preview(debug)
+                    preview_resize_ms = _elapsed_ms(resize_start_ns)
+
+                    display_start_ns = time.perf_counter_ns()
+                    cv2.imshow("UR10 vibration vision test", preview)
                     key = cv2.waitKey(1) & 0xFF
+                    preview_display_ms = _elapsed_ms(display_start_ns)
                     if key in (27, ord("q")):
                         print("[视觉] 操作者按键结束预览。")
-                        break
+                        stop_requested = True
+
+                if config.ENABLE_VISION_TIMING:
+                    timing = result.setdefault("timing_ms", _empty_timing())
+                    if isinstance(timing, dict):
+                        timing["debug_image_save_ms"] = debug_image_save_ms
+                        timing["preview_resize_ms"] = preview_resize_ms
+                        timing["preview_display_ms"] = preview_display_ms
+
+                    record_for_json = result
+                    if not config.SAVE_PER_FRAME_TIMING:
+                        record_for_json = dict(result)
+                        record_for_json.pop("timing_ms", None)
+
+                    serialize_start_ns = time.perf_counter_ns()
+                    json_text = _json_line(record_for_json)
+                    json_serialize_ms = _elapsed_ms(serialize_start_ns)
+                    if isinstance(timing, dict):
+                        timing["json_serialize_ms"] = json_serialize_ms
+                        if config.SAVE_PER_FRAME_TIMING:
+                            json_text = _json_line(result)
+
+                    write_start_ns = time.perf_counter_ns()
+                    file.write(json_text + "\n")
+                    txt_write_ms = _elapsed_ms(write_start_ns)
+                    full_loop_total_ms = _elapsed_ms(loop_start_ns)
+                    if isinstance(timing, dict):
+                        timing["txt_write_ms"] = txt_write_ms
+                        timing["full_loop_total_ms"] = full_loop_total_ms
+                    timing_records.append(dict(result))
+                else:
+                    # 当前帧 result 写入一行 JSON。
+                    # 后续 analyze.py 会读取这些行，继续完成去趋势、频谱和指标计算。
+                    file.write(_json_line(result) + "\n")
+
+                if stop_requested:
+                    break
     finally:
         if config.SHOW_PREVIEW:
             cv2.destroyAllWindows()
+
+    run_elapsed_s = _elapsed_ms(run_start_ns) / 1000.0
+    if config.ENABLE_VISION_TIMING and timing_records:
+        _write_vision_timing_summary(timing_summary_path, timing_records, run_elapsed_s)
 
     if processed_count == 0:
         raise RuntimeError("视觉测试没有成功读取任何一帧。")
@@ -2169,6 +2639,49 @@ def run_vision_test() -> Path:
         f"[视觉] 完成 {processed_count} 帧，其中至少一种方法有效 {valid_count} 帧；"
         f"结果：{result_path}"
     )
+    if config.ENABLE_VISION_TIMING and timing_records:
+        stats = _run_basic_timing_stats(timing_records, run_elapsed_s)
+        stable_records = timing_records[int(config.VISION_TIMING_WARMUP_FRAMES) :]
+        report_records = stable_records or timing_records
+        full_values = _finite_timing_values(report_records, "full_loop_total_ms")
+        full_average = float(np.mean(full_values)) if full_values else math.nan
+        full_p95 = _percentile(full_values, 95)
+        top_fields = _top_average_timing_fields(report_records)
+        top_text = ", ".join(f"{name}={value:.3f}ms" for name, value in top_fields)
+        camera_fps_text = (
+            "N/A"
+            if stats["camera_fps_by_frame_id_host"] is None
+            else f"{float(stats['camera_fps_by_frame_id_host']):.3f}"
+        )
+        processing_fps_text = (
+            "N/A"
+            if stats["processing_fps"] is None
+            else f"{float(stats['processing_fps']):.3f}"
+        )
+        skip_rate_text = (
+            "N/A"
+            if stats["skip_rate"] is None
+            else f"{float(stats['skip_rate']):.2%}"
+        )
+        checker_rate_text = (
+            "N/A"
+            if stats["checker_success_rate"] is None
+            else f"{float(stats['checker_success_rate']):.2%}"
+        )
+        print(
+            "[视觉计时] "
+            f"相机推算帧率 {camera_fps_text} fps；"
+            f"实际处理帧率 {processing_fps_text} fps；"
+            f"跳帧率 {skip_rate_text}；"
+            f"棋盘格成功率 {checker_rate_text}。"
+        )
+        print(
+            "[视觉计时] "
+            f"full_loop 平均 {full_average:.3f} ms，"
+            f"P95 {_format_ms(full_p95)} ms；"
+            f"平均耗时前5：{top_text or 'N/A'}。"
+        )
+        print(f"[视觉计时] 汇总：{timing_summary_path}")
     return run_dir
 
 

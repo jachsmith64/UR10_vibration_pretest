@@ -119,6 +119,14 @@ SAVE_DEBUG_IMAGE = True
 DEBUG_IMAGE_EVERY_N_FRAMES = 66
 MAX_DEBUG_IMAGES = 300
 
+# 本段控制视觉链路性能计时。
+# 输入：每帧相机取流、预处理、棋盘格识别、绘图、写文件等阶段。
+# 输出：vision_results.txt 中的 timing_ms 字段，以及 vision_timing_summary.txt 汇总报告。
+# 实验作用：只观察耗时瓶颈，不改变识别算法、不改变 ROI、不优化处理流程。
+ENABLE_VISION_TIMING = True
+VISION_TIMING_WARMUP_FRAMES = 3
+SAVE_PER_FRAME_TIMING = True
+
 # 本段是正式实验专用的额外保护。
 # 输入：完整实验中的实时 debug 图；输出：是否允许边实验边落盘保存质检图。
 # 实验作用：默认关闭，避免磁盘写入拖慢在线取图；需要现场验证电脑性能后再打开。
@@ -302,7 +310,8 @@ HIK_MVS_IMPORT_PATH: str | None = (
 # 输入：曝光时间和增益；输出：相机节点参数或保留相机当前设置。
 # 实验作用：稳定曝光能减少识别点明暗波动；首次连接应先在 MVS 客户端确认可用范围。
 # None 表示程序不主动修改相机当前配置。
-HIK_EXPOSURE_US: float | None = None
+# 当前 132 fps 单帧周期约为 7576 us，曝光应低于这个值以免压低帧率。
+HIK_EXPOSURE_US: float | None = 6500.0
 HIK_GAIN: float | None = None
 
 # 本段控制在线取帧时“等一帧最多等多久”。
@@ -720,6 +729,9 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if FPS_WARNING_RELATIVE_TOLERANCE < 0 or FPS_WARNING_ABSOLUTE_TOLERANCE_HZ < 0:
         raise ValueError("FPS 警告容差不能为负数。")
+
+    if VISION_TIMING_WARMUP_FRAMES < 0:
+        raise ValueError("VISION_TIMING_WARMUP_FRAMES 不能为负数。")
 
     if not 0 <= STEADY_MOTION_TRIM_FRACTION < 0.5:
         raise ValueError("STEADY_MOTION_TRIM_FRACTION 必须在 [0, 0.5) 范围内。")
