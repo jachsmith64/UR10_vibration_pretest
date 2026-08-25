@@ -30,9 +30,9 @@ _write_outputs()
 推荐操作流程：
 1. 打印棋盘格标定板。
    - 使用普通平整纸张或更硬的板材固定，标定板必须尽量平整。
-   - config.py 当前默认 CHECKERBOARD_INNER_CORNERS = (7, 5)，表示内角点是 7 列、5 行。
-   - 注意这是“内角点数量”，不是黑白方格数量；7×5 内角点对应 8×6 个黑白方格。
-   - CHECKER_SQUARE_MM = 4.0 表示每个黑白方格边长 4 mm；如果你的标定板不是 4 mm，运行时必须改参数。
+   - config.py 当前默认 CHECKERBOARD_INNER_CORNERS = (11, 8)，表示内角点是 11 列、8 行。
+   - 注意这是“内角点数量”，不是黑白方格数量；11×8 内角点对应 12×9 个黑白方格。
+   - CHECKER_SQUARE_MM = 3.0 表示每个黑白方格边长 3 mm；如果你的标定板不是 3 mm，运行时必须改参数。
 
 2. 拍摄标定照片。
    - 使用正式实验同一台相机、同一分辨率、同一镜头焦距、同一对焦状态。
@@ -182,7 +182,7 @@ def _find_corners(
             | cv2.CALIB_CB_NORMALIZE_IMAGE
         )
         found, corners = cv2.findChessboardCornersSB(gray, board_size, flags=flags_sb)
-        if found:
+        if found and corners is not None:
             return True, corners.astype(np.float32)
 
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
@@ -213,7 +213,8 @@ def _draw_detection_debug(
     """
 
     canvas = image.copy()
-    cv2.drawChessboardCorners(canvas, board_size, corners, found)
+    if corners is not None:
+        cv2.drawChessboardCorners(canvas, board_size, corners, found)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(output_path), canvas)
 
@@ -310,24 +311,28 @@ def _calibrate(
         None,
         None,
     )
+    camera_matrix_array = np.asarray(camera_matrix, dtype=np.float64)
+    distortion_array = np.asarray(distortion, dtype=np.float64)
+    rvec_list = [np.asarray(rvec, dtype=np.float64) for rvec in rvecs]
+    tvec_list = [np.asarray(tvec, dtype=np.float64) for tvec in tvecs]
 
     for index, detection in enumerate([item for item in detections if item.found]):
         projected, _ = cv2.projectPoints(
             object_points[index],
-            rvecs[index],
-            tvecs[index],
-            camera_matrix,
-            distortion,
+            rvec_list[index],
+            tvec_list[index],
+            camera_matrix_array,
+            distortion_array,
         )
         error = cv2.norm(image_points[index], projected, cv2.NORM_L2) / len(projected)
         detection.reprojection_error_px = float(error)
 
     return (
         float(rms),
-        camera_matrix,
-        distortion.reshape(-1),
-        rvecs,
-        tvecs,
+        camera_matrix_array,
+        distortion_array.reshape(-1),
+        rvec_list,
+        tvec_list,
         image_size,
         detections,
     )

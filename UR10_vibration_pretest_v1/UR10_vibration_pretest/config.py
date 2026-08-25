@@ -67,13 +67,13 @@ VALID_RUN_MODES: Final[set[str]] = {
 # 本段选择图像从哪里来。
 # 输入：图片文件夹、视频文件或海康相机；输出：camera.py 会把不同来源统一包装成 FramePacket。
 # 实验作用：离线预实验通常用 image_folder/video；正式在线实验才会使用 hik_camera。
-VISION_SOURCE = "image_folder"
+VISION_SOURCE = "hik_camera"
 VALID_VISION_SOURCES: Final[set[str]] = {"image_folder", "video", "hik_camera"}
 
 # 本段选择每帧图像用哪套识别方法。
 # 输入：同一张 FramePacket；输出：圆点法、棋盘格法或两者并行的位移/坐标结果。
 # 实验作用：compare 适合前期判断哪种标志更稳定；正式实验可固定为更可靠的一种，减少计算负担。
-VISION_METHOD = "compare"
+VISION_METHOD = "checkerboard"
 VALID_VISION_METHODS: Final[set[str]] = {"circles", "checkerboard", "compare"}
 
 # 本段限定离线图片序列的文件类型和读取顺序。
@@ -189,13 +189,15 @@ BRIGHT_PIXEL_THRESHOLD = 245
 # 本段定义棋盘格法要寻找的几何模板。
 # 输入：实际打印纸上的黑白棋盘格；输出：OpenCV 在图像中应找到的内角点网格。
 # 实验作用：只有模板尺寸和实物一致，棋盘格法才能把角点位移解释成纸面位移。
-# 注意 OpenCV 要的是“内角点数量”，不是黑白方格数量；(7, 5) 对应实际 8 列×6 行方格。
-CHECKERBOARD_INNER_CORNERS = (7, 5)
+# 注意 OpenCV 要的是“内角点数量”，不是黑白方格数量。
+# 当前购买棋盘格为 12×9 个 3 mm 方格，图案尺寸 36×27 mm，
+# 因此可检测的内角点数量是 11×8。
+CHECKERBOARD_INNER_CORNERS = (11, 8)
 
 # 本段提供棋盘格法的物理尺度。
 # 输入：单个黑白方格边长，单位 mm；输出：像素位移到纸面毫米位移的比例。
 # 实验作用：这个值填错时，位移趋势可能还像对的，但毫米量级会整体错。
-CHECKER_SQUARE_MM = 4.0
+CHECKER_SQUARE_MM = 3.0
 
 # 本段控制棋盘格角点的亚像素精修。
 # 输入：初步检测到的角点；输出：更精细的角点坐标。
@@ -269,7 +271,7 @@ CIRCLE_RESIDUAL_WARNING_PX = 1.0
 # 输入：棋盘格和圆点布局参数；输出：一份可打印的 marker_sheet.svg。
 # 实验作用：vision_test 时自动生成参考纸，方便保持“代码里的几何尺寸”和“打印出来的实物”一致。
 # 打印时必须使用 100% 比例，不能选择“适应页面”。
-GENERATE_MARKER_SHEET_ON_VISION_TEST = True
+GENERATE_MARKER_SHEET_ON_VISION_TEST = False
 MARKER_SHEET_PATH = OUTPUT_ROOT / "marker_sheet.svg"
 
 # 本段定义测量纸的外框和留白。
@@ -292,7 +294,9 @@ HIK_CAMERA_SERIAL = ""
 # 本段告诉 Python 去哪里找海康 MVS SDK 的导入文件。
 # 输入：官方 Samples/Python/MvImport 路径；输出：运行时追加到 sys.path 的目录。
 # 实验作用：只在 hik_camera 模式需要；离线图片和视频流程完全不依赖它。
-HIK_MVS_IMPORT_PATH: str | None = None
+HIK_MVS_IMPORT_PATH: str | None = (
+    r"D:\SOFTWARE\MindVision_cs028_10UM\MVS\Development\Samples\Python\MvImport"
+)
 
 # 本段控制相机成像亮度。
 # 输入：曝光时间和增益；输出：相机节点参数或保留相机当前设置。
@@ -464,7 +468,7 @@ ANALYSIS_FILE: Path | None = None
 # 本段选择分析阶段使用哪套视觉结果。
 # 输入：每帧 JSON 中的 circles/checkerboard 结果；输出：用于统计和画图的一条位移序列。
 # 实验作用：前期 compare 会同时保存两套结果，分析时可以分别选用，判断问题出在识别方法还是实验本身。
-ANALYSIS_VISION_METHOD = "circles"
+ANALYSIS_VISION_METHOD = "checkerboard"
 
 # 本段选择振动分析观察哪个方向。
 # 输入：视觉算法输出的 dx、dy；输出：x、y 或合位移 magnitude 时间序列。

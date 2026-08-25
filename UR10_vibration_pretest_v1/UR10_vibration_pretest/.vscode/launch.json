@@ -1,0 +1,69 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launcher UI",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}\\launcher_ui.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "MPLCONFIGDIR": "${workspaceFolder}\\outputs\\matplotlib-cache"
+            }
+        },
+        {
+            "name": "Vision Test - Hik Camera",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}\\main.py",
+            "args": [
+                "--mode",
+                "vision_test"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "MPLCONFIGDIR": "${workspaceFolder}\\outputs\\matplotlib-cache"
+            }
+        },
+        {
+            "name": "Robot Dry Run - Safe",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}\\main.py",
+            "args": [
+                "--mode",
+                "robot_dry_run"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "MPLCONFIGDIR": "${workspaceFolder}\\outputs\\matplotlib-cache"
+            }
+        },
+        {
+            "name": "Analyze Latest Result",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}\\main.py",
+            "args": [
+                "--mode",
+                "analyze"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "MPLCONFIGDIR": "${workspaceFolder}\\outputs\\matplotlib-cache"
+            }
+        }
+    ]
+}
