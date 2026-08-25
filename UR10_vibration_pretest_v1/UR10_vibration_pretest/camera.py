@@ -37,10 +37,14 @@ from typing import Any, Iterator, cast
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from scipy.optimize import linear_sum_assignment
 
 import config
 from calibration import image_points_to_spatial
+
+
+_FONT_CACHE: dict[int, Any] = {}
 
 
 # =============================================================================
@@ -89,6 +93,95 @@ def _natural_sort_key(path: Path) -> list[int | str]:
     # 数字段转成 int，非数字段保持字符串。
     # sorted() 使用这个列表比较，就能得到更符合人类直觉的顺序。
     return [int(part) if part.isdigit() else part for part in parts]
+
+
+def _load_preview_font(size: int) -> Any:
+    """
+    加载预览图左上角信息面板使用的中文字体。
+
+    OpenCV 自带的 putText 只适合英文和数字，直接画中文会乱码或显示成方块。
+    因此这里用 Pillow 从 Windows 字体目录加载微软雅黑/黑体/宋体，再把文字画回 OpenCV 图像。
+    """
+
+    # 字体加载相对慢，所以同一个字号只加载一次，后续帧复用缓存。
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+
+    # 按常见 Windows 中文字体优先级寻找。
+    candidates = (
+        Path(r"C:\Windows\Fonts\msyh.ttc"),
+        Path(r"C:\Windows\Fonts\simhei.ttf"),
+        Path(r"C:\Windows\Fonts\simsun.ttc"),
+    )
+    for font_path in candidates:
+        if font_path.exists():
+            font = ImageFont.truetype(str(font_path), size=size)
+            _FONT_CACHE[size] = font
+            return font
+
+    # 理论上中文 Windows 都能找到上面的字体；找不到时退回 Pillow 默认字体。
+    font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
+
+
+def _draw_chinese_panel(
+    canvas: np.ndarray,
+    lines: list[str],
+    warning_lines: list[str],
+) -> None:
+    """
+    在 OpenCV 图像左上角绘制中文信息面板。
+
+    输入：
+    - canvas：BGR 图像，会被原地修改；
+    - lines：普通状态行；
+    - warning_lines：需要红色显示的提示行。
+
+    输出：
+    - canvas 左上角出现半透明黑底、白字/红字的信息面板。
+    """
+
+    # Pillow 使用 RGB/RGBA，OpenCV 使用 BGR；先转换到 Pillow 方便画中文。
+    image = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    font = _load_preview_font(22)
+    warning_font = _load_preview_font(23)
+    all_lines = lines + warning_lines
+    if not all_lines:
+        return
+
+    # 计算信息面板尺寸，让文字不贴边也不超出图像。
+    text_width = 0
+    for text in all_lines:
+        bbox = draw.textbbox((0, 0), text, font=warning_font if text in warning_lines else font)
+        text_width = max(text_width, bbox[2] - bbox[0])
+
+    line_height = 30
+    panel_width = min(image.size[0] - 12, text_width + 28)
+    panel_height = 16 + line_height * len(all_lines)
+
+    # 半透明黑底保证白板、黑背景或棋盘格上都能看清文字。
+    draw.rounded_rectangle(
+        (6, 6, 6 + panel_width, 6 + panel_height),
+        radius=6,
+        fill=(0, 0, 0, 168),
+    )
+
+    # 普通行用白色，警告行用红色。
+    y = 14
+    for text in lines:
+        draw.text((18, y), text, font=font, fill=(255, 255, 255, 255))
+        y += line_height
+    for text in warning_lines:
+        draw.text((18, y), text, font=warning_font, fill=(255, 80, 80, 255))
+        y += line_height
+
+    # 合成后转回 OpenCV BGR，并写回原数组。
+    composed = Image.alpha_composite(image, overlay).convert("RGB")
+    canvas[:, :] = cv2.cvtColor(np.asarray(composed), cv2.COLOR_RGB2BGR)
 
 
 class ImageFolderSource:
@@ -770,6 +863,11 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
     else:
         gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
 
+    # 本段保留一份“未做高斯模糊”的灰度图，专门用于计算清晰度。
+    # 如果在已经模糊后的 gray 上计算 Laplacian 方差，清晰度数值会被人为压低，
+    # 尤其是白色背景板占画面大部分时，更容易出现过于敏感的 blurred warning。
+    sharpness_gray = gray.copy()
+
     # 本段可选做轻微高斯滤波。
     # 输入是灰度图；输出是噪声略低的灰度图。
     # 这有助于阈值分割稳定，但核太大会吃掉边缘，所以由 config.py 控制。
@@ -784,7 +882,7 @@ def preprocess_frame(frame: np.ndarray) -> tuple[np.ndarray, dict[str, float], t
     # 输出写入每帧 VISION 记录，以后如果某一帧识别失败，用于回头解释识别失败或位移异常。
     metrics = {
         "mean_brightness": float(np.mean(gray)),#平均亮度
-        "blur_variance": float(cv2.Laplacian(gray, cv2.CV_64F).var()),#清晰度指标
+        "blur_variance": float(cv2.Laplacian(sharpness_gray, cv2.CV_64F).var()),#清晰度指标
         "dark_fraction": float(np.mean(gray <= config.DARK_PIXEL_THRESHOLD)),#过暗的像素的比例
         "bright_fraction": float(np.mean(gray >= config.BRIGHT_PIXEL_THRESHOLD)),#过亮的像素的比例
     }
@@ -1664,66 +1762,47 @@ class VisionProcessor:
             value = result.get(name, default)
             return float(default if value is None else value)
 
+        def short_number(name: str, digits: int = 3) -> str:
+            value = metric(name, math.nan)
+            if not math.isfinite(value):
+                return "--"
+            return f"{value:.{digits}f}"
+
         # 本段组织左上角质检文字。
-        # 输出让使用者快速看到帧号、有效性、两种方法位移/质量和图像亮度/模糊程度。
+        # 输出让使用者快速看到帧号、是否识别到完整棋盘格、角点数量、位移和图像质量。
+        expected_checker_corners = (
+            int(config.CHECKERBOARD_INNER_CORNERS[0])
+            * int(config.CHECKERBOARD_INNER_CORNERS[1])
+        )
+        checker_count = int(result.get("checker_corner_count", 0))
+        checker_valid = bool(result.get("checker_is_valid", False))
+        if checker_valid:
+            status = "已识别棋盘格"
+        else:
+            status = "未识别完整棋盘格"
+
         lines = [
-            f"frame={result['frame_id']} valid={result['is_valid']}",
-            (
-                "circle: "
-                f"dx={metric('circle_dx_mm', math.nan):.4f} mm  "
-                f"dy={metric('circle_dy_mm', math.nan):.4f} mm  "
-                f"q={metric('circle_quality', 0.0):.2f}"
-            ),
-            (
-                "checker: "
-                f"dx={metric('checker_dx_mm', math.nan):.4f} mm  "
-                f"dy={metric('checker_dy_mm', math.nan):.4f} mm  "
-                f"q={metric('checker_quality', 0.0):.2f}"
-            ),
-            (
-                f"brightness={metric('mean_brightness', math.nan):.1f}  "
-                f"blurVar={metric('blur_variance', math.nan):.1f}"
-            ),
+            f"帧号 {result['frame_id']}｜{status}",
+            f"角点 {checker_count}/{expected_checker_corners}｜质量 {short_number('checker_quality', 2)}",
+            f"位移 X {short_number('checker_dx_mm')} mm｜Y {short_number('checker_dy_mm')} mm",
+            f"亮度 {short_number('mean_brightness', 1)}｜清晰 {short_number('blur_variance', 1)}",
         ]
 
-        # 本段把质检文字画到图像上。
-        # 先画白色粗线再画深色细线，是为了在亮背景或暗背景上都能读清。
-        for line_index, text in enumerate(lines):
-            y = 28 + line_index * 25
-            cv2.putText(
-                canvas,
-                text,
-                (12, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (255, 255, 255),
-                3,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                canvas,
-                text,
-                (12, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (30, 30, 30),
-                1,
-                cv2.LINE_AA,
-            )
-
+        # 本段生成更直观的中文提示。
+        # 它只影响预览和 debug 图，不改变任何识别结果。
+        warning_lines: list[str] = []
         if result["blur_variance"] < config.BLUR_WARNING_THRESHOLD:
-            # 本段把低清晰度帧显式标出来。
-            # 输出是红色 WARNING，帮助人工快速定位可能由运动模糊或失焦导致的异常帧。
-            cv2.putText(
-                canvas,
-                "WARNING: image may be blurred",
-                (12, 135),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            warning_lines.append("提示：可能失焦/运动模糊")
+        if result["bright_fraction"] > 0.20:
+            warning_lines.append("提示：画面过亮/过曝")
+        if result["dark_fraction"] > 0.20:
+            warning_lines.append("提示：画面过暗")
+        if not checker_valid:
+            warning_lines.append("提示：请让 12×9 方格完整入画")
+
+        # 本段真正绘制中文面板。
+        # 使用 Pillow 字体绘制，避免 OpenCV putText 无法显示中文。
+        _draw_chinese_panel(canvas, lines, warning_lines)
         return canvas
 
 
@@ -2057,10 +2136,11 @@ def run_vision_test() -> Path:
 
                 # 本段控制调试图保存量。
                 # 调试图用于人工检查识别点、编号和图像质量；它不是后续算法输入。
-                # 为避免批量离线数据产生过多图片，只按固定间隔和最大张数保存。
+                # 为避免批量离线数据产生过多图片，只按相机原始帧号间隔和最大张数保存。
+                # 对在线相机来说，若 frame_id 大幅跳跃，说明当前程序处理链路没有跟上相机实际帧率。
                 should_save = (
                     config.SAVE_DEBUG_IMAGE
-                    and packet.frame_id % config.DEBUG_IMAGE_EVERY_N_FRAMES == 0 # 当前帧编号能不能被DEBUG_IMAGE_EVERY_N_FRAMES整除（余数为0），能则保存为参考
+                    and packet.frame_id % config.DEBUG_IMAGE_EVERY_N_FRAMES == 0
                     and saved_debug_count < config.MAX_DEBUG_IMAGES
                 )
                 if should_save:
