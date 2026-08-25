@@ -2212,11 +2212,6 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
     # 输入是视觉时间轴和 EVENT 事件；输出是 full/baseline/motion/steady_motion/post 等窗口掩码。
     events = event_times_seconds(loaded.events)
     event_sequence = event_times_sequence(loaded.events)
-    timeline_events = dict(events)
-    if event_sequence.get("motion_command_sent"):
-        timeline_events["motion_command_sent"] = event_sequence["motion_command_sent"][0]
-    if event_sequence.get("motion_finished"):
-        timeline_events["motion_finished"] = event_sequence["motion_finished"][-1]
     windows, segments = select_analysis_segments(
         vision_time,
         events,
@@ -2292,14 +2287,14 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         full_uniform_time,
         full_uniform_values,
         full_rate,
-        timeline_events,
+        events,
     )
 
     # 本段提取运动前静止基线。
     # 输入是实验开始和运动命令事件；输出 baseline_uniform_mask。
     # 恢复时间阈值会参考基线 RMS，避免把静态视觉噪声误判成残余振动。
-    baseline_start = timeline_events.get("experiment_started", float(full_uniform_time[0]))
-    baseline_end = timeline_events.get("motion_command_sent")
+    baseline_start = events.get("experiment_started", float(full_uniform_time[0]))
+    baseline_end = events.get("motion_command_sent")
     baseline_uniform_mask = _window_mask(
         full_uniform_time,
         baseline_start,
@@ -2315,7 +2310,7 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
     recovery = calculate_recovery_time(
         full_uniform_time,
         full_residual,
-        timeline_events,
+        events,
         baseline_uniform_mask,
         full_rate,
     )
@@ -2341,7 +2336,7 @@ def run_analysis(analysis_file: Path | None = None) -> Path:
         full_uniform_time,
         full_trend,
         full_residual,
-        timeline_events,
+        events,
         config.ANALYSIS_VISION_METHOD,
         config.ANALYSIS_AXIS,
     )
