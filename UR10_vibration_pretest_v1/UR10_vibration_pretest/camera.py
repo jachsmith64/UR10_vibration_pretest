@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib
 import csv
+import json
 import math
 import re
 import sys
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from queue import Full
-from typing import Any, Iterator, cast
+from typing import Any, Iterator, TypedDict, cast
 
 import cv2
 import numpy as np
@@ -45,6 +46,28 @@ from calibration import image_points_to_spatial
 
 
 _FONT_CACHE: dict[int, Any] = {}
+
+
+class CaptureTimestampRow(TypedDict, total=False):
+    """高速采集阶段每帧时间戳 CSV 的内存结构。"""
+
+    capture_index: int
+    frame_id: int
+    frame_id_gap: int | None
+    missing_before: int
+    host_ns: int
+    camera_timestamp_raw: int | None
+    frame_time_s: float
+    camera_time_s: float | None
+    analysis_time_s: float
+    analysis_time_source: str
+
+
+class MissingFrameRow(TypedDict):
+    missing_frame_id: int
+    previous_saved_frame_id: int
+    next_saved_frame_id: int
+    estimated_frame_time_s: float
 VISION_TIMING_FIELDS: tuple[str, ...] = (
     "camera_wait_ms",
     "frame_convert_ms",
@@ -127,6 +150,13 @@ class FramePacket:
     camera_timestamp_raw: float | int | None
     source_name: str
     source_timing_ms: dict[str, float | None] | None = None
+    capture_index: int | None = None
+    frame_id_gap: int | None = None
+    missing_before: int | None = None
+    frame_time_s: float | None = None
+    camera_time_s: float | None = None
+    analysis_time_s: float | None = None
+    analysis_time_source: str | None = None
 
 
 def _natural_sort_key(path: Path) -> list[int | str]:
@@ -495,6 +525,92 @@ class VideoSource:
             frame_id += 1
 
 
+class RawCaptureSource:
+    """vision_capture 输出的 RAW 帧输入源。"""
+
+    def __init__(self, capture_dir: Path) -> None:
+        self.capture_dir = Path(capture_dir)
+        self.metadata: dict[str, Any] = {}
+        self.timestamps: list[CaptureTimestampRow] = []
+        self.raw_capture: np.memmap[Any, Any] | None = None
+
+    def __enter__(self) -> "RawCaptureSource":
+        metadata_path = self.capture_dir / "capture_metadata.json"
+        timestamps_path = self.capture_dir / "frame_timestamps.csv"
+        raw_path = self.capture_dir / "frames.raw"
+
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"缺少 capture_metadata.json：{metadata_path}")
+        if not timestamps_path.exists():
+            raise FileNotFoundError(f"缺少 frame_timestamps.csv：{timestamps_path}")
+        if not raw_path.exists():
+            raise FileNotFoundError(f"缺少 frames.raw：{raw_path}")
+
+        self.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        frame_count = int(self.metadata["frame_count"])
+        height = int(self.metadata["height"])
+        width = int(self.metadata["width"])
+        dtype_name = str(self.metadata["dtype"])
+        channels = int(self.metadata.get("channels", 1))
+        if channels != 1 or dtype_name != "uint8":
+            raise ValueError(
+                "当前 RawCaptureSource 只支持 Mono8 RAW："
+                f"channels={channels}, dtype={dtype_name}"
+            )
+
+        expected_bytes = frame_count * height * width
+        actual_bytes = raw_path.stat().st_size
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"RAW 文件大小不一致：metadata 期望 {expected_bytes} bytes，"
+                f"实际 {actual_bytes} bytes。"
+            )
+
+        self.timestamps = _read_capture_timestamps(timestamps_path, self.metadata)
+        if len(self.timestamps) != frame_count:
+            raise ValueError(
+                f"时间戳行数 {len(self.timestamps)} 与 frame_count={frame_count} 不一致。"
+            )
+
+        self.raw_capture = np.memmap(
+            raw_path,
+            dtype=np.uint8,
+            mode="r",
+            shape=(frame_count, height, width),
+        )
+        print(f"[离线识别] 已打开 RAW 采集：{self.capture_dir}，共 {frame_count} 帧。")
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if self.raw_capture is not None:
+            mmap_object = getattr(self.raw_capture, "_mmap", None)
+            if mmap_object is not None:
+                mmap_object.close()
+        self.raw_capture = None
+
+    def __iter__(self) -> Iterator[FramePacket]:
+        if self.raw_capture is None:
+            raise RuntimeError("RawCaptureSource 必须放在 with 语句中使用。")
+
+        for row in self.timestamps:
+            capture_index = int(row["capture_index"])
+            frame = np.asarray(self.raw_capture[capture_index])
+            yield FramePacket(
+                frame=frame,
+                frame_id=int(row["frame_id"]),
+                host_ns=int(row["host_ns"]),
+                camera_timestamp_raw=row["camera_timestamp_raw"],
+                source_name=f"raw_capture:{self.capture_dir.name}",
+                capture_index=capture_index,
+                frame_id_gap=row.get("frame_id_gap"),
+                missing_before=int(row.get("missing_before", 0)),
+                frame_time_s=float(row["frame_time_s"]),
+                camera_time_s=row.get("camera_time_s"),
+                analysis_time_s=float(row["analysis_time_s"]),
+                analysis_time_source=str(row["analysis_time_source"]),
+            )
+
+
 class HikCameraSource:
     """
     海康 MVS 实时相机输入源。
@@ -525,6 +641,8 @@ class HikCameraSource:
         self.payload_size = 0
         self.data_buffer: Any = None
         self.frame_info: Any = None
+        self.actual_camera_fps: float | None = None
+        self.actual_camera_fps_source = "config.EXPECTED_VISION_FPS"
 
     @staticmethod
     def _decode_c_string(value: Any) -> str:
@@ -646,6 +764,37 @@ class HikCameraSource:
                 f"MVS 返回 0x{int(ret) & 0xFFFFFFFF:08X}。请在 MVS 客户端确认节点范围。"
             )
 
+    def _refresh_actual_camera_fps(self) -> None:
+        """尽量读取相机实际输出帧率；失败时回退到配置值。"""
+
+        fallback = config.EXPECTED_VISION_FPS
+        self.actual_camera_fps = float(fallback) if fallback is not None else None
+        self.actual_camera_fps_source = "config.EXPECTED_VISION_FPS"
+
+        if self.camera is None or self.sdk is None:
+            return
+        float_type = getattr(self.sdk, "MVCC_FLOATVALUE", None)
+        getter = getattr(self.camera, "MV_CC_GetFloatValue", None)
+        if float_type is None or getter is None:
+            return
+
+        for node_name in (
+            "ResultingFrameRate",
+            "AcquisitionResultingFrameRate",
+            "AcquisitionFrameRate",
+        ):
+            value = float_type()
+            try:
+                ret = getter(node_name, value)
+            except Exception:
+                continue
+            if int(ret) == 0:
+                current = float(getattr(value, "fCurValue", math.nan))
+                if math.isfinite(current) and current > 0:
+                    self.actual_camera_fps = current
+                    self.actual_camera_fps_source = node_name
+                    return
+
     def __enter__(self) -> "HikCameraSource":
         from ctypes import c_ubyte
 
@@ -683,6 +832,7 @@ class HikCameraSource:
             if config.HIK_GAIN is not None:
                 self.camera.MV_CC_SetEnumValue("GainAuto", 0)
             self._try_set_float("Gain", config.HIK_GAIN)
+            self._refresh_actual_camera_fps()
 
             payload = self.sdk.MVCC_INTVALUE_EX()
             self._check_ret(
@@ -1773,18 +1923,35 @@ class VisionProcessor:
             "frame_id": int(packet.frame_id),
             "camera_timestamp_raw": packet.camera_timestamp_raw,
             "source_name": packet.source_name,
+            "capture_index": packet.capture_index,
+            "frame_id_gap": packet.frame_id_gap,
+            "missing_before": packet.missing_before,
+            "frame_time_s": packet.frame_time_s,
+            "camera_time_s": packet.camera_time_s,
+            "analysis_time_source": packet.analysis_time_source,
             **image_metrics,
         }
 
         # 本段决定这帧进入离线分析时使用哪个时间轴。
         # 如果是离线的图片/视频，优先使用图片自己自带的时间戳。如果没有，就用电脑当前时间。（一般是有的）
-        if (
+        if packet.analysis_time_s is not None and math.isfinite(float(packet.analysis_time_s)):
+            result["analysis_time_s"] = float(packet.analysis_time_s)
+            if packet.analysis_time_source is None:
+                result["analysis_time_source"] = "packet_analysis_time_s"
+        elif packet.source_name.startswith("raw_capture:"):
+            raise RuntimeError(
+                "raw_capture 缺少有效 analysis_time_s；请检查 frame_timestamps.csv "
+                "是否包含 frame_time_s/analysis_time_s。"
+            )
+        elif (
             packet.source_name.startswith(("image_folder:", "video:"))
             and packet.camera_timestamp_raw is not None
         ):
             result["analysis_time_s"] = float(packet.camera_timestamp_raw)
+            result["analysis_time_source"] = "camera_timestamp_raw"
         else:
             result["analysis_time_s"] = float(packet.host_ns) * 1e-9
+            result["analysis_time_source"] = "host_ns"
 
         # 本段 预留 “算法看见的点”。
         # 这些点既会进入日志成为排错证据，也会画到 debug 图上给人肉眼检查。
@@ -2447,6 +2614,760 @@ def _top_average_timing_fields(
             averages.append((field, float(np.mean(values))))
     averages.sort(key=lambda item: item[1], reverse=True)
     return averages[:limit]
+
+
+def _latest_capture_dir() -> Path:
+    """在 outputs 下寻找最近一次完整的 vision_capture 输出目录。"""
+
+    candidates = [
+        path
+        for path in config.OUTPUT_ROOT.glob("vision_capture_*")
+        if (
+            path.is_dir()
+            and (path / "capture_metadata.json").is_file()
+            and (path / "frames.raw").is_file()
+            and (path / "frame_timestamps.csv").is_file()
+        )
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"{config.OUTPUT_ROOT} 下没有完整的 vision_capture_* 采集结果。"
+        )
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _resolve_raw_capture_dir() -> Path:
+    """解析 vision_offline 要读取的 RAW 采集目录。"""
+
+    if config.RAW_CAPTURE_DIR is None:
+        return _latest_capture_dir()
+    capture_dir = Path(config.RAW_CAPTURE_DIR).expanduser()
+    if not capture_dir.is_absolute():
+        capture_dir = (config.PROJECT_DIR / capture_dir).resolve()
+    missing = [
+        filename
+        for filename in ("capture_metadata.json", "frames.raw", "frame_timestamps.csv")
+        if not (capture_dir / filename).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"RAW_CAPTURE_DIR={capture_dir} 不是完整采集目录，缺少：{', '.join(missing)}"
+        )
+    return capture_dir
+
+
+def _optional_int_from_text(value: Any) -> int | None:
+    if value in ("", None):
+        return None
+    return int(float(value))
+
+
+def _optional_float_from_text(value: Any) -> float | None:
+    if value in ("", None):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _write_capture_timestamps(output_path: Path, rows: list[CaptureTimestampRow]) -> None:
+    """一次性写入采集帧时间戳 CSV。"""
+
+    with output_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "capture_index",
+                "frame_id",
+                "frame_id_gap",
+                "missing_before",
+                "host_ns",
+                "camera_timestamp_raw",
+                "frame_time_s",
+                "camera_time_s",
+                "analysis_time_s",
+                "analysis_time_source",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _read_capture_timestamps(
+    path: Path,
+    metadata: dict[str, Any] | None = None,
+) -> list[CaptureTimestampRow]:
+    """读取 frame_timestamps.csv；旧目录缺字段时按 frame_id 和 fps 重建时间轴。"""
+
+    rows: list[CaptureTimestampRow] = []
+    has_new_time_fields = False
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        has_new_time_fields = "analysis_time_s" in (reader.fieldnames or ())
+        for index, row in enumerate(reader):
+            rows.append(
+                {
+                    "capture_index": int(row.get("capture_index") or index),
+                    "frame_id": int(row["frame_id"]),
+                    "frame_id_gap": _optional_int_from_text(row.get("frame_id_gap")),
+                    "missing_before": int(row.get("missing_before") or 0),
+                    "host_ns": int(row["host_ns"]),
+                    "camera_timestamp_raw": _optional_int_from_text(
+                        row.get("camera_timestamp_raw")
+                    ),
+                    "frame_time_s": _optional_float_from_text(row.get("frame_time_s")) or 0.0,
+                    "camera_time_s": _optional_float_from_text(row.get("camera_time_s")),
+                    "analysis_time_s": _optional_float_from_text(
+                        row.get("analysis_time_s")
+                    ) or 0.0,
+                    "analysis_time_source": row.get("analysis_time_source")
+                    or "frame_id_fps_fallback",
+                }
+            )
+
+    if rows and not has_new_time_fields:
+        fps = float(
+            (metadata or {}).get("actual_camera_fps")
+            or (metadata or {}).get("expected_fps")
+            or config.EXPECTED_VISION_FPS
+            or 1.0
+        )
+        _enrich_capture_timestamps(rows, fps)
+        print(
+            "[离线识别警告] 当前采集目录缺少新时间字段，"
+            "已按 frame_id 和 fps 重建 analysis_time_s。"
+        )
+    return rows
+
+
+def _enrich_capture_timestamps(
+    rows: list[CaptureTimestampRow],
+    actual_camera_fps: float,
+) -> tuple[list[MissingFrameRow], str]:
+    """根据 frame_id 建立不挤压缺帧的分析时间轴。"""
+
+    if not rows:
+        return [], "frame_id_fps_fallback"
+    if actual_camera_fps <= 0:
+        raise ValueError("actual_camera_fps 必须大于 0。")
+
+    first_frame_id = int(rows[0]["frame_id"])
+    missing_rows: list[MissingFrameRow] = []
+    previous_frame_id: int | None = None
+    for capture_index, row in enumerate(rows):
+        row["capture_index"] = capture_index
+        frame_id = int(row["frame_id"])
+        if previous_frame_id is None:
+            row["frame_id_gap"] = None
+            row["missing_before"] = 0
+        else:
+            frame_id_gap = frame_id - previous_frame_id
+            row["frame_id_gap"] = frame_id_gap
+            row["missing_before"] = max(frame_id_gap - 1, 0)
+            if frame_id_gap <= 0:
+                print(
+                    "[采集严重警告] frame_id 出现重复或倒退："
+                    f"previous={previous_frame_id}, current={frame_id}。"
+                )
+            for missing_frame_id in range(previous_frame_id + 1, frame_id):
+                missing_rows.append(
+                    {
+                        "missing_frame_id": missing_frame_id,
+                        "previous_saved_frame_id": previous_frame_id,
+                        "next_saved_frame_id": frame_id,
+                        "estimated_frame_time_s": (
+                            (missing_frame_id - first_frame_id) / actual_camera_fps
+                        ),
+                    }
+                )
+        frame_time_s = (frame_id - first_frame_id) / actual_camera_fps
+        row["frame_time_s"] = frame_time_s
+        row["camera_time_s"] = None
+        row["analysis_time_s"] = frame_time_s
+        row["analysis_time_source"] = "frame_id_fps_fallback"
+        previous_frame_id = frame_id
+    return missing_rows, "frame_id_fps_fallback"
+
+
+def _write_missing_frames(output_path: Path, rows: list[MissingFrameRow]) -> None:
+    """写出逐帧缺失清单。"""
+
+    with output_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "missing_frame_id",
+                "previous_saved_frame_id",
+                "next_saved_frame_id",
+                "estimated_frame_time_s",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _capture_summary_values(
+    timestamp_rows: list[CaptureTimestampRow],
+) -> dict[str, float | int | None]:
+    """根据采集到的帧号和 host_ns 计算跳帧/帧率统计。"""
+
+    if not timestamp_rows:
+        return {
+            "frame_count": 0,
+            "first_frame_id": None,
+            "last_frame_id": None,
+            "theoretical_frame_count": None,
+            "missing_frames": None,
+            "missing_rate": None,
+            "continuous_ratio": None,
+            "gap_event_count": 0,
+            "maximum_missing_run": 0,
+            "camera_fps_by_frame_id_host": None,
+        }
+
+    first_frame = int(timestamp_rows[0]["frame_id"])
+    last_frame = int(timestamp_rows[-1]["frame_id"])
+    frame_count = len(timestamp_rows)
+    theoretical_count = max(0, last_frame - first_frame + 1)
+    gaps = [
+        int(timestamp_rows[index]["frame_id"])
+        - int(timestamp_rows[index - 1]["frame_id"])
+        for index in range(1, frame_count)
+    ]
+    missing_frames = sum(max(gap - 1, 0) for gap in gaps)
+    missing_rate = missing_frames / theoretical_count if theoretical_count else None
+    continuous_ratio = (
+        sum(1 for gap in gaps if gap == 1) / len(gaps)
+        if gaps
+        else None
+    )
+
+    first_host = int(timestamp_rows[0]["host_ns"])
+    last_host = int(timestamp_rows[-1]["host_ns"])
+    host_span_s = (last_host - first_host) / 1_000_000_000.0
+    camera_fps = None
+    if host_span_s > 0 and last_frame > first_frame:
+        camera_fps = (last_frame - first_frame) / host_span_s
+
+    return {
+        "frame_count": frame_count,
+        "first_frame_id": first_frame,
+        "last_frame_id": last_frame,
+        "theoretical_frame_count": theoretical_count,
+        "missing_frames": missing_frames,
+        "missing_rate": missing_rate,
+        "continuous_ratio": continuous_ratio,
+        "gap_event_count": sum(1 for gap in gaps if gap > 1),
+        "maximum_missing_run": max((max(gap - 1, 0) for gap in gaps), default=0),
+        "camera_fps_by_frame_id_host": camera_fps,
+    }
+
+
+def _write_capture_summary(
+    output_path: Path,
+    timestamp_rows: list[CaptureTimestampRow],
+    copy_times_ms: list[float],
+    capture_elapsed_s: float,
+    raw_write_ms: float | None,
+    raw_file_size: int,
+    actual_camera_fps: float,
+    actual_camera_fps_source: str,
+    analysis_time_source: str,
+    missing_frames_path: Path,
+) -> None:
+    """写出高速采集阶段的人类可读摘要。"""
+
+    stats = _capture_summary_values(timestamp_rows)
+    copy_average = float(np.mean(copy_times_ms)) if copy_times_ms else None
+    copy_p95 = _percentile(copy_times_ms, 95)
+    copy_max = max(copy_times_ms) if copy_times_ms else None
+
+    def fmt(value: float | int | None, digits: int = 3) -> str:
+        if value is None:
+            return "N/A"
+        if isinstance(value, int):
+            return str(value)
+        if not math.isfinite(float(value)):
+            return "N/A"
+        return f"{float(value):.{digits}f}"
+
+    def pct(value: float | int | None) -> str:
+        if value is None:
+            return "N/A"
+        return f"{float(value):.2%}"
+
+    lines = [
+        "UR10 相机高速 RAW 采集摘要",
+        "=" * 72,
+        "说明：本摘要只统计高速采集阶段是否接住相机输出的原始图像帧。",
+        "      采集缺帧来自相机 frame_id 断号，表示这些帧没有进入 frames.raw。",
+        "-" * 72,
+        f"生成时间：{datetime.now().isoformat(timespec='seconds')}",
+        f"实际保存的原始图像帧数：{stats['frame_count']}",
+        f"相机帧号起点：{stats['first_frame_id']}",
+        f"相机帧号终点：{stats['last_frame_id']}",
+        f"按首末 frame_id 推算应出现的相机帧数：{stats['theoretical_frame_count']}",
+        f"采集阶段未保存的相机帧数：{stats['missing_frames']}",
+        f"采集缺帧率：{pct(stats['missing_rate'])}",
+        f"frame_id 连续比例：{pct(stats['continuous_ratio'])}",
+        f"frame_id 断号事件次数：{stats['gap_event_count']}",
+        f"最大连续缺失帧数：{stats['maximum_missing_run']}",
+        f"actual_camera_fps：{fmt(actual_camera_fps)} fps（来源：{actual_camera_fps_source}）",
+        f"analysis_time_s 来源：{analysis_time_source}",
+        f"missing_frames.csv：{missing_frames_path}",
+        f"根据 frame_id 和 host_ns 推算的相机帧率：{fmt(stats['camera_fps_by_frame_id_host'])} fps",
+        "host_ns 只用于电脑侧对时，不作为 raw_capture 离线频谱分析时间轴。",
+        f"每帧保存/复制平均耗时：{fmt(copy_average)} ms",
+        f"每帧保存/复制 P95：{fmt(copy_p95)} ms",
+        f"每帧保存/复制最大值：{fmt(copy_max)} ms",
+        f"采集期间总耗时：{fmt(capture_elapsed_s)} s",
+        f"采集结束后的 RAW 收尾耗时：{fmt(raw_write_ms)} ms",
+        f"RAW 文件大小：{raw_file_size} bytes",
+    ]
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _save_capture_sample_images(frames: np.ndarray, output_dir: Path) -> None:
+    """采集停止后统一保存首/中/末三张样本 PNG。"""
+
+    if len(frames) == 0 or not config.CAPTURE_SAVE_SAMPLE_IMAGES:
+        return
+    sample_indices = {
+        "sample_first.png": 0,
+        "sample_middle.png": len(frames) // 2,
+        "sample_last.png": len(frames) - 1,
+    }
+    for filename, index in sample_indices.items():
+        cv2.imwrite(str(output_dir / filename), frames[index])
+
+
+def _save_capture_sample_images_from_raw(
+    raw_path: Path,
+    frame_count: int,
+    height: int,
+    width: int,
+    output_dir: Path,
+) -> None:
+    """stream_raw 模式下从 RAW 文件抽取首/中/末三张样本图。"""
+
+    if frame_count == 0 or not config.CAPTURE_SAVE_SAMPLE_IMAGES:
+        return
+    raw_capture = np.memmap(
+        raw_path,
+        dtype=np.uint8,
+        mode="r",
+        shape=(frame_count, height, width),
+    )
+    try:
+        _save_capture_sample_images(raw_capture, output_dir)
+    finally:
+        mmap_object = getattr(raw_capture, "_mmap", None)
+        if mmap_object is not None:
+            mmap_object.close()
+
+
+def _write_raw_frames_from_ram(raw_path: Path, frames: np.ndarray) -> float:
+    """把 RAM 中的帧分块写入 RAW 临时文件，完成后替换为正式文件。"""
+
+    temp_path = raw_path.with_name(raw_path.name + ".tmp")
+    chunk_frames = max(1, int(config.CAPTURE_RAW_WRITE_CHUNK_FRAMES))
+    total_frames = int(frames.shape[0])
+    write_start_ns = time.perf_counter_ns()
+    with temp_path.open("wb") as file:
+        for start in range(0, total_frames, chunk_frames):
+            end = min(total_frames, start + chunk_frames)
+            frames[start:end].tofile(file)
+    temp_path.replace(raw_path)
+    return _elapsed_ms(write_start_ns)
+
+
+def _finalize_memmap_raw(
+    raw_path: Path,
+    temp_path: Path,
+    frames: np.ndarray,
+    frame_count: int,
+) -> float:
+    """收尾 memmap RAW：flush、按实际帧数截断，再重命名为正式文件。"""
+
+    finalize_start_ns = time.perf_counter_ns()
+    frame_bytes = int(frames.shape[1] * frames.shape[2] * frames.dtype.itemsize)
+    final_size = int(frame_count * frame_bytes)
+    if isinstance(frames, np.memmap):
+        frames.flush()
+        mmap_object = getattr(frames, "_mmap", None)
+        if mmap_object is not None:
+            mmap_object.close()
+    with temp_path.open("r+b") as file:
+        file.truncate(final_size)
+    temp_path.replace(raw_path)
+    return _elapsed_ms(finalize_start_ns)
+
+
+def _preview_capture_frame(frame: np.ndarray, window_name: str) -> bool:
+    """显示采集预览；返回 True 表示用户请求停止。"""
+
+    preview = _resize_for_preview(frame)
+    cv2.imshow(window_name, preview)
+    key = cv2.waitKey(1) & 0xFF
+    return key in (27, ord("q"))
+
+
+def run_vision_capture() -> Path:
+    """高速采集海康相机 Mono8 原始帧，并保存为 RAW。"""
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = config.OUTPUT_ROOT / f"vision_capture_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_path = run_dir / "frames.raw"
+    raw_temp_path = raw_path.with_name(raw_path.name + ".tmp")
+    metadata_path = run_dir / "capture_metadata.json"
+    timestamps_path = run_dir / "frame_timestamps.csv"
+    missing_frames_path = run_dir / "missing_frames.csv"
+    summary_path = run_dir / "capture_summary.txt"
+
+    storage_mode = str(config.CAPTURE_STORAGE_MODE)
+    capture_duration_s = config.CAPTURE_DURATION_S
+    expected_fps = float(config.EXPECTED_VISION_FPS or 132.0)
+    expected_frames = (
+        int(math.ceil(capture_duration_s * expected_fps))
+        if capture_duration_s is not None
+        else None
+    )
+    capacity = (
+        max(1, int(math.ceil(expected_frames * 1.10)) + 8)
+        if expected_frames is not None
+        else None
+    )
+
+    frames_buffer: np.ndarray | None = None
+    raw_stream: Any = None
+    timestamp_rows: list[CaptureTimestampRow] = []
+    copy_times_ms: list[float] = []
+    width = 0
+    height = 0
+    capture_elapsed_s = 0.0
+    raw_write_ms: float | None = None
+    actual_camera_fps = expected_fps
+    actual_camera_fps_source = "config.EXPECTED_VISION_FPS"
+    analysis_time_source = "frame_id_fps_fallback"
+
+    print("[采集] 高速采集模式：只保存原始帧，不做棋盘格识别。")
+    try:
+        with HikCameraSource() as source:
+            iterator = iter(source)
+            first_packet = next(iterator)
+            first_frame = first_packet.frame
+            if source.actual_camera_fps is not None:
+                actual_camera_fps = float(source.actual_camera_fps)
+                actual_camera_fps_source = source.actual_camera_fps_source
+
+            if config.CAPTURE_REQUIRE_MONO8:
+                if first_frame.ndim != 2 or first_frame.dtype != np.uint8:
+                    raise RuntimeError(
+                        "高速采集要求 Mono8：请在 MVS 客户端把 PixelFormat 设置为 Mono8。"
+                    )
+            if first_frame.ndim != 2 or first_frame.dtype != np.uint8:
+                raise RuntimeError(
+                    f"当前 RAW 采集只支持二维 uint8 帧，实际 shape={first_frame.shape}, "
+                    f"dtype={first_frame.dtype}。"
+                )
+
+            height, width = int(first_frame.shape[0]), int(first_frame.shape[1])
+            if storage_mode == "stream_raw":
+                raw_stream = raw_temp_path.open("wb")
+            elif storage_mode == "memmap_raw":
+                if capacity is None:
+                    raise RuntimeError("memmap_raw 需要设置 CAPTURE_DURATION_S。")
+                frames_buffer = np.memmap(
+                    raw_temp_path,
+                    dtype=np.uint8,
+                    mode="w+",
+                    shape=(capacity, height, width),
+                )
+            else:
+                if capacity is None:
+                    raise RuntimeError("ram_then_raw 需要设置 CAPTURE_DURATION_S。")
+                estimated_gib = capacity * height * width / (1024**3)
+                print(f"[采集] ram_then_raw 预计占用 RAM {estimated_gib:.3f} GiB。")
+                try:
+                    frames_buffer = np.empty((capacity, height, width), dtype=np.uint8)
+                    frames_buffer.fill(0)
+                except MemoryError as exc:
+                    raise MemoryError(
+                        "ram_then_raw 预分配内存失败；请缩短 CAPTURE_DURATION_S。"
+                    ) from exc
+
+            if config.CAPTURE_SHOW_PREVIEW:
+                _preview_capture_frame(first_frame, "UR10 raw capture preview")
+
+            countdown = float(config.CAPTURE_START_COUNTDOWN_S)
+            if countdown > 0:
+                print(f"[采集] {countdown:.1f} 秒后开始正式采集。")
+                time.sleep(countdown)
+
+            capture_start_ns = time.perf_counter_ns()
+            deadline_ns = (
+                capture_start_ns + int(capture_duration_s * 1_000_000_000)
+                if capture_duration_s is not None
+                else None
+            )
+            captured_count = 0
+            preview_interval_ns = int(1_000_000_000 / float(config.CAPTURE_PREVIEW_FPS))
+            next_preview_ns = capture_start_ns
+
+            while True:
+                if deadline_ns is not None and time.perf_counter_ns() >= deadline_ns:
+                    break
+
+                packet = next(iterator)
+                frame = packet.frame
+                if frame.shape != (height, width) or frame.dtype != np.uint8:
+                    raise RuntimeError(
+                        "采集过程中帧尺寸或 dtype 发生变化："
+                        f"expected {(height, width)} uint8, got {frame.shape} {frame.dtype}。"
+                    )
+                if frames_buffer is not None and captured_count >= len(frames_buffer):
+                    raise RuntimeError(
+                        f"预分配容量 {len(frames_buffer)} 帧已满，"
+                        "请提高 EXPECTED_VISION_FPS 或缩短 CAPTURE_DURATION_S。"
+                    )
+
+                copy_start_ns = time.perf_counter_ns()
+                if storage_mode == "stream_raw":
+                    if raw_stream is None:
+                        raise RuntimeError("stream_raw 文件句柄尚未打开。")
+                    frame_view = frame if frame.flags.c_contiguous else np.ascontiguousarray(frame)
+                    raw_stream.write(memoryview(frame_view).cast("B"))
+                elif frames_buffer is not None:
+                    np.copyto(frames_buffer[captured_count], frame)
+                else:
+                    raise RuntimeError("采集缓冲区尚未初始化。")
+                copy_times_ms.append(_elapsed_ms(copy_start_ns))
+                timestamp_rows.append(
+                    {
+                        "capture_index": captured_count,
+                        "frame_id": int(packet.frame_id),
+                        "host_ns": int(packet.host_ns),
+                        "camera_timestamp_raw": (
+                            None
+                            if packet.camera_timestamp_raw is None
+                            else int(packet.camera_timestamp_raw)
+                        ),
+                    }
+                )
+                captured_count += 1
+
+                if (
+                    config.CAPTURE_SHOW_PREVIEW
+                    and time.perf_counter_ns() >= next_preview_ns
+                ):
+                    if _preview_capture_frame(frame, "UR10 raw capture preview"):
+                        print("[采集] 预览窗口请求停止采集。")
+                        break
+                    next_preview_ns += preview_interval_ns
+
+            capture_elapsed_s = _elapsed_ms(capture_start_ns) / 1000.0
+            print(f"[采集] 正式采集结束，已采集 {captured_count} 帧。")
+    finally:
+        if raw_stream is not None:
+            raw_stream.close()
+        if config.CAPTURE_SHOW_PREVIEW:
+            try:
+                cv2.destroyWindow("UR10 raw capture preview")
+            except cv2.error:
+                pass
+
+    if not timestamp_rows:
+        raise RuntimeError("高速采集没有保存到任何有效帧。")
+
+    actual_count = len(timestamp_rows)
+    missing_frame_rows, analysis_time_source = _enrich_capture_timestamps(
+        timestamp_rows,
+        actual_camera_fps=actual_camera_fps,
+    )
+
+    if storage_mode == "stream_raw":
+        raw_write_start_ns = time.perf_counter_ns()
+        raw_temp_path.replace(raw_path)
+        raw_write_ms = _elapsed_ms(raw_write_start_ns)
+        _save_capture_sample_images_from_raw(raw_path, actual_count, height, width, run_dir)
+    elif storage_mode == "memmap_raw":
+        if frames_buffer is None:
+            raise RuntimeError("memmap_raw 缓冲区尚未初始化。")
+        frames = frames_buffer[:actual_count]
+        _save_capture_sample_images(frames, run_dir)
+        raw_write_ms = _finalize_memmap_raw(raw_path, raw_temp_path, frames_buffer, actual_count)
+    else:
+        if frames_buffer is None:
+            raise RuntimeError("ram_then_raw 缓冲区尚未初始化。")
+        frames = frames_buffer[:actual_count]
+        raw_write_ms = _write_raw_frames_from_ram(raw_path, frames)
+        _save_capture_sample_images(frames, run_dir)
+
+    _write_capture_timestamps(timestamps_path, timestamp_rows)
+    _write_missing_frames(missing_frames_path, missing_frame_rows)
+
+    raw_file_size = raw_path.stat().st_size if raw_path.exists() else 0
+    metadata = {
+        "width": width,
+        "height": height,
+        "channels": 1,
+        "dtype": "uint8",
+        "storage_mode": storage_mode,
+        "frame_count": actual_count,
+        "frame_bytes": int(width * height),
+        "raw_file": raw_path.name,
+        "expected_fps": expected_fps,
+        "actual_camera_fps": actual_camera_fps,
+        "actual_camera_fps_source": actual_camera_fps_source,
+        "nominal_frame_period_s": 1.0 / actual_camera_fps,
+        "analysis_time_source": analysis_time_source,
+        "capture_duration_s": (
+            None if capture_duration_s is None else float(capture_duration_s)
+        ),
+        "first_frame_id": int(timestamp_rows[0]["frame_id"]),
+        "last_frame_id": int(timestamp_rows[-1]["frame_id"]),
+        "first_host_ns": int(timestamp_rows[0]["host_ns"]),
+        "last_host_ns": int(timestamp_rows[-1]["host_ns"]),
+        "first_camera_timestamp_raw": timestamp_rows[0]["camera_timestamp_raw"],
+        "last_camera_timestamp_raw": timestamp_rows[-1]["camera_timestamp_raw"],
+        "missing_frame_count": len(missing_frame_rows),
+        "gap_event_count": sum(
+            1 for row in timestamp_rows if int(row.get("missing_before", 0)) > 0
+        ),
+        "maximum_missing_run": max(
+            (int(row.get("missing_before", 0)) for row in timestamp_rows),
+            default=0,
+        ),
+        "missing_frames_csv": missing_frames_path.name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _write_capture_summary(
+        summary_path,
+        timestamp_rows,
+        copy_times_ms,
+        capture_elapsed_s,
+        raw_write_ms,
+        raw_file_size,
+        actual_camera_fps,
+        actual_camera_fps_source,
+        analysis_time_source,
+        missing_frames_path,
+    )
+
+    stats = _capture_summary_values(timestamp_rows)
+    print(
+        "[采集] 完成："
+        f"{stats['frame_count']} 帧，"
+        f"采集缺帧率 {stats['missing_rate'] or 0.0:.2%}。"
+    )
+    print(f"[采集] 输出目录：{run_dir}")
+    return run_dir
+
+
+def run_vision_offline() -> Path:
+    """读取 vision_capture 保存的 RAW 原始帧，并离线逐帧完整识别。"""
+
+    capture_dir = _resolve_raw_capture_dir()
+    metadata_path = capture_dir / "capture_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expected_count = int(metadata["frame_count"])
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = config.OUTPUT_ROOT / f"vision_offline_{timestamp}"
+    debug_dir = run_dir / "debug_images"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if config.SAVE_DEBUG_IMAGE:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+    result_path = run_dir / "vision_results.txt"
+    processor = VisionProcessor()
+    processed_count = 0
+    checker_valid_count = 0
+    saved_debug_count = 0
+    offline_start_ns = time.perf_counter_ns()
+
+    with RawCaptureSource(capture_dir) as source, result_path.open(
+        "w",
+        encoding="utf-8",
+        buffering=1,
+    ) as file:
+        meta = {
+            "kind": "META",
+            "host_ns": time.perf_counter_ns(),
+            "mode": "vision_offline",
+            "source_capture_dir": str(capture_dir),
+            "vision_source": "raw_capture",
+            "vision_method": config.VISION_METHOD,
+            "raw_frame_count": expected_count,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        file.write(_json_line(meta) + "\n")
+
+        print(
+            f"[离线识别] 开始处理 {expected_count} 帧；"
+            f"每 {config.OFFLINE_PROGRESS_EVERY_N_FRAMES} 帧输出一次进度。",
+            flush=True,
+        )
+
+        for packet in source:
+            result, debug = processor.process_frame(packet)
+            file.write(_json_line(result) + "\n")
+            processed_count += 1
+            checker_valid_count += int(bool(result.get("checker_is_valid", False)))
+
+            should_save = (
+                config.SAVE_DEBUG_IMAGE
+                and packet.frame_id % config.DEBUG_IMAGE_EVERY_N_FRAMES == 0
+                and saved_debug_count < config.MAX_DEBUG_IMAGES
+            )
+            if should_save:
+                cv2.imwrite(str(debug_dir / f"frame_{packet.frame_id:08d}.jpg"), debug)
+                saved_debug_count += 1
+
+            if config.OFFLINE_SHOW_PREVIEW:
+                cv2.imshow("UR10 vibration offline vision", _resize_for_preview(debug))
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    print("[离线识别警告] 操作者提前结束，结果将不完整。")
+                    break
+
+            if (
+                processed_count == 1
+                or processed_count % config.OFFLINE_PROGRESS_EVERY_N_FRAMES == 0
+                or processed_count == expected_count
+            ):
+                elapsed_s = _elapsed_ms(offline_start_ns) / 1000.0
+                fps = processed_count / elapsed_s if elapsed_s > 0 else math.nan
+                print(
+                    "[离线识别] 进度："
+                    f"{processed_count}/{expected_count} 帧，"
+                    f"当前帧号 {packet.frame_id}，"
+                    f"{fps:.2f} fps。",
+                    flush=True,
+                )
+
+    if config.OFFLINE_SHOW_PREVIEW:
+        cv2.destroyAllWindows()
+
+    if processed_count != expected_count:
+        raise RuntimeError(
+            f"离线结果 VISION 记录数 {processed_count} 与采集 frame_count={expected_count} 不一致。"
+        )
+
+    success_rate = checker_valid_count / processed_count if processed_count else 0.0
+    print(
+        "[离线识别] 完成："
+        f"处理 {processed_count} 帧，"
+        f"有效棋盘格 {checker_valid_count} 帧，"
+        f"成功率 {success_rate:.2%}。"
+    )
+    print(f"[离线识别] 结果：{result_path}")
+    return run_dir
 
 
 def run_vision_test() -> Path:

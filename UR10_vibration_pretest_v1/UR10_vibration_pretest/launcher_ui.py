@@ -59,6 +59,22 @@ class LauncherApp:
         )
         self.vision_button.pack(side=LEFT, padx=(0, 8))
 
+        self.capture_button = Button(
+            button_row,
+            text="高速采集",
+            command=lambda: self.start_mode("vision_capture"),
+            width=16,
+        )
+        self.capture_button.pack(side=LEFT, padx=(0, 8))
+
+        self.offline_button = Button(
+            button_row,
+            text="离线识别",
+            command=lambda: self.start_mode("vision_offline"),
+            width=16,
+        )
+        self.offline_button.pack(side=LEFT, padx=(0, 8))
+
         self.dry_run_button = Button(
             button_row,
             text="轨迹 dry-run",
@@ -111,6 +127,8 @@ class LauncherApp:
 
         state = "disabled" if running else "normal"
         self.vision_button.configure(state=state)
+        self.capture_button.configure(state=state)
+        self.offline_button.configure(state=state)
         self.dry_run_button.configure(state=state)
         self.analyze_button.configure(state=state)
         self.stop_button.configure(state="normal" if running else "disabled")

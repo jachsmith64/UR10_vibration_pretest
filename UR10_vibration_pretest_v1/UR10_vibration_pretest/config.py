@@ -53,6 +53,8 @@ RUN_MODE = "vision_test"
 # 每个模式对应一类实验任务；写错模式名时，程序会在启动阶段停止，而不是跑到一半才失败。
 VALID_RUN_MODES: Final[set[str]] = {
     "vision_test",    # 只测图像读取、标志识别和位移计算。
+    "vision_capture", # 只高速采集相机原始帧，保存为 RAW，尽量少做额外处理。
+    "vision_offline", # 读取 vision_capture 的 RAW 结果，再离线逐帧完整识别。
     "robot_dry_run",  # 只生成并检查轨迹，不导入 UR 库，也不连接真机。
     "robot_test",     # 连接 UR，默认只读取状态；必须再次开关才允许低速运动。
     "experiment",     # 相机、UR 和记录进程共同运行的正式预实验。
@@ -98,7 +100,7 @@ IMAGE_FOLDER_FPS = 132.0
 # 本段控制“采样率偏差是否提示”。
 # 输入：分析阶段从 analysis_time_s 估计出的真实 fps。
 # 输出：正常接近 132 fps 时不提示；偏差超过容差或出现大间隔时写入摘要并在终端提醒。
-EXPECTED_VISION_FPS: float | None = 132.0
+EXPECTED_VISION_FPS: float | None = 132.23
 FPS_WARNING_RELATIVE_TOLERANCE = 0.03
 FPS_WARNING_ABSOLUTE_TOLERANCE_HZ = 1.0
 FRAME_GAP_WARNING_FACTOR = 2.5
@@ -126,6 +128,24 @@ MAX_DEBUG_IMAGES = 300
 ENABLE_VISION_TIMING = True
 VISION_TIMING_WARMUP_FRAMES = 3
 SAVE_PER_FRAME_TIMING = True
+
+# 本段控制“双阶段视觉预实验”的高速采集阶段。
+# 输入：海康相机实时 Mono8 图像；输出：outputs/vision_capture_时间戳 中的 frames.raw 和时间戳文件。
+# 实验作用：先用尽量轻的流程保留相机原始帧，之后再用 vision_offline 慢慢逐帧完整识别。
+CAPTURE_DURATION_S: float | None = None
+CAPTURE_START_COUNTDOWN_S = 3.0
+# stream_raw 会边采集边追加写 frames.raw.tmp；
+# memmap_raw 会复制到内存映射文件；
+# ram_then_raw 会先放 RAM，结束后再整块写 RAW，避免采集循环被写盘拖慢。
+CAPTURE_STORAGE_MODE = "stream_raw"
+CAPTURE_RAW_WRITE_CHUNK_FRAMES = 64
+CAPTURE_REQUIRE_MONO8 = True
+CAPTURE_SAVE_SAMPLE_IMAGES = True
+CAPTURE_SHOW_PREVIEW = True
+CAPTURE_PREVIEW_FPS = 20.0
+RAW_CAPTURE_DIR: Path | None = None
+OFFLINE_SHOW_PREVIEW = False
+OFFLINE_PROGRESS_EVERY_N_FRAMES = 25
 
 # 本段是正式实验专用的额外保护。
 # 输入：完整实验中的实时 debug 图；输出：是否允许边实验边落盘保存质检图。
@@ -732,6 +752,36 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if VISION_TIMING_WARMUP_FRAMES < 0:
         raise ValueError("VISION_TIMING_WARMUP_FRAMES 不能为负数。")
+
+    if CAPTURE_DURATION_S is not None and CAPTURE_DURATION_S <= 0:
+        raise ValueError("CAPTURE_DURATION_S 必须为 None 或大于 0。")
+
+    if CAPTURE_START_COUNTDOWN_S < 0:
+        raise ValueError("CAPTURE_START_COUNTDOWN_S 不能为负数。")
+
+    if CAPTURE_STORAGE_MODE not in {"stream_raw", "memmap_raw", "ram_then_raw"}:
+        raise ValueError(
+            "CAPTURE_STORAGE_MODE 只允许 'stream_raw'、'memmap_raw' 或 'ram_then_raw'。"
+        )
+
+    if CAPTURE_DURATION_S is None and CAPTURE_STORAGE_MODE != "stream_raw":
+        raise ValueError("CAPTURE_DURATION_S=None 时，CAPTURE_STORAGE_MODE 必须为 'stream_raw'。")
+
+    if CAPTURE_RAW_WRITE_CHUNK_FRAMES < 1:
+        raise ValueError("CAPTURE_RAW_WRITE_CHUNK_FRAMES 必须至少为 1。")
+
+    if CAPTURE_PREVIEW_FPS <= 0:
+        raise ValueError("CAPTURE_PREVIEW_FPS 必须大于 0。")
+
+    if OFFLINE_PROGRESS_EVERY_N_FRAMES < 1:
+        raise ValueError("OFFLINE_PROGRESS_EVERY_N_FRAMES 必须至少为 1。")
+
+    if selected_mode == "vision_offline" and RAW_CAPTURE_DIR is not None:
+        capture_dir = Path(RAW_CAPTURE_DIR).expanduser()
+        if not capture_dir.is_absolute():
+            capture_dir = (PROJECT_DIR / capture_dir).resolve()
+        if not capture_dir.exists() or not capture_dir.is_dir():
+            raise ValueError(f"RAW_CAPTURE_DIR 不存在或不是文件夹：{capture_dir}")
 
     if not 0 <= STEADY_MOTION_TRIM_FRACTION < 0.5:
         raise ValueError("STEADY_MOTION_TRIM_FRACTION 必须在 [0, 0.5) 范围内。")

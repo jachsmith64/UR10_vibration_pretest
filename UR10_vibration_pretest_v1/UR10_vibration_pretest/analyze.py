@@ -321,10 +321,13 @@ def extract_vision_series(
 
         # 本段决定这一帧是否真正进入分析。
         # vision_test 优先使用 analysis_time_s；正式 experiment 可用 host_ns 与机器人记录对时。
-        if math.isfinite(host_ns) and math.isfinite(displacement):
-            time_values.append(
-                analysis_time_s if math.isfinite(analysis_time_s) else host_ns * 1e-9
-            )
+        if math.isfinite(displacement) and (
+            math.isfinite(analysis_time_s) or math.isfinite(host_ns)
+        ):
+            if math.isfinite(analysis_time_s):
+                time_values.append(analysis_time_s)
+            else:
+                time_values.append(host_ns * 1e-9)
             displacement_values.append(displacement)
             quality_values.append(quality)
 

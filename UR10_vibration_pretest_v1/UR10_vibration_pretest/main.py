@@ -259,6 +259,30 @@ def run_vision_test_mode() -> Path:
     return run_vision_test()
 
 
+def run_vision_capture_mode() -> Path:
+    """
+    用户选择 vision_capture 后进入这里。
+
+    这个模式只高速采集海康相机原始 Mono8 帧到 RAW 文件，不做棋盘格识别，不连接机器人。
+    """
+
+    from camera import run_vision_capture
+
+    return run_vision_capture()
+
+
+def run_vision_offline_mode() -> Path:
+    """
+    用户选择 vision_offline 后进入这里。
+
+    这个模式读取 vision_capture 保存的 RAW 帧，离线逐帧完整执行现有视觉识别。
+    """
+
+    from camera import run_vision_offline
+
+    return run_vision_offline()
+
+
 def run_robot_dry_run_mode() -> Path:
     """
     用户选择 robot_dry_run 后进入这里。
@@ -595,6 +619,12 @@ def main() -> Path:
     # 实验作用：保证一次运行只做一类事情，不会同时误跑视觉测试和真机实验。
     if selected_mode == "vision_test":
         return run_vision_test_mode()
+
+    if selected_mode == "vision_capture":
+        return run_vision_capture_mode()
+
+    if selected_mode == "vision_offline":
+        return run_vision_offline_mode()
 
     if selected_mode == "robot_dry_run":
         return run_robot_dry_run_mode()
