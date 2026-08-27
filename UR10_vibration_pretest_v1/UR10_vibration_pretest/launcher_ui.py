@@ -68,6 +68,7 @@ class LauncherApp:
         self._build_log_section(root)
 
         self.root.after(100, self.drain_output_queue)
+        self.root.after(350, self.show_usage_guide)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_hardware_section(self, root: Tk) -> None:
@@ -248,6 +249,14 @@ class LauncherApp:
         )
         self.outputs_button.pack(side=LEFT, padx=(0, 8))
 
+        self.guide_button = Button(
+            button_row,
+            text="操作说明",
+            command=self.show_usage_guide,
+            width=16,
+        )
+        self.guide_button.pack(side=LEFT, padx=(0, 8))
+
         self.stop_button = Button(
             button_row,
             text="停止当前任务",
@@ -415,6 +424,19 @@ class LauncherApp:
             title,
             summary
             + "\n\n请确认：索尼相机已经开始录像；机械臂周围无人；方向和位移正确；急停可立即触及。",
+        )
+
+    def show_usage_guide(self) -> None:
+        """给第一次使用启动器的人显示简短操作顺序。"""
+
+        messagebox.showinfo(
+            "操作说明",
+            "1. 先点击“检测机械臂通信（不会运动）”。通过后才会解锁三个运动实验。\n\n"
+            "2. 做运动实验前，先手动开始索尼相机录像，再填写速度、时间、方向等参数。\n\n"
+            "3. 点击对应实验按钮后，确认弹窗中的安全项。工业相机会开始保存 RAW，随后按提示打开并关闭手机手电筒。\n\n"
+            "4. 检测到手电筒并等待画面恢复后，机械臂才会开始一次往返运动；结束后工业相机会继续记录 1 秒并自动封口保存。\n\n"
+            "5. 需要停止时点“停止当前任务”，请等待窗口提示安全收尾完成；真实危险以示教器急停/安全停止为准。\n\n"
+            "6. 实验结束后再手动停止索尼相机录像，结果在 outputs 目录中查看。",
         )
 
     def _start_motion(self, mode: str, args: list[str], summary: str) -> None:
