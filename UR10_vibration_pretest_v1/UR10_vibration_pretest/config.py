@@ -344,7 +344,7 @@ HIK_CAMERA_SERIAL = ""
 # 输入：官方 Samples/Python/MvImport 路径；输出：运行时追加到 sys.path 的目录。
 # 实验作用：只在 hik_camera 模式需要；离线图片和视频流程完全不依赖它。
 HIK_MVS_IMPORT_PATH: str | None = (
-    r"D:\SOFTWARE\MindVision_cs028_10UM\MVS\Development\Samples\Python\MvImport"
+    r"D:\Software\MVScamera\MVS\Development\Samples\Python\MvImport"
 )
 
 # 本段控制相机成像亮度。
