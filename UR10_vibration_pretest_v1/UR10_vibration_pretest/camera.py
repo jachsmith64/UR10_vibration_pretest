@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from queue import Full
-from typing import Any, Iterator, TypedDict, cast
+from typing import Any, Callable, Iterator, TypedDict, cast
 
 import cv2
 import numpy as np
@@ -3132,12 +3132,24 @@ def _preview_capture_frame(frame: np.ndarray, window_name: str) -> bool:
     return key in (27, ord("q"))
 
 
-def run_vision_capture() -> Path:
-    """高速采集海康相机 Mono8 原始帧，并保存为 RAW。"""
+def _run_raw_capture_core(
+    run_dir: Path,
+    *,
+    capture_duration_s: float | None,
+    start_countdown_s: float,
+    stop_requested: Callable[[], bool],
+    before_capture: Callable[[Iterator[FramePacket], FramePacket], None] | None = None,
+    on_captured_frame: Callable[[FramePacket, np.ndarray, int], None] | None = None,
+    on_preview_stop: Callable[[], None] | None = None,
+    preview_window_name: str = "UR10 raw capture preview",
+    sample_output_dir: Path | None = None,
+    metadata_extra: dict[str, Any] | None = None,
+) -> Path:
+    """可复用的 Mono8 RAW 采集核心；不改变时间戳和缺帧写法。"""
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = config.OUTPUT_ROOT / f"vision_capture_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    sample_output_dir = sample_output_dir or run_dir
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
 
     raw_path = run_dir / "frames.raw"
     raw_temp_path = raw_path.with_name(raw_path.name + ".tmp")
@@ -3147,7 +3159,6 @@ def run_vision_capture() -> Path:
     summary_path = run_dir / "capture_summary.txt"
 
     storage_mode = str(config.CAPTURE_STORAGE_MODE)
-    capture_duration_s = config.CAPTURE_DURATION_S
     expected_fps = float(config.EXPECTED_VISION_FPS or 132.0)
     expected_frames = (
         int(math.ceil(capture_duration_s * expected_fps))
@@ -3172,8 +3183,6 @@ def run_vision_capture() -> Path:
     actual_camera_fps_source = "config.EXPECTED_VISION_FPS"
     analysis_time_source = "frame_id_fps_fallback"
 
-    print("[采集] 高速采集模式：只保存原始帧，不做棋盘格识别。")
-    _clear_capture_stop_request()
     try:
         with HikCameraSource() as source:
             iterator = iter(source)
@@ -3195,6 +3204,9 @@ def run_vision_capture() -> Path:
                 )
 
             height, width = int(first_frame.shape[0]), int(first_frame.shape[1])
+            if before_capture is not None:
+                before_capture(iterator, first_packet)
+
             if storage_mode == "stream_raw":
                 raw_stream = raw_temp_path.open("wb")
             elif storage_mode == "memmap_raw":
@@ -3220,18 +3232,18 @@ def run_vision_capture() -> Path:
                     ) from exc
 
             if config.CAPTURE_SHOW_PREVIEW:
-                _preview_capture_frame(first_frame, "UR10 raw capture preview")
+                _preview_capture_frame(first_frame, preview_window_name)
 
-            countdown = float(config.CAPTURE_START_COUNTDOWN_S)
+            countdown = float(start_countdown_s)
             if countdown > 0:
                 print(f"[采集] {countdown:.1f} 秒后开始正式采集。")
                 countdown_deadline = time.perf_counter() + countdown
                 while time.perf_counter() < countdown_deadline:
-                    if _capture_stop_requested():
+                    if stop_requested():
                         print("[采集] 倒计时期间收到停止请求。")
                         break
                     time.sleep(0.05)
-                if _capture_stop_requested():
+                if stop_requested():
                     raise KeyboardInterrupt
 
             capture_start_ns = time.perf_counter_ns()
@@ -3245,8 +3257,8 @@ def run_vision_capture() -> Path:
             next_preview_ns = capture_start_ns
 
             while True:
-                if _capture_stop_requested():
-                    print("[采集] 收到启动器停止请求，正在结束采集并保存已采集帧。")
+                if stop_requested():
+                    print("[采集] 收到停止请求，正在结束采集并保存已采集帧。")
                     break
                 if deadline_ns is not None and time.perf_counter_ns() >= deadline_ns:
                     break
@@ -3287,14 +3299,18 @@ def run_vision_capture() -> Path:
                         ),
                     }
                 )
+                if on_captured_frame is not None:
+                    on_captured_frame(packet, frame, captured_count)
                 captured_count += 1
 
                 if (
                     config.CAPTURE_SHOW_PREVIEW
                     and time.perf_counter_ns() >= next_preview_ns
                 ):
-                    if _preview_capture_frame(frame, "UR10 raw capture preview"):
+                    if _preview_capture_frame(frame, preview_window_name):
                         print("[采集] 预览窗口请求停止采集。")
+                        if on_preview_stop is not None:
+                            on_preview_stop()
                         break
                     next_preview_ns += preview_interval_ns
 
@@ -3305,10 +3321,9 @@ def run_vision_capture() -> Path:
             raw_stream.close()
         if config.CAPTURE_SHOW_PREVIEW:
             try:
-                cv2.destroyWindow("UR10 raw capture preview")
+                cv2.destroyWindow(preview_window_name)
             except cv2.error:
                 pass
-        _clear_capture_stop_request()
 
     if not timestamp_rows:
         raise RuntimeError("高速采集没有保存到任何有效帧。")
@@ -3323,19 +3338,25 @@ def run_vision_capture() -> Path:
         raw_write_start_ns = time.perf_counter_ns()
         raw_temp_path.replace(raw_path)
         raw_write_ms = _elapsed_ms(raw_write_start_ns)
-        _save_capture_sample_images_from_raw(raw_path, actual_count, height, width, run_dir)
+        _save_capture_sample_images_from_raw(
+            raw_path,
+            actual_count,
+            height,
+            width,
+            sample_output_dir,
+        )
     elif storage_mode == "memmap_raw":
         if frames_buffer is None:
             raise RuntimeError("memmap_raw 缓冲区尚未初始化。")
         frames = frames_buffer[:actual_count]
-        _save_capture_sample_images(frames, run_dir)
+        _save_capture_sample_images(frames, sample_output_dir)
         raw_write_ms = _finalize_memmap_raw(raw_path, raw_temp_path, frames_buffer, actual_count)
     else:
         if frames_buffer is None:
             raise RuntimeError("ram_then_raw 缓冲区尚未初始化。")
         frames = frames_buffer[:actual_count]
         raw_write_ms = _write_raw_frames_from_ram(raw_path, frames)
-        _save_capture_sample_images(frames, run_dir)
+        _save_capture_sample_images(frames, sample_output_dir)
 
     _write_capture_timestamps(timestamps_path, timestamp_rows)
     _write_missing_frames(missing_frames_path, missing_frame_rows)
@@ -3375,6 +3396,8 @@ def run_vision_capture() -> Path:
         "missing_frames_csv": missing_frames_path.name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if metadata_extra:
+        metadata.update(metadata_extra)
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -3400,6 +3423,24 @@ def run_vision_capture() -> Path:
     )
     print(f"[采集] 输出目录：{run_dir}")
     return run_dir
+
+
+def run_vision_capture() -> Path:
+    """高速采集海康相机 Mono8 原始帧，并保存为 RAW。"""
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = config.OUTPUT_ROOT / f"vision_capture_{timestamp}"
+    print("[采集] 高速采集模式：只保存原始帧，不做棋盘格识别。")
+    _clear_capture_stop_request()
+    try:
+        return _run_raw_capture_core(
+            run_dir,
+            capture_duration_s=config.CAPTURE_DURATION_S,
+            start_countdown_s=float(config.CAPTURE_START_COUNTDOWN_S),
+            stop_requested=_capture_stop_requested,
+        )
+    finally:
+        _clear_capture_stop_request()
 
 
 def run_vision_offline() -> Path:
@@ -3763,6 +3804,243 @@ def _put_record(record_queue: Any, record: dict[str, Any], stop_event: Any) -> b
         # 输出 stop_event，让机器人和主程序也尽快进入安全收尾。
         stop_event.set()
         return False
+
+
+def _record_camera_event(record_queue: Any, stop_event: Any, name: str, **extra: Any) -> None:
+    """给新相对运动实验写入统一事件。"""
+
+    if not _put_record(
+        record_queue,
+        {
+            "kind": "EVENT",
+            "host_ns": time.perf_counter_ns(),
+            "name": name,
+            **extra,
+        },
+        stop_event,
+    ):
+        raise RuntimeError("记录队列已满，相机事件无法写入。")
+
+
+def _sparse_brightness_metrics(frame: np.ndarray) -> tuple[float, float]:
+    """在低开销稀疏采样图上计算亮度均值和高亮像素比例。"""
+
+    sample = frame[::16, ::16]
+    mean_brightness = float(np.mean(sample))
+    saturation_ratio = float(np.mean(sample >= int(config.FLASH_SATURATION_THRESHOLD)))
+    return mean_brightness, saturation_ratio
+
+
+def relative_motion_raw_camera_worker(
+    record_queue: Any,
+    error_queue: Any,
+    run_dir: Path,
+    stop_event: Any,
+    camera_ready: Any,
+    capture_start: Any,
+    vision_recovered: Any,
+    camera_stop: Any,
+    camera_finished: Any,
+) -> None:
+    """
+    三个相对运动实验的工业相机 RAW 子进程。
+
+    相机 ready 前后只消费帧；capture_start 之后才开始写 RAW，并用稀疏亮度检测手电筒。
+    """
+
+    camera_dir = Path(run_dir) / "camera"
+    sample_dir = camera_dir / "sample_frames"
+    failure: dict[str, str] = {}
+    baseline_samples: list[tuple[float, float, int]] = []
+    gate: dict[str, Any] = {
+        "state": "baseline",
+        "baseline_start_ns": None,
+        "baseline_mean": None,
+        "baseline_mad": None,
+        "baseline_saturation": None,
+        "flash_wait_start_ns": None,
+        "flash_on_start_ns": None,
+        "flash_off_ns": None,
+        "recovery_stable_start_ns": None,
+    }
+
+    def seconds_since(start_ns: int | None, now_ns: int) -> float:
+        if start_ns is None:
+            return 0.0
+        return (now_ns - start_ns) / 1_000_000_000.0
+
+    def fail_after_sealing(message: str) -> None:
+        if not failure:
+            failure["message"] = message
+            stop_event.set()
+
+    def before_capture(iterator: Iterator[FramePacket], first_packet: FramePacket) -> None:
+        if first_packet.frame.ndim != 2 or first_packet.frame.dtype != np.uint8:
+            raise RuntimeError("相对运动 RAW 采集要求 Mono8 uint8 图像。")
+        _record_camera_event(record_queue, stop_event, "camera_ready")
+        print("[状态] 正在准备工业相机", flush=True)
+        camera_ready.set()
+        while not capture_start.is_set():
+            if stop_event.is_set():
+                return
+            next(iterator)
+
+    def on_preview_stop() -> None:
+        fail_after_sealing("工业相机预览窗口收到 q/Esc，已请求整套实验安全停止。")
+
+    def on_frame(packet: FramePacket, frame: np.ndarray, capture_index: int) -> None:
+        now_ns = int(packet.host_ns)
+        mean_brightness, saturation_ratio = _sparse_brightness_metrics(frame)
+        state = str(gate["state"])
+
+        if state == "baseline":
+            if gate["baseline_start_ns"] is None:
+                gate["baseline_start_ns"] = now_ns
+                _record_camera_event(record_queue, stop_event, "camera_recording_started")
+                print("[状态] 工业相机开始保存", flush=True)
+            baseline_samples.append((mean_brightness, saturation_ratio, now_ns))
+            if seconds_since(gate["baseline_start_ns"], now_ns) >= float(
+                config.BRIGHTNESS_BASELINE_SECONDS
+            ):
+                means = np.asarray([item[0] for item in baseline_samples], dtype=float)
+                sats = np.asarray([item[1] for item in baseline_samples], dtype=float)
+                baseline_mean = float(np.median(means))
+                baseline_mad = max(
+                    float(np.median(np.abs(means - baseline_mean))),
+                    1.0,
+                )
+                baseline_saturation = float(np.median(sats))
+                gate.update(
+                    {
+                        "state": "wait_flash_on",
+                        "baseline_mean": baseline_mean,
+                        "baseline_mad": baseline_mad,
+                        "baseline_saturation": baseline_saturation,
+                        "flash_wait_start_ns": now_ns,
+                    }
+                )
+                _record_camera_event(
+                    record_queue,
+                    stop_event,
+                    "brightness_baseline_ready",
+                    baseline_mean=baseline_mean,
+                    baseline_mad=baseline_mad,
+                    baseline_saturation=baseline_saturation,
+                )
+                _record_camera_event(record_queue, stop_event, "flash_wait_started")
+                print("[状态] 请现在打开手机手电筒，再关闭，正在等待同步信号。", flush=True)
+            return
+
+        baseline_mean = float(gate["baseline_mean"])
+        baseline_mad = float(gate["baseline_mad"])
+        baseline_saturation = float(gate["baseline_saturation"])
+        flash_mean_threshold = max(
+            baseline_mean * (1.0 + float(config.FLASH_MEAN_RELATIVE_INCREASE)),
+            baseline_mean + float(config.FLASH_MEAN_ABSOLUTE_INCREASE),
+            baseline_mean + float(config.FLASH_MEAN_MAD_MULTIPLIER) * baseline_mad,
+        )
+        flash_saturation_threshold = (
+            baseline_saturation + float(config.FLASH_SATURATION_RELATIVE_INCREASE)
+        )
+        flash_is_on = (
+            mean_brightness >= flash_mean_threshold
+            or saturation_ratio >= flash_saturation_threshold
+        )
+        recovered = (
+            mean_brightness <= baseline_mean + float(config.FLASH_RECOVERY_MEAN_TOLERANCE)
+            and saturation_ratio
+            <= baseline_saturation + float(config.FLASH_RECOVERY_SATURATION_TOLERANCE)
+        )
+
+        if state == "wait_flash_on":
+            if seconds_since(gate["flash_wait_start_ns"], now_ns) > float(
+                config.FLASH_WAIT_TIMEOUT_SECONDS
+            ):
+                fail_after_sealing("5 秒内没有检测到手电筒同步信号，机械臂不会运动。")
+                return
+            if flash_is_on:
+                if gate["flash_on_start_ns"] is None:
+                    gate["flash_on_start_ns"] = now_ns
+                if seconds_since(gate["flash_on_start_ns"], now_ns) >= float(
+                    config.FLASH_MIN_DURATION_SECONDS
+                ):
+                    gate["state"] = "wait_flash_off"
+                    _record_camera_event(
+                        record_queue,
+                        stop_event,
+                        "flash_on_detected",
+                        capture_index=capture_index,
+                    )
+                    print("[状态] 已检测到手电筒", flush=True)
+            else:
+                gate["flash_on_start_ns"] = None
+            return
+
+        if state == "wait_flash_off":
+            if not flash_is_on:
+                gate["state"] = "recovering"
+                gate["flash_off_ns"] = now_ns
+                gate["recovery_stable_start_ns"] = None
+                _record_camera_event(
+                    record_queue,
+                    stop_event,
+                    "flash_off_detected",
+                    capture_index=capture_index,
+                )
+                print("[状态] 等待视野恢复", flush=True)
+            return
+
+        if state == "recovering":
+            if seconds_since(gate["flash_off_ns"], now_ns) > float(
+                config.FLASH_RECOVERY_TIMEOUT_SECONDS
+            ):
+                fail_after_sealing("手电筒关闭后视野没有在限定时间内稳定恢复。")
+                return
+            if recovered:
+                if gate["recovery_stable_start_ns"] is None:
+                    gate["recovery_stable_start_ns"] = now_ns
+                if seconds_since(gate["recovery_stable_start_ns"], now_ns) >= float(
+                    config.VISION_RECOVERY_STABLE_SECONDS
+                ):
+                    gate["state"] = "done"
+                    vision_recovered.set()
+                    _record_camera_event(
+                        record_queue,
+                        stop_event,
+                        "vision_recovered",
+                        capture_index=capture_index,
+                    )
+                    print("[状态] 视野已恢复，机械臂即将运动", flush=True)
+            else:
+                gate["recovery_stable_start_ns"] = None
+
+    try:
+        _run_raw_capture_core(
+            camera_dir,
+            capture_duration_s=None,
+            start_countdown_s=0.0,
+            stop_requested=lambda: stop_event.is_set() or camera_stop.is_set(),
+            before_capture=before_capture,
+            on_captured_frame=on_frame,
+            on_preview_stop=on_preview_stop,
+            preview_window_name="UR10 relative motion raw capture",
+            sample_output_dir=sample_dir,
+            metadata_extra={"mode": "relative_motion_experiment"},
+        )
+        _record_camera_event(record_queue, stop_event, "camera_recording_stopped")
+        print("[状态] 正在保存RAW和时间戳", flush=True)
+        camera_finished.set()
+        if failure:
+            raise RuntimeError(failure["message"])
+    except Exception as exc:
+        try:
+            error_queue.put(
+                f"相对运动相机进程异常：{type(exc).__name__}: {exc}",
+                timeout=1.0,
+            )
+        except Full:
+            pass
+        stop_event.set()
 
 
 def camera_worker(

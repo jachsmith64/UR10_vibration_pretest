@@ -56,8 +56,12 @@ VALID_RUN_MODES: Final[set[str]] = {
     "vision_capture", # 只高速采集相机原始帧，保存为 RAW，尽量少做额外处理。
     "vision_offline", # 读取 vision_capture 的 RAW 结果，再离线逐帧完整识别。
     "robot_dry_run",  # 只生成并检查轨迹，不导入 UR 库，也不连接真机。
+    "robot_connection_test", # 只读检测 UR 通信，不创建控制接口、不发送运动命令。
     "robot_test",     # 连接 UR，默认只读取状态；必须再次开关才允许低速运动。
     "experiment",     # 相机、UR 和记录进程共同运行的正式预实验。
+    "x_line_experiment",  # 以当前 TCP 为 A 点，执行 X 方向往返相对运动并采 RAW。
+    "xy_line_experiment", # 以当前 TCP 为 A 点，执行 X-Y 倾斜直线往返并采 RAW。
+    "xy_l_experiment",    # 以当前 TCP 为 A 点，执行 X-Y 平面 L 折线往返并采 RAW。
     "analyze",        # 读取已有 TXT/JSONL 记录并生成振动分析结果。
 }
 
@@ -146,6 +150,23 @@ CAPTURE_PREVIEW_FPS = 20.0
 RAW_CAPTURE_DIR: Path | None = None
 OFFLINE_SHOW_PREVIEW = False
 OFFLINE_PROGRESS_EVERY_N_FRAMES = 25
+
+# 本段服务“手机手电筒同步标记”门控，只在三个相对运动实验中使用。
+# 输入：RAW 采集循环中 frame[::16, ::16] 的稀疏亮度统计；输出：是否允许机器人开始运动。
+# 实验作用：索尼相机由人手动录像，工业相机和索尼画面里的同一次亮度峰用于离线对齐。
+BRIGHTNESS_BASELINE_SECONDS = 0.5
+FLASH_WAIT_TIMEOUT_SECONDS = 5.0
+FLASH_MIN_DURATION_SECONDS = 0.2
+VISION_RECOVERY_STABLE_SECONDS = 1.0
+FLASH_RECOVERY_TIMEOUT_SECONDS = 5.0
+POST_MOTION_RECORD_SECONDS = 1.0
+FLASH_MEAN_RELATIVE_INCREASE = 0.25
+FLASH_MEAN_ABSOLUTE_INCREASE = 20.0
+FLASH_MEAN_MAD_MULTIPLIER = 8.0
+FLASH_SATURATION_THRESHOLD = 245
+FLASH_SATURATION_RELATIVE_INCREASE = 0.02
+FLASH_RECOVERY_MEAN_TOLERANCE = 8.0
+FLASH_RECOVERY_SATURATION_TOLERANCE = 0.01
 
 # 本段是正式实验专用的额外保护。
 # 输入：完整实验中的实时 debug 图；输出：是否允许边实验边落盘保存质检图。
@@ -356,6 +377,11 @@ ROBOT_CONNECT_TIMEOUT_S = 5.0
 # 实验作用：第一次接触实机必须保持 False，先确认连接、坐标读取和日志流程正常。
 ROBOT_TEST_ALLOW_MOTION = False
 
+# 本段专门保护“以当前 TCP 为 A 点”的三个相对运动实验。
+# 输入：实验室现场确认后的人工开关；输出：是否允许 x_line/xy_line/xy_l 三个新模式发送运动命令。
+# 实验作用：这些模式不依赖 POINT_A/B/C，但仍必须有独立的真机运动许可，默认绝不运动。
+ROBOT_RELATIVE_MOTION_ENABLED = False
+
 # 本段是所有真机运动前的总安全闸。
 # 输入：人工示教并确认后的 A/B/C 位姿和工作区；输出：是否允许 robot.py 发送运动命令。
 # 实验作用：防止示例坐标或未确认坐标被误发给机器人；只有现场逐点确认后才可改 True。
@@ -377,6 +403,11 @@ ROBOT_RTDE_FREQUENCY = -1.0
 # 输入：RTDE 持续读取到的机器人状态；输出：run_log.txt 中 robot_state 记录的时间序列。
 # 实验作用：125 Hz 足以覆盖当前预计 5-40 Hz 振动，同时控制文件体积。
 ROBOT_RECORD_HZ = 125.0
+
+# 本段服务只读机械臂通信检测。
+# 输入：检测持续时间；输出：robot_connection_test 按 ROBOT_RECORD_HZ 连续读取状态。
+# 实验作用：确认 RTDE Receive 能稳定读状态，且全程不创建控制接口、不发送任何运动命令。
+ROBOT_CONNECTION_TEST_SECONDS = 3.0
 
 
 # =============================================================================
@@ -413,6 +444,24 @@ BLEND_RADIUS_M = 0.005
 # 实验作用：在正式 experiment 前验证机器人可连接、可运动、可记录，但不直接跑完整实验速度。
 ROBOT_TEST_SPEED_M_S = 0.02
 ROBOT_TEST_ACCELERATION_M_S2 = 0.05
+
+# 本段服务三个相对运动实验的默认 UI 参数和安全范围。
+# 输入：启动器或命令行传入的 mm/s、秒、角度、方向；输出：main.py/robot.py 二次校验后的相对轨迹。
+# 实验作用：每次从当前实际 TCP 作为 A 点，只改 X/Y，不复用示例 POINT_A/B/C。
+ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S = 3.0
+ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S = 15.0
+ROBOT_EXPERIMENT_DEFAULT_X_ONE_WAY_TIME_S = 3.75
+ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S = 3.75
+ROBOT_EXPERIMENT_DEFAULT_ANGLE_DEG = 45.0
+ROBOT_EXPERIMENT_ACCELERATION_M_S2 = 0.01
+ROBOT_EXPERIMENT_MIN_SPEED_MM_S = 0.5
+ROBOT_EXPERIMENT_MAX_SPEED_MM_S = 10.0
+ROBOT_EXPERIMENT_MAX_SEGMENT_MM = 50.0
+ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S = 120.0
+ROBOT_EXPERIMENT_MAX_ANGLE_DEG = 90.0
+ROBOT_EXPERIMENT_STOP_SPEED_MM_S = 0.2
+ROBOT_RETURN_WARNING_MM = 0.5
+ROBOT_RELATIVE_BLEND_MM = 0.0
 
 # 本段给代码层面加一个 TCP 工作区边界。
 # 输入：待执行轨迹中的所有 TCP 点；输出：通过检查或拒绝执行。
@@ -707,17 +756,81 @@ def validate_config(run_mode: str | None = None) -> None:
     # 输入：当前运行模式、控制模式、执行器模式和机器人地址。
     # 输出：确认本版代码不会把“预留接口”误当成已经实现的正式在线控制。
     # 实验作用：SFC/servo 相关名称目前只作为接口占位；真机模式下误选这些值必须提前停止。
-    if selected_mode in {"robot_test", "experiment"} and CONTROL_MODE == "sfc":
+    robot_modes = {
+        "robot_connection_test",
+        "robot_test",
+        "experiment",
+        "x_line_experiment",
+        "xy_line_experiment",
+        "xy_l_experiment",
+    }
+    relative_motion_modes = {
+        "x_line_experiment",
+        "xy_line_experiment",
+        "xy_l_experiment",
+    }
+
+    if selected_mode in robot_modes and CONTROL_MODE == "sfc":
         raise ValueError(
             "当前版本只预留了 SFC 接口，尚未实现在线控制。"
             "为了避免把开环运动误当成 SFC，程序拒绝连接机器人。"
         )
 
-    if selected_mode == "experiment" and EXECUTOR_MODE != "open_loop":
-        raise ValueError("当前正式实验只实现 open_loop 轨迹执行器。")
+    if selected_mode in {"experiment", *relative_motion_modes} and EXECUTOR_MODE != "open_loop":
+        raise ValueError("当前正式/相对运动实验只实现 open_loop 轨迹执行器。")
 
-    if selected_mode in {"robot_test", "experiment"} and not ROBOT_HOST.strip():
+    if selected_mode in robot_modes and not ROBOT_HOST.strip():
         raise ValueError("真机模式必须填写非空 ROBOT_HOST。")
+
+    if ROBOT_CONNECTION_TEST_SECONDS <= 0:
+        raise ValueError("ROBOT_CONNECTION_TEST_SECONDS 必须为正数。")
+
+    if ROBOT_RECORD_HZ <= 0:
+        raise ValueError("ROBOT_RECORD_HZ 必须为正数。")
+
+    if ROBOT_EXPERIMENT_MIN_SPEED_MM_S <= 0:
+        raise ValueError("ROBOT_EXPERIMENT_MIN_SPEED_MM_S 必须为正数。")
+
+    if ROBOT_EXPERIMENT_MAX_SPEED_MM_S < ROBOT_EXPERIMENT_MIN_SPEED_MM_S:
+        raise ValueError("ROBOT_EXPERIMENT_MAX_SPEED_MM_S 不能小于最小速度。")
+
+    if ROBOT_EXPERIMENT_MAX_SEGMENT_MM <= 0:
+        raise ValueError("ROBOT_EXPERIMENT_MAX_SEGMENT_MM 必须为正数。")
+
+    if ROBOT_EXPERIMENT_ACCELERATION_M_S2 <= 0:
+        raise ValueError("ROBOT_EXPERIMENT_ACCELERATION_M_S2 必须为正数。")
+
+    if ROBOT_EXPERIMENT_STOP_SPEED_MM_S <= 0:
+        raise ValueError("ROBOT_EXPERIMENT_STOP_SPEED_MM_S 必须为正数。")
+
+    if ROBOT_RETURN_WARNING_MM <= 0:
+        raise ValueError("ROBOT_RETURN_WARNING_MM 必须为正数。")
+
+    for name, value in {
+        "BRIGHTNESS_BASELINE_SECONDS": BRIGHTNESS_BASELINE_SECONDS,
+        "FLASH_WAIT_TIMEOUT_SECONDS": FLASH_WAIT_TIMEOUT_SECONDS,
+        "FLASH_MIN_DURATION_SECONDS": FLASH_MIN_DURATION_SECONDS,
+        "VISION_RECOVERY_STABLE_SECONDS": VISION_RECOVERY_STABLE_SECONDS,
+        "FLASH_RECOVERY_TIMEOUT_SECONDS": FLASH_RECOVERY_TIMEOUT_SECONDS,
+        "POST_MOTION_RECORD_SECONDS": POST_MOTION_RECORD_SECONDS,
+        "FLASH_MEAN_ABSOLUTE_INCREASE": FLASH_MEAN_ABSOLUTE_INCREASE,
+        "FLASH_MEAN_MAD_MULTIPLIER": FLASH_MEAN_MAD_MULTIPLIER,
+        "FLASH_RECOVERY_MEAN_TOLERANCE": FLASH_RECOVERY_MEAN_TOLERANCE,
+    }.items():
+        if value <= 0:
+            raise ValueError(f"{name} 必须为正数。")
+
+    if not 0.0 <= FLASH_MEAN_RELATIVE_INCREASE <= 10.0:
+        raise ValueError("FLASH_MEAN_RELATIVE_INCREASE 必须在合理范围内。")
+
+    if not 0.0 <= FLASH_SATURATION_RELATIVE_INCREASE <= 1.0:
+        raise ValueError("FLASH_SATURATION_RELATIVE_INCREASE 必须在 0 到 1 之间。")
+
+    if not 0 <= FLASH_SATURATION_THRESHOLD <= 255:
+        raise ValueError("FLASH_SATURATION_THRESHOLD 必须在 0 到 255 之间。")
+
+    if not 0.0 <= FLASH_RECOVERY_SATURATION_TOLERANCE <= 1.0:
+        raise ValueError("FLASH_RECOVERY_SATURATION_TOLERANCE 必须在 0 到 1 之间。")
 
     # 本段检查视觉识别、时间轴和空间坐标参数。
     # 输入：棋盘格尺寸、圆点数量、滤波核、相机内参、fps 提示阈值、空间坐标开关等。

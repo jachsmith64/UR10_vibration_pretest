@@ -159,6 +159,7 @@ def validate_trajectory(
     trajectory: list[Waypoint],
     *,
     for_real_robot: bool,
+    pose_source: str = "absolute",
 ) -> list[str]:
     """
     对一条轨迹做启动前的纯软件安全检查。
@@ -227,10 +228,15 @@ def validate_trajectory(
 
         if length <= 1e-6:
             raise ValueError(f"{start.name}→{end.name} 两点位置重合。")
-        if length > config.MAX_SEGMENT_LENGTH_M:
+        max_segment_length_m = (
+            config.ROBOT_EXPERIMENT_MAX_SEGMENT_MM / 1000.0
+            if pose_source == "relative"
+            else config.MAX_SEGMENT_LENGTH_M
+        )
+        if length > max_segment_length_m:
             raise ValueError(
                 f"{start.name}→{end.name} 长 {length:.4f} m，"
-                f"超过 MAX_SEGMENT_LENGTH_M={config.MAX_SEGMENT_LENGTH_M:.4f} m。"
+                f"超过允许上限 {max_segment_length_m:.4f} m。"
             )
         messages.append(f"{start.name}→{end.name}: 线段长度 {length:.4f} m")
 
@@ -254,10 +260,23 @@ def validate_trajectory(
     # 本段只在真机流程中启用。
     # 输入：for_real_robot 和 ROBOT_POSES_CONFIRMED；输出：允许真机继续或拒绝示例点位。
     # 实验作用：dry-run 可以用示例点学习流程，但真机绝不能用未确认点位。
-    if for_real_robot and not config.ROBOT_POSES_CONFIRMED:
+    if pose_source not in {"absolute", "relative"}:
+        raise ValueError(f"未知 pose_source={pose_source!r}。")
+
+    if for_real_robot and pose_source == "absolute" and not config.ROBOT_POSES_CONFIRMED:
         raise PermissionError(
             "ROBOT_POSES_CONFIRMED=False。示例位姿只能用于 dry_run；"
             "请先用示教器确认 A/B/C 和真实工作区，再明确改为 True。"
+        )
+
+    if (
+        for_real_robot
+        and pose_source == "relative"
+        and not config.ROBOT_RELATIVE_MOTION_ENABLED
+    ):
+        raise PermissionError(
+            "ROBOT_RELATIVE_MOTION_ENABLED=False。三个相对运动实验默认禁止真机运动；"
+            "请在实验室完成通信测试和现场安全确认后再明确改为 True。"
         )
 
     return messages
@@ -342,6 +361,234 @@ def estimate_trajectory(trajectory: list[Waypoint]) -> dict[str, Any]:
         "xyz_min_m": positions.min(axis=0).tolist(),
         "xyz_max_m": positions.max(axis=0).tolist(),
     }
+
+
+def _direction_sign(value: str, axis: str) -> int:
+    """把 UI/命令行中的 +X/-X/+Y/-Y 转成符号。"""
+
+    expected = {f"+{axis}": 1, f"-{axis}": -1}
+    if value not in expected:
+        raise ValueError(f"{axis} 方向必须是 {sorted(expected)} 之一，实际为 {value!r}。")
+    return expected[value]
+
+
+def _finite_positive(name: str, value: float) -> float:
+    """校验一个有限正数参数。"""
+
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} 必须是有限正数。")
+    return value
+
+
+def _validate_speed_mm_s(name: str, value: float) -> float:
+    """校验 UI 输入速度，并返回 m/s。"""
+
+    speed_mm_s = _finite_positive(name, value)
+    if not (
+        config.ROBOT_EXPERIMENT_MIN_SPEED_MM_S
+        <= speed_mm_s
+        <= config.ROBOT_EXPERIMENT_MAX_SPEED_MM_S
+    ):
+        raise ValueError(
+            f"{name}={speed_mm_s:.3f} mm/s 超出允许范围 "
+            f"[{config.ROBOT_EXPERIMENT_MIN_SPEED_MM_S:.3f}, "
+            f"{config.ROBOT_EXPERIMENT_MAX_SPEED_MM_S:.3f}] mm/s。"
+        )
+    return speed_mm_s / 1000.0
+
+
+def _offset_pose(start_pose: list[float], dx_m: float, dy_m: float) -> list[float]:
+    """基于本次实际 A 点生成只改 X/Y、姿态保持不变的新 TCP 位姿。"""
+
+    pose = list(start_pose)
+    if len(pose) != 6:
+        raise ValueError("当前 TCP 位姿必须是 6 个数。")
+    pose[0] += float(dx_m)
+    pose[1] += float(dy_m)
+    return pose
+
+
+def _relative_parameters_for_json(parameters: dict[str, Any]) -> dict[str, Any]:
+    """把相对运动参数整理成 JSON 友好的纯数据。"""
+
+    return {
+        key: (float(value) if isinstance(value, (int, float)) else value)
+        for key, value in parameters.items()
+    }
+
+
+def build_relative_motion_trajectory(
+    experiment_mode: str,
+    start_pose: list[float],
+    parameters: dict[str, Any],
+) -> tuple[list[Waypoint], dict[str, Any]]:
+    """
+    根据本次实际 TCP 起点 A 和 UI 参数生成三种相对运动轨迹。
+
+    输出的最后一个 Waypoint 始终回到 A，且所有点保持 A 的 Rx/Ry/Rz。
+    """
+
+    acceleration = _finite_positive(
+        "acceleration_m_s2",
+        float(parameters.get("acceleration_m_s2", config.ROBOT_EXPERIMENT_ACCELERATION_M_S2)),
+    )
+    x_direction = str(parameters.get("x_direction", "+X"))
+    y_direction = str(parameters.get("y_direction", "+Y"))
+    sign_x = _direction_sign(x_direction, "X")
+    sign_y = _direction_sign(y_direction, "Y")
+    blend_m = float(parameters.get("blend_mm", config.ROBOT_RELATIVE_BLEND_MM)) / 1000.0
+    if not math.isfinite(blend_m) or blend_m < 0:
+        raise ValueError("blend_mm 必须是有限非负数。")
+
+    point_a = Waypoint(
+        "A",
+        list(start_pose),
+        config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S / 1000.0,
+        acceleration,
+        0.0,
+    )
+    waypoints: list[Waypoint]
+    computed: dict[str, Any] = {
+        "experiment_mode": experiment_mode,
+        "start_pose_a": list(start_pose),
+        "x_direction": x_direction,
+        "y_direction": y_direction,
+        "acceleration_m_s2": acceleration,
+        "input_parameters": _relative_parameters_for_json(parameters),
+    }
+
+    if experiment_mode == "x_line_experiment":
+        speed_m_s = _validate_speed_mm_s(
+            "speed_mm_s",
+            float(parameters.get("speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
+        )
+        total_time_s = _finite_positive(
+            "total_time_s",
+            float(parameters.get("total_time_s", config.ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S)),
+        )
+        if total_time_s > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
+            raise ValueError("total_time_s 超出允许上限。")
+        distance_m = speed_m_s * total_time_s / 2.0
+        point_b = Waypoint(
+            "B",
+            _offset_pose(start_pose, sign_x * distance_m, 0.0),
+            speed_m_s,
+            acceleration,
+            0.0,
+        )
+        point_a_return = Waypoint("A_return", list(start_pose), speed_m_s, acceleration, 0.0)
+        waypoints = [point_a, point_b, point_a_return]
+        computed.update(
+            {
+                "nominal_total_motion_time_s": total_time_s,
+                "one_way_distance_m": distance_m,
+                "dx_m": sign_x * distance_m,
+                "dy_m": 0.0,
+                "point_b": point_b.pose,
+            }
+        )
+    elif experiment_mode == "xy_line_experiment":
+        speed_m_s = _validate_speed_mm_s(
+            "speed_mm_s",
+            float(parameters.get("speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
+        )
+        total_time_s = _finite_positive(
+            "total_time_s",
+            float(parameters.get("total_time_s", config.ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S)),
+        )
+        angle_deg = float(parameters.get("angle_deg", config.ROBOT_EXPERIMENT_DEFAULT_ANGLE_DEG))
+        if (
+            not math.isfinite(angle_deg)
+            or not 0.0 <= angle_deg <= config.ROBOT_EXPERIMENT_MAX_ANGLE_DEG
+        ):
+            raise ValueError(
+                f"angle_deg 必须在 0 到 {config.ROBOT_EXPERIMENT_MAX_ANGLE_DEG:.1f} 之间。"
+            )
+        if total_time_s > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
+            raise ValueError("total_time_s 超出允许上限。")
+        distance_m = speed_m_s * total_time_s / 2.0
+        angle_rad = math.radians(angle_deg)
+        dx_m = sign_x * distance_m * math.cos(angle_rad)
+        dy_m = sign_y * distance_m * math.sin(angle_rad)
+        point_b = Waypoint(
+            "B",
+            _offset_pose(start_pose, dx_m, dy_m),
+            speed_m_s,
+            acceleration,
+            0.0,
+        )
+        point_a_return = Waypoint("A_return", list(start_pose), speed_m_s, acceleration, 0.0)
+        waypoints = [point_a, point_b, point_a_return]
+        computed.update(
+            {
+                "nominal_total_motion_time_s": total_time_s,
+                "one_way_distance_m": distance_m,
+                "angle_deg": angle_deg,
+                "dx_m": dx_m,
+                "dy_m": dy_m,
+                "point_b": point_b.pose,
+            }
+        )
+    elif experiment_mode == "xy_l_experiment":
+        x_speed_m_s = _validate_speed_mm_s(
+            "x_speed_mm_s",
+            float(parameters.get("x_speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
+        )
+        y_speed_m_s = _validate_speed_mm_s(
+            "y_speed_mm_s",
+            float(parameters.get("y_speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
+        )
+        x_time_s = _finite_positive(
+            "x_one_way_time_s",
+            float(parameters.get("x_one_way_time_s", config.ROBOT_EXPERIMENT_DEFAULT_X_ONE_WAY_TIME_S)),
+        )
+        y_time_s = _finite_positive(
+            "y_one_way_time_s",
+            float(parameters.get("y_one_way_time_s", config.ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S)),
+        )
+        if max(x_time_s, y_time_s) > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
+            raise ValueError("L 折线单段时间超出允许上限。")
+        dx_m = sign_x * x_speed_m_s * x_time_s
+        dy_m = sign_y * y_speed_m_s * y_time_s
+        point_b = Waypoint(
+            "B",
+            _offset_pose(start_pose, dx_m, 0.0),
+            x_speed_m_s,
+            acceleration,
+            blend_m,
+        )
+        point_c = Waypoint(
+            "C",
+            _offset_pose(start_pose, dx_m, dy_m),
+            y_speed_m_s,
+            acceleration,
+            0.0,
+        )
+        point_b_return = Waypoint(
+            "B_return",
+            point_b.pose,
+            y_speed_m_s,
+            acceleration,
+            0.0,
+        )
+        point_a_return = Waypoint("A_return", list(start_pose), x_speed_m_s, acceleration, 0.0)
+        waypoints = [point_a, point_b, point_c, point_b_return, point_a_return]
+        computed.update(
+            {
+                "nominal_total_motion_time_s": 2.0 * (x_time_s + y_time_s),
+                "dx_m": dx_m,
+                "dy_m": dy_m,
+                "point_b": point_b.pose,
+                "point_c": point_c.pose,
+                "blend_m": blend_m,
+            }
+        )
+    else:
+        raise ValueError(f"未知相对运动模式：{experiment_mode}")
+
+    validate_trajectory(waypoints, for_real_robot=False, pose_source="relative")
+    return waypoints, computed
 
 
 def _plot_trajectory(trajectory: list[Waypoint], output_path: Path) -> None:
@@ -695,6 +942,8 @@ class URRobot:
             "speed_scaling": float(
                 self._safe_call(self.receive, "getSpeedScaling", math.nan)
             ),
+            "robot_mode": self._safe_call(self.receive, "getRobotMode", None),
+            "safety_mode": self._safe_call(self.receive, "getSafetyMode", None),
             "runtime_state": self._safe_call(self.receive, "getRuntimeState", None),
             "robot_status_bits": self._safe_call(
                 self.receive,
@@ -925,6 +1174,162 @@ def require_operator_confirmation(purpose: str) -> None:
 # 6. robot_test：用户单独验证 UR 连接，默认只读状态不运动
 # =============================================================================
 
+def _dashboard_safety_status_is_normal(dashboard_info: dict[str, str]) -> bool | None:
+    """从 Dashboard 只读回复中判断 safety status 是否明确为 NORMAL。"""
+
+    status = dashboard_info.get("safety_status")
+    if not status:
+        return None
+    upper = status.upper()
+    if "NORMAL" in upper:
+        return True
+    if "PROTECTIVE" in upper or "SAFEGUARD" in upper or "FAULT" in upper:
+        return False
+    return None
+
+
+def _rtde_safety_mode_is_normal(state: dict[str, Any]) -> bool | None:
+    """保守判断 RTDE safety mode；缺字段时返回未知。"""
+
+    safety_mode = state.get("safety_mode")
+    if safety_mode is None:
+        return None
+    try:
+        # ur_rtde 常见枚举中 1 表示 NORMAL；未知非 1 值按异常处理。
+        return int(safety_mode) == 1
+    except (TypeError, ValueError):
+        return None
+
+
+def run_robot_connection_test() -> Path:
+    """
+    只读检测 UR 通信稳定性。
+
+    本函数只调用 robot.connect(require_control=False) 和 read_state()，不会构造轨迹，
+    不创建 RTDEControlInterface，也不会调用 move/stop 类运动接口。
+    """
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = config.OUTPUT_ROOT / f"robot_connection_test_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "robot_connection_log.txt"
+    summary_path = output_dir / "connection_summary.json"
+
+    robot = URRobot()
+    samples: list[dict[str, Any]] = []
+    read_errors: list[str] = []
+    started_ns = time.perf_counter_ns()
+    success = False
+    failure_reason = ""
+    status_printed = False
+
+    try:
+        robot.connect(require_control=False)
+        duration_s = float(config.ROBOT_CONNECTION_TEST_SECONDS)
+        period = 1.0 / float(config.ROBOT_RECORD_HZ)
+        deadline = time.perf_counter() + duration_s
+        next_sample = time.perf_counter()
+
+        while time.perf_counter() < deadline:
+            try:
+                samples.append(robot.read_state())
+            except Exception as exc:
+                read_errors.append(f"{type(exc).__name__}: {exc}")
+            next_sample += period
+            time.sleep(max(0.0, next_sample - time.perf_counter()))
+
+        elapsed_s = (time.perf_counter_ns() - started_ns) / 1_000_000_000.0
+        actual_hz = len(samples) / elapsed_s if elapsed_s > 0 else 0.0
+        expected_reads = max(1, int(duration_s * float(config.ROBOT_RECORD_HZ)))
+        enough_reads = len(samples) >= max(1, int(expected_reads * 0.8))
+        dashboard_safety_ok = _dashboard_safety_status_is_normal(robot.dashboard_info)
+        rtde_safety_ok = _rtde_safety_mode_is_normal(samples[-1]) if samples else None
+
+        if read_errors:
+            failure_reason = f"读取状态异常 {len(read_errors)} 次。"
+        elif not samples:
+            failure_reason = "没有成功读取任何机器人状态。"
+        elif not enough_reads:
+            failure_reason = (
+                f"成功读取次数 {len(samples)} 低于预期 {expected_reads} 的 80%。"
+            )
+        elif dashboard_safety_ok is False or rtde_safety_ok is False:
+            failure_reason = "机器人安全状态不是 NORMAL。"
+        else:
+            success = True
+
+        summary = {
+            "kind": "ROBOT_CONNECTION_TEST_SUMMARY",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "robot_host": config.ROBOT_HOST,
+            "duration_s": duration_s,
+            "target_read_hz": config.ROBOT_RECORD_HZ,
+            "successful_read_count": len(samples),
+            "actual_read_hz": actual_hz,
+            "read_error_count": len(read_errors),
+            "read_errors": read_errors[:10],
+            "dashboard": robot.dashboard_info,
+            "dashboard_safety_ok": dashboard_safety_ok,
+            "rtde_safety_ok": rtde_safety_ok,
+            "success": success,
+            "failure_reason": failure_reason,
+            "first_state": samples[0] if samples else None,
+            "last_state": samples[-1] if samples else None,
+        }
+
+        with log_path.open("w", encoding="utf-8", buffering=1) as file:
+            file.write(json.dumps({"kind": "META", **summary}, ensure_ascii=False) + "\n")
+            for sample in samples:
+                file.write(json.dumps(sample, ensure_ascii=False, allow_nan=True) + "\n")
+
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=True),
+            encoding="utf-8",
+        )
+
+        if not success:
+            print("[状态] 机械臂通信检测失败", flush=True)
+            status_printed = True
+            raise RuntimeError(failure_reason or "机械臂通信检测失败。")
+
+        print("[状态] 机械臂通信检测通过", flush=True)
+        status_printed = True
+        print(f"[机器人] 通信检测记录：{log_path}", flush=True)
+        return output_dir
+    except Exception as exc:
+        if not summary_path.exists():
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            summary = {
+                "kind": "ROBOT_CONNECTION_TEST_SUMMARY",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "robot_host": config.ROBOT_HOST,
+                "duration_s": config.ROBOT_CONNECTION_TEST_SECONDS,
+                "target_read_hz": config.ROBOT_RECORD_HZ,
+                "successful_read_count": len(samples),
+                "actual_read_hz": 0.0,
+                "read_error_count": len(read_errors),
+                "read_errors": read_errors[:10],
+                "dashboard": robot.dashboard_info,
+                "success": False,
+                "failure_reason": failure_reason,
+                "first_state": samples[0] if samples else None,
+                "last_state": samples[-1] if samples else None,
+            }
+            log_path.write_text(
+                json.dumps({"kind": "META", **summary}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            summary_path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=True),
+                encoding="utf-8",
+            )
+        if not status_printed:
+            print("[状态] 机械臂通信检测失败", flush=True)
+        raise
+    finally:
+        robot.disconnect()
+
+
 def run_robot_test() -> Path:
     """
     用户选择 robot_test 后进入这里。
@@ -1083,6 +1488,233 @@ def _put_record(record_queue: Any, record: dict[str, Any], stop_event: Any) -> N
     except Full as exc:
         stop_event.set()
         raise RuntimeError("记录队列已满，机器人数据无法写入。") from exc
+
+
+def _record_robot_event(record_queue: Any, stop_event: Any, name: str, **extra: Any) -> None:
+    """给相对运动实验写入统一事件。"""
+
+    _put_record(
+        record_queue,
+        {
+            "kind": "EVENT",
+            "host_ns": time.perf_counter_ns(),
+            "name": name,
+            **extra,
+        },
+        stop_event,
+    )
+
+
+def _tcp_speed_norm_m_s(state: dict[str, Any]) -> float:
+    """从一条机器人状态记录计算 TCP 线速度模长。"""
+
+    speed = state.get("actual_tcp_speed") or []
+    if len(speed) < 3:
+        return math.inf
+    return float(np.linalg.norm(np.asarray(speed[:3], dtype=float)))
+
+
+def _wait_until_tcp_stopped(
+    robot: URRobot,
+    threshold_m_s: float,
+    timeout_s: float,
+) -> dict[str, Any]:
+    """等待 TCP 线速度降到阈值以下，并返回最后一条状态。"""
+
+    deadline = time.perf_counter() + timeout_s
+    last_state = robot.read_state()
+    while time.perf_counter() < deadline:
+        last_state = robot.read_state()
+        if _tcp_speed_norm_m_s(last_state) <= threshold_m_s:
+            return last_state
+        time.sleep(0.02)
+    raise TimeoutError("等待机器人停止超时。")
+
+
+def relative_motion_robot_worker(
+    record_queue: Any,
+    error_queue: Any,
+    experiment_mode: str,
+    parameters: dict[str, Any],
+    run_dir: Path,
+    stop_event: Any,
+    robot_ready: Any,
+    motion_start: Any,
+    motion_done: Any,
+) -> None:
+    """
+    三个新相对运动实验共用的机器人子进程。
+
+    它在 motion_start 置位前只连接、读状态、计算和验证轨迹，不发送运动命令。
+    """
+
+    robot = URRobot()
+    motion_started = False
+    normal_motion_finished = False
+    robot_log_path = Path(run_dir) / "robot_log.txt"
+    parameters_path = Path(run_dir) / "experiment_parameters.json"
+    period = 1.0 / float(config.ROBOT_RECORD_HZ)
+    stop_speed_m_s = float(config.ROBOT_EXPERIMENT_STOP_SPEED_MM_S) / 1000.0
+
+    try:
+        _record_robot_event(record_queue, stop_event, "hardware_preparation_started")
+        if not config.ROBOT_RELATIVE_MOTION_ENABLED:
+            raise PermissionError(
+                "ROBOT_RELATIVE_MOTION_ENABLED=False，三个相对运动实验默认禁止真机运动。"
+            )
+        robot.connect(require_control=True)
+        first_state = robot.read_state()
+        dashboard_safety_ok = _dashboard_safety_status_is_normal(robot.dashboard_info)
+        rtde_safety_ok = _rtde_safety_mode_is_normal(first_state)
+        if dashboard_safety_ok is False or rtde_safety_ok is False:
+            raise RuntimeError("机器人安全状态不是 NORMAL，拒绝运动。")
+        if _tcp_speed_norm_m_s(first_state) > stop_speed_m_s:
+            raise RuntimeError("当前 TCP 速度未接近停止，拒绝计算相对运动起点。")
+
+        start_pose = [float(value) for value in first_state["actual_tcp_pose"]]
+        trajectory, computed = build_relative_motion_trajectory(
+            experiment_mode,
+            start_pose,
+            parameters,
+        )
+        validate_trajectory(trajectory, for_real_robot=True, pose_source="relative")
+        robot.verify_controller_safety_limits(trajectory)
+
+        experiment_parameters = {
+            **computed,
+            "kind": "RELATIVE_MOTION_PARAMETERS",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "robot_host": config.ROBOT_HOST,
+            "waypoints": [asdict(waypoint) for waypoint in trajectory],
+            "return_warning_mm": config.ROBOT_RETURN_WARNING_MM,
+            "flash_gate": {
+                "brightness_baseline_seconds": config.BRIGHTNESS_BASELINE_SECONDS,
+                "flash_wait_timeout_seconds": config.FLASH_WAIT_TIMEOUT_SECONDS,
+                "flash_min_duration_seconds": config.FLASH_MIN_DURATION_SECONDS,
+                "vision_recovery_stable_seconds": config.VISION_RECOVERY_STABLE_SECONDS,
+                "flash_recovery_timeout_seconds": config.FLASH_RECOVERY_TIMEOUT_SECONDS,
+            },
+            "industrial_camera_actual_fps": None,
+        }
+        parameters_path.write_text(
+            json.dumps(experiment_parameters, ensure_ascii=False, indent=2, allow_nan=True),
+            encoding="utf-8",
+        )
+
+        _record_robot_event(
+            record_queue,
+            stop_event,
+            "robot_ready",
+            start_pose=start_pose,
+            waypoint_count=len(trajectory),
+        )
+        print("[状态] 正在准备机械臂", flush=True)
+        robot_ready.set()
+
+        with robot_log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+            log_file.write(
+                json.dumps(
+                    {
+                        "kind": "META",
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "mode": experiment_mode,
+                        "robot_host": config.ROBOT_HOST,
+                        "dashboard": robot.dashboard_info,
+                    },
+                    ensure_ascii=False,
+                    allow_nan=True,
+                )
+                + "\n"
+            )
+
+            next_sample = time.perf_counter()
+            while not motion_start.is_set():
+                if stop_event.is_set():
+                    return
+                state = robot.read_state()
+                log_file.write(json.dumps(state, ensure_ascii=False, allow_nan=True) + "\n")
+                next_sample += period
+                time.sleep(max(0.0, next_sample - time.perf_counter()))
+
+            if stop_event.is_set():
+                return
+
+            _record_robot_event(
+                record_queue,
+                stop_event,
+                "motion_command_sent",
+                trajectory_mode=experiment_mode,
+            )
+            print("[状态] 机械臂运动中", flush=True)
+            robot.execute_trajectory(trajectory)
+            motion_started = True
+            motion_deadline = time.perf_counter() + float(config.ROBOT_MOTION_TIMEOUT_S)
+
+            while robot.motion_in_progress():
+                if stop_event.is_set():
+                    robot.stop_motion()
+                    break
+                if time.perf_counter() > motion_deadline:
+                    robot.stop_motion()
+                    raise TimeoutError("相对运动执行超过超时上限，已调用 stopL。")
+                state = robot.read_state()
+                log_file.write(json.dumps(state, ensure_ascii=False, allow_nan=True) + "\n")
+                next_sample += period
+                time.sleep(max(0.0, next_sample - time.perf_counter()))
+
+            stopped_state = _wait_until_tcp_stopped(robot, stop_speed_m_s, 5.0)
+            log_file.write(json.dumps(stopped_state, ensure_ascii=False, allow_nan=True) + "\n")
+            if stop_event.is_set():
+                _record_robot_event(
+                    record_queue,
+                    stop_event,
+                    "robot_stopped_confirmed",
+                    tcp_speed_m_s=_tcp_speed_norm_m_s(stopped_state),
+                    interrupted=True,
+                )
+                return
+            current_xyz = np.asarray(stopped_state["actual_tcp_pose"][:3], dtype=float)
+            start_xyz = np.asarray(start_pose[:3], dtype=float)
+            error_xyz_m = current_xyz - start_xyz
+            error_norm_m = float(np.linalg.norm(error_xyz_m))
+            warning = error_norm_m * 1000.0 > float(config.ROBOT_RETURN_WARNING_MM)
+            _record_robot_event(
+                record_queue,
+                stop_event,
+                "robot_stopped_confirmed",
+                tcp_speed_m_s=_tcp_speed_norm_m_s(stopped_state),
+            )
+            _record_robot_event(
+                record_queue,
+                stop_event,
+                "robot_return_error_measured",
+                error_xyz_m=error_xyz_m.tolist(),
+                error_norm_m=error_norm_m,
+                warning=warning,
+            )
+            _record_robot_event(record_queue, stop_event, "motion_finished")
+            print("[状态] 机械臂已回到初始位置", flush=True)
+            normal_motion_finished = True
+            motion_done.set()
+
+            while not stop_event.is_set():
+                state = robot.read_state()
+                log_file.write(json.dumps(state, ensure_ascii=False, allow_nan=True) + "\n")
+                next_sample += period
+                time.sleep(max(0.0, next_sample - time.perf_counter()))
+    except Exception as exc:
+        try:
+            error_queue.put(
+                f"相对运动机器人进程异常：{type(exc).__name__}: {exc}",
+                timeout=1.0,
+            )
+        except Full:
+            pass
+        stop_event.set()
+    finally:
+        if motion_started and not normal_motion_finished:
+            robot.stop_motion()
+        robot.disconnect()
 
 
 def robot_worker(

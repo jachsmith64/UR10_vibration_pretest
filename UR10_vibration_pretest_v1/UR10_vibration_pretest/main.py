@@ -237,6 +237,108 @@ def _join_or_terminate(process: BaseProcess) -> None:
         process.join(timeout=2.0)
 
 
+RELATIVE_MOTION_MODES = {
+    "x_line_experiment",
+    "xy_line_experiment",
+    "xy_l_experiment",
+}
+
+
+def _clear_stop_request_file(path: Path | None) -> None:
+    """清理本次 run 专属停止请求文件。"""
+
+    if path is not None and path.exists():
+        path.unlink()
+
+
+def _external_stop_requested(path: Path | None) -> bool:
+    """检查启动器为本次 run 写入的停止请求。"""
+
+    return bool(path is not None and path.exists())
+
+
+def _wait_event_or_error(
+    event: Any,
+    description: str,
+    error_queue: Any,
+    stop_event: Any,
+    stop_request_path: Path | None,
+    *,
+    timeout_s: float | None = None,
+) -> None:
+    """等待一个事件，同时响应 worker 错误和启动器停止请求。"""
+
+    deadline = None if timeout_s is None else time.perf_counter() + timeout_s
+    while not event.is_set():
+        worker_error = _pop_worker_error(error_queue)
+        if worker_error:
+            raise RuntimeError(worker_error)
+        if _external_stop_requested(stop_request_path):
+            stop_event.set()
+        if stop_event.is_set():
+            worker_error = _pop_worker_error(error_queue)
+            if worker_error:
+                raise RuntimeError(worker_error)
+            raise RuntimeError(f"{description} 期间收到停止请求。")
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise TimeoutError(f"等待 {description} 超时。")
+        time.sleep(0.05)
+
+
+def _sleep_with_stop_checks(
+    seconds: float,
+    error_queue: Any,
+    stop_event: Any,
+    stop_request_path: Path | None,
+) -> None:
+    """带错误和停止请求检查的短等待。"""
+
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        worker_error = _pop_worker_error(error_queue)
+        if worker_error:
+            raise RuntimeError(worker_error)
+        if _external_stop_requested(stop_request_path):
+            stop_event.set()
+        if stop_event.is_set():
+            raise RuntimeError("后记录期间收到停止请求。")
+        time.sleep(0.05)
+
+
+def _relative_parameters_from_args(arguments: argparse.Namespace) -> dict[str, Any]:
+    """把命令行/UI 参数整理给 robot.py 的纯轨迹函数。"""
+
+    return {
+        "speed_mm_s": arguments.speed_mm_s,
+        "total_time_s": arguments.total_time_s,
+        "angle_deg": arguments.angle_deg,
+        "x_direction": arguments.x_direction,
+        "y_direction": arguments.y_direction,
+        "x_speed_mm_s": arguments.x_speed_mm_s,
+        "x_one_way_time_s": arguments.x_one_way_time_s,
+        "y_speed_mm_s": arguments.y_speed_mm_s,
+        "y_one_way_time_s": arguments.y_one_way_time_s,
+        "blend_mm": arguments.blend_mm,
+        "acceleration_m_s2": config.ROBOT_EXPERIMENT_ACCELERATION_M_S2,
+    }
+
+
+def _update_experiment_parameters_with_camera_fps(run_dir: Path) -> None:
+    """相机完成后把实际 fps 回填到 experiment_parameters.json。"""
+
+    parameters_path = run_dir / "experiment_parameters.json"
+    metadata_path = run_dir / "camera" / "capture_metadata.json"
+    if not parameters_path.exists() or not metadata_path.exists():
+        return
+    parameters = json.loads(parameters_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    parameters["industrial_camera_actual_fps"] = metadata.get("actual_camera_fps")
+    parameters_path.write_text(
+        json.dumps(parameters, ensure_ascii=False, indent=2, allow_nan=True),
+        encoding="utf-8",
+    )
+
+
 # =============================================================================
 # 2. 五种模式的高层入口：用户选一个模式，main.py 就转交给一个模块
 # =============================================================================
@@ -301,6 +403,14 @@ def run_robot_dry_run_mode() -> Path:
     return run_robot_dry_run()
 
 
+def run_robot_connection_test_mode() -> Path:
+    """只读检测机械臂通信，不创建控制接口、不发送运动命令。"""
+
+    from robot import run_robot_connection_test
+
+    return run_robot_connection_test()
+
+
 def run_robot_test_mode() -> Path:
     """
     用户选择 robot_test 后进入这里。
@@ -333,6 +443,226 @@ def run_analysis_mode(analysis_file: Path | None = None) -> Path:
     from analyze import run_analysis
 
     return run_analysis(analysis_file)
+
+
+def run_relative_motion_experiment_mode(
+    selected_mode: str,
+    arguments: argparse.Namespace,
+) -> Path:
+    """三个相对运动实验共用的主进程协调入口。"""
+
+    if selected_mode not in RELATIVE_MOTION_MODES:
+        raise ValueError(f"不是相对运动实验模式：{selected_mode}")
+
+    if not config.ROBOT_RELATIVE_MOTION_ENABLED:
+        raise PermissionError(
+            "ROBOT_RELATIVE_MOTION_ENABLED=False。请在实验室完成通信测试和现场安全确认后再改为 True。"
+        )
+
+    parameters = _relative_parameters_from_args(arguments)
+    stop_request_path = arguments.stop_request_path
+    if stop_request_path is not None and not stop_request_path.is_absolute():
+        stop_request_path = (config.PROJECT_DIR / stop_request_path).resolve()
+    _clear_stop_request_file(stop_request_path)
+
+    if not arguments.ui_confirmed:
+        from robot import require_operator_confirmation
+
+        require_operator_confirmation(f"{selected_mode} 相对运动实验")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = config.OUTPUT_ROOT / f"{selected_mode}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    events_path = run_dir / "experiment_events.txt"
+    summary_path = run_dir / "experiment_summary.json"
+
+    context = mp.get_context("spawn")
+    record_queue = context.Queue(maxsize=config.RECORD_QUEUE_MAXSIZE)
+    error_queue = context.Queue(maxsize=config.ERROR_QUEUE_MAXSIZE)
+
+    camera_ready = context.Event()
+    robot_ready = context.Event()
+    capture_start = context.Event()
+    vision_recovered = context.Event()
+    motion_start = context.Event()
+    motion_done = context.Event()
+    camera_stop = context.Event()
+    camera_finished = context.Event()
+    stop_requested = context.Event()
+
+    from camera import relative_motion_raw_camera_worker
+    from robot import build_relative_motion_trajectory, relative_motion_robot_worker
+
+    # 纯计算预检只验证 UI/CLI 数字，不连接机器人；真实 A 点会在 robot worker 中重算。
+    build_relative_motion_trajectory(
+        selected_mode,
+        list(config.POINT_A),
+        parameters,
+    )
+
+    writer_process = context.Process(
+        target=record_writer_worker,
+        args=(record_queue, events_path),
+        name="relative-event-writer",
+    )
+    camera_process = context.Process(
+        target=relative_motion_raw_camera_worker,
+        args=(
+            record_queue,
+            error_queue,
+            run_dir,
+            stop_requested,
+            camera_ready,
+            capture_start,
+            vision_recovered,
+            camera_stop,
+            camera_finished,
+        ),
+        name="relative-raw-camera",
+    )
+    robot_process = context.Process(
+        target=relative_motion_robot_worker,
+        args=(
+            record_queue,
+            error_queue,
+            selected_mode,
+            parameters,
+            run_dir,
+            stop_requested,
+            robot_ready,
+            motion_start,
+            motion_done,
+        ),
+        name="relative-robot",
+    )
+    processes = [camera_process, robot_process]
+    success = False
+    failure_message: str | None = None
+
+    writer_process.start()
+    record_queue.put(
+        {
+            "kind": "META",
+            "host_ns": time.perf_counter_ns(),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "mode": selected_mode,
+            "robot_host": config.ROBOT_HOST,
+            "stop_request_path": None if stop_request_path is None else str(stop_request_path),
+        },
+        timeout=1.0,
+    )
+
+    try:
+        _record_event(record_queue, "hardware_preparation_started", mode=selected_mode)
+        print("[状态] 正在准备工业相机", flush=True)
+        camera_process.start()
+        robot_process.start()
+
+        _wait_event_or_error(
+            camera_ready,
+            "工业相机 ready",
+            error_queue,
+            stop_requested,
+            stop_request_path,
+            timeout_s=config.WORKER_READY_TIMEOUT_S,
+        )
+        _wait_event_or_error(
+            robot_ready,
+            "机械臂 ready",
+            error_queue,
+            stop_requested,
+            stop_request_path,
+            timeout_s=config.WORKER_READY_TIMEOUT_S,
+        )
+
+        capture_start.set()
+        _wait_event_or_error(
+            vision_recovered,
+            "手电筒同步和视野恢复",
+            error_queue,
+            stop_requested,
+            stop_request_path,
+            timeout_s=(
+                config.BRIGHTNESS_BASELINE_SECONDS
+                + config.FLASH_WAIT_TIMEOUT_SECONDS
+                + config.FLASH_RECOVERY_TIMEOUT_SECONDS
+                + config.VISION_RECOVERY_STABLE_SECONDS
+                + 2.0
+            ),
+        )
+
+        if stop_requested.is_set():
+            raise RuntimeError("运动前收到停止请求。")
+        motion_start.set()
+        _wait_event_or_error(
+            motion_done,
+            "机械臂运动完成",
+            error_queue,
+            stop_requested,
+            stop_request_path,
+            timeout_s=config.ROBOT_MOTION_TIMEOUT_S + 10.0,
+        )
+
+        _record_event(record_queue, "camera_post_record_started")
+        print("[状态] 工业相机后记录1秒", flush=True)
+        _sleep_with_stop_checks(
+            float(config.POST_MOTION_RECORD_SECONDS),
+            error_queue,
+            stop_requested,
+            stop_request_path,
+        )
+        camera_stop.set()
+        _wait_event_or_error(
+            camera_finished,
+            "工业相机封口",
+            error_queue,
+            stop_requested,
+            stop_request_path,
+            timeout_s=config.WORKER_JOIN_TIMEOUT_S + 10.0,
+        )
+        _record_event(record_queue, "experiment_completed")
+        success = True
+        print("[状态] 实验完成", flush=True)
+    except Exception as exc:
+        failure_message = f"{type(exc).__name__}: {exc}"
+        stop_requested.set()
+        camera_stop.set()
+        try:
+            _record_event(record_queue, "experiment_aborted", message=failure_message)
+        except Exception:
+            pass
+        print("[状态] 实验失败", flush=True)
+        raise
+    finally:
+        stop_requested.set()
+        camera_stop.set()
+        for process in processes:
+            if process.pid is not None:
+                _join_or_terminate(process)
+        record_queue.put(None, timeout=2.0)
+        _join_or_terminate(writer_process)
+        record_queue.close()
+        error_queue.close()
+        _clear_stop_request_file(stop_request_path)
+
+        _update_experiment_parameters_with_camera_fps(run_dir)
+        summary = {
+            "kind": "RELATIVE_MOTION_EXPERIMENT_SUMMARY",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "mode": selected_mode,
+            "success": success,
+            "failure_message": failure_message,
+            "run_dir": str(run_dir),
+            "camera_dir": str(run_dir / "camera"),
+            "robot_log": str(run_dir / "robot_log.txt"),
+            "events": str(events_path),
+        }
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=True),
+            encoding="utf-8",
+        )
+
+    return run_dir
 
 
 def run_experiment_mode() -> Path:
@@ -578,6 +908,36 @@ def _parse_arguments() -> argparse.Namespace:
         help="analyze 模式下临时指定 run_log.txt 或 vision_results.txt。",
     )
 
+    parser.add_argument("--speed-mm-s", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)
+    parser.add_argument("--total-time-s", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S)
+    parser.add_argument("--angle-deg", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_ANGLE_DEG)
+    parser.add_argument("--x-direction", choices=["+X", "-X"], default="+X")
+    parser.add_argument("--y-direction", choices=["+Y", "-Y"], default="+Y")
+    parser.add_argument("--x-speed-mm-s", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)
+    parser.add_argument(
+        "--x-one-way-time-s",
+        type=float,
+        default=config.ROBOT_EXPERIMENT_DEFAULT_X_ONE_WAY_TIME_S,
+    )
+    parser.add_argument("--y-speed-mm-s", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)
+    parser.add_argument(
+        "--y-one-way-time-s",
+        type=float,
+        default=config.ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S,
+    )
+    parser.add_argument("--blend-mm", type=float, default=config.ROBOT_RELATIVE_BLEND_MM)
+    parser.add_argument(
+        "--ui-confirmed",
+        action="store_true",
+        help="启动器已完成索尼录像、路径方向、无人区和急停确认。",
+    )
+    parser.add_argument(
+        "--stop-request-path",
+        type=Path,
+        default=None,
+        help="启动器为本次运动实验写入的 run 级停止请求文件。",
+    )
+
     # 本段真正读取终端参数，并把字符串转换成 Python 可用的对象。
     return parser.parse_args()
 
@@ -629,11 +989,17 @@ def main() -> Path:
     if selected_mode == "robot_dry_run":
         return run_robot_dry_run_mode()
 
+    if selected_mode == "robot_connection_test":
+        return run_robot_connection_test_mode()
+
     if selected_mode == "robot_test":
         return run_robot_test_mode()
 
     if selected_mode == "experiment":
         return run_experiment_mode()
+
+    if selected_mode in RELATIVE_MOTION_MODES:
+        return run_relative_motion_experiment_mode(selected_mode, arguments)
 
     if selected_mode == "analyze":
         return run_analysis_mode(arguments.analysis_file)
