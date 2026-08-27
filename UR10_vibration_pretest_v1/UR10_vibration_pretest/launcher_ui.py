@@ -28,6 +28,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 VENV_PYTHON = PROJECT_DIR / ".venv" / "Scripts" / "python.exe"
 PYTHON_EXE = VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable)
 OUTPUT_ROOT = PROJECT_DIR / "outputs"
+CAPTURE_STOP_REQUEST_PATH = OUTPUT_ROOT / "vision_capture_stop.request"
 
 
 class LauncherApp:
@@ -37,6 +38,7 @@ class LauncherApp:
         self.root = root
         self.process: subprocess.Popen[str] | None = None
         self.output_queue: queue.Queue[str] = queue.Queue()
+        self.current_mode: str | None = None
 
         root.title("UR10 预实验启动面板")
         root.geometry("980x620")
@@ -165,6 +167,7 @@ class LauncherApp:
             errors="replace",
             env=env,
         )
+        self.current_mode = mode
         self.set_running_state(True, mode)
 
         thread = threading.Thread(target=self.read_process_output, daemon=True)
@@ -192,6 +195,7 @@ class LauncherApp:
                 message = self.output_queue.get_nowait()
                 if message == "__PROCESS_DONE__":
                     self.process = None
+                    self.current_mode = None
                     self.set_running_state(False)
                 else:
                     self.append_log(message)
@@ -209,6 +213,16 @@ class LauncherApp:
             return
 
         self.append_log("\n正在请求停止当前任务...\n")
+        if self.current_mode == "vision_capture":
+            try:
+                OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+                CAPTURE_STOP_REQUEST_PATH.write_text("stop\n", encoding="utf-8")
+                self.append_log("已通知高速采集自行退出并保存 RAW，请等待任务结束。\n")
+                self.stop_button.configure(state="disabled")
+            except OSError as exc:
+                self.append_log(f"写入高速采集停止请求失败：{exc}\n")
+            return
+
         self.process.terminate()
 
     def open_outputs(self) -> None:

@@ -2669,6 +2669,110 @@ def _optional_float_from_text(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _capture_fps_from_metadata(metadata: dict[str, Any] | None) -> float:
+    """从 metadata/config 中取得用于 frame_id 时间轴校验的 fps。"""
+
+    fps = float(
+        (metadata or {}).get("actual_camera_fps")
+        or (metadata or {}).get("expected_fps")
+        or config.EXPECTED_VISION_FPS
+        or 1.0
+    )
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"采集 metadata 中 fps 无效：{fps}")
+    return fps
+
+
+def _validate_capture_timestamps(
+    path: Path,
+    rows: list[CaptureTimestampRow],
+    actual_camera_fps: float,
+) -> None:
+    """校验 RAW 时间戳表，防止缺帧后的 analysis_time_s 被压缩。"""
+
+    if not rows:
+        return
+
+    first_frame_id = int(rows[0]["frame_id"])
+    previous_frame_id: int | None = None
+    previous_analysis_time: float | None = None
+    tolerance_s = max(1e-9, (1.0 / actual_camera_fps) * 1e-6)
+
+    for index, row in enumerate(rows):
+        capture_index = int(row["capture_index"])
+        frame_id = int(row["frame_id"])
+        frame_time_s = float(row["frame_time_s"])
+        analysis_time_s = float(row["analysis_time_s"])
+        analysis_source = str(row.get("analysis_time_source") or "")
+        expected_frame_time_s = (frame_id - first_frame_id) / actual_camera_fps
+
+        if capture_index != index:
+            raise ValueError(
+                f"{path} 第 {index + 2} 行 capture_index={capture_index}，"
+                f"应为 {index}。RAW 读取必须按连续存储索引定位。"
+            )
+        if not math.isfinite(frame_time_s) or not math.isfinite(analysis_time_s):
+            raise ValueError(f"{path} 第 {index + 2} 行存在无效时间值。")
+        if abs(frame_time_s - expected_frame_time_s) > tolerance_s:
+            raise ValueError(
+                f"{path} 第 {index + 2} 行 frame_time_s={frame_time_s:.12f}，"
+                f"但 frame_id={frame_id} 按 fps={actual_camera_fps:.6f} "
+                f"应为 {expected_frame_time_s:.12f}。"
+            )
+        if analysis_source == "frame_id_fps_fallback":
+            if abs(analysis_time_s - expected_frame_time_s) > tolerance_s:
+                raise ValueError(
+                    f"{path} 第 {index + 2} 行 analysis_time_s={analysis_time_s:.12f}，"
+                    f"但按 frame_id 时间轴应为 {expected_frame_time_s:.12f}，"
+                    "疑似把缺帧后的帧向前压缩。"
+                )
+        elif analysis_time_s + tolerance_s < expected_frame_time_s:
+            raise ValueError(
+                f"{path} 第 {index + 2} 行 analysis_time_s={analysis_time_s:.12f} "
+                f"早于 frame_id 时间位置 {expected_frame_time_s:.12f}，"
+                "疑似缺帧时间轴被压缩。"
+            )
+
+        if previous_frame_id is None:
+            if row.get("frame_id_gap") is not None:
+                raise ValueError(f"{path} 第 2 行 frame_id_gap 应为空。")
+            if int(row.get("missing_before", 0)) != 0:
+                raise ValueError(f"{path} 第 2 行 missing_before 应为 0。")
+            if abs(analysis_time_s) > tolerance_s:
+                raise ValueError(f"{path} 第 2 行 analysis_time_s 应从 0 附近开始。")
+        else:
+            frame_id_gap = frame_id - previous_frame_id
+            if frame_id_gap <= 0:
+                raise ValueError(
+                    f"{path} 第 {index + 2} 行 frame_id={frame_id} "
+                    f"没有严格大于上一行 {previous_frame_id}。"
+                )
+            recorded_gap = row.get("frame_id_gap")
+            if recorded_gap is not None and int(recorded_gap) != frame_id_gap:
+                raise ValueError(
+                    f"{path} 第 {index + 2} 行 frame_id_gap={recorded_gap}，"
+                    f"应为 {frame_id_gap}。"
+                )
+            expected_missing = max(frame_id_gap - 1, 0)
+            if int(row.get("missing_before", 0)) != expected_missing:
+                raise ValueError(
+                    f"{path} 第 {index + 2} 行 missing_before={row.get('missing_before')}，"
+                    f"应为 {expected_missing}。"
+                )
+            if previous_analysis_time is not None:
+                expected_delta_s = frame_id_gap / actual_camera_fps
+                actual_delta_s = analysis_time_s - previous_analysis_time
+                if actual_delta_s + tolerance_s < expected_delta_s:
+                    raise ValueError(
+                        f"{path} 第 {index + 2} 行相邻 analysis_time_s 间隔 "
+                        f"{actual_delta_s:.12f}s，小于 frame_id_gap={frame_id_gap} "
+                        f"应有间隔 {expected_delta_s:.12f}s，疑似缺帧被压缩。"
+                    )
+
+        previous_frame_id = frame_id
+        previous_analysis_time = analysis_time_s
+
+
 def _write_capture_timestamps(output_path: Path, rows: list[CaptureTimestampRow]) -> None:
     """一次性写入采集帧时间戳 CSV。"""
 
@@ -2725,17 +2829,14 @@ def _read_capture_timestamps(
             )
 
     if rows and not has_new_time_fields:
-        fps = float(
-            (metadata or {}).get("actual_camera_fps")
-            or (metadata or {}).get("expected_fps")
-            or config.EXPECTED_VISION_FPS
-            or 1.0
-        )
+        fps = _capture_fps_from_metadata(metadata)
         _enrich_capture_timestamps(rows, fps)
         print(
             "[离线识别警告] 当前采集目录缺少新时间字段，"
             "已按 frame_id 和 fps 重建 analysis_time_s。"
         )
+    if rows:
+        _validate_capture_timestamps(path, rows, _capture_fps_from_metadata(metadata))
     return rows
 
 
@@ -2980,6 +3081,26 @@ def _write_raw_frames_from_ram(raw_path: Path, frames: np.ndarray) -> float:
     return _elapsed_ms(write_start_ns)
 
 
+def _capture_stop_request_path() -> Path:
+    """启动器请求 vision_capture 温和停止时写入的哨兵文件。"""
+
+    return config.OUTPUT_ROOT / "vision_capture_stop.request"
+
+
+def _capture_stop_requested() -> bool:
+    """检查启动器是否请求高速采集自行收尾。"""
+
+    return _capture_stop_request_path().exists()
+
+
+def _clear_capture_stop_request() -> None:
+    """清理高速采集停止请求，避免影响下一次采集。"""
+
+    stop_path = _capture_stop_request_path()
+    if stop_path.exists():
+        stop_path.unlink()
+
+
 def _finalize_memmap_raw(
     raw_path: Path,
     temp_path: Path,
@@ -3052,6 +3173,7 @@ def run_vision_capture() -> Path:
     analysis_time_source = "frame_id_fps_fallback"
 
     print("[采集] 高速采集模式：只保存原始帧，不做棋盘格识别。")
+    _clear_capture_stop_request()
     try:
         with HikCameraSource() as source:
             iterator = iter(source)
@@ -3103,7 +3225,14 @@ def run_vision_capture() -> Path:
             countdown = float(config.CAPTURE_START_COUNTDOWN_S)
             if countdown > 0:
                 print(f"[采集] {countdown:.1f} 秒后开始正式采集。")
-                time.sleep(countdown)
+                countdown_deadline = time.perf_counter() + countdown
+                while time.perf_counter() < countdown_deadline:
+                    if _capture_stop_requested():
+                        print("[采集] 倒计时期间收到停止请求。")
+                        break
+                    time.sleep(0.05)
+                if _capture_stop_requested():
+                    raise KeyboardInterrupt
 
             capture_start_ns = time.perf_counter_ns()
             deadline_ns = (
@@ -3116,6 +3245,9 @@ def run_vision_capture() -> Path:
             next_preview_ns = capture_start_ns
 
             while True:
+                if _capture_stop_requested():
+                    print("[采集] 收到启动器停止请求，正在结束采集并保存已采集帧。")
+                    break
                 if deadline_ns is not None and time.perf_counter_ns() >= deadline_ns:
                     break
 
@@ -3176,6 +3308,7 @@ def run_vision_capture() -> Path:
                 cv2.destroyWindow("UR10 raw capture preview")
             except cv2.error:
                 pass
+        _clear_capture_stop_request()
 
     if not timestamp_rows:
         raise RuntimeError("高速采集没有保存到任何有效帧。")
