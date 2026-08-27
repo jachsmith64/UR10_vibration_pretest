@@ -5,5 +5,8 @@ __pycache__/
 .pytest_cache/
 .npm-cache/
 outputs/
+*.bundle
+*_transfer_package.zip
+transfer_8_27_stable/
 Thumbs.db
 .DS_Store
