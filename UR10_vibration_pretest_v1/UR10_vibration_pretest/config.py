@@ -155,16 +155,18 @@ OFFLINE_PROGRESS_EVERY_N_FRAMES = 25
 # 输入：RAW 采集循环中 frame[::16, ::16] 的稀疏亮度统计；输出：是否允许机器人开始运动。
 # 实验作用：索尼相机由人手动录像，工业相机和索尼画面里的同一次亮度峰用于离线对齐。
 BRIGHTNESS_BASELINE_SECONDS = 0.5
-FLASH_WAIT_TIMEOUT_SECONDS = 5.0
-FLASH_MIN_DURATION_SECONDS = 0.2
+FLASH_WAIT_TIMEOUT_SECONDS = 10.0
+FLASH_MIN_DURATION_SECONDS = 0.15
 VISION_RECOVERY_STABLE_SECONDS = 1.0
 FLASH_RECOVERY_TIMEOUT_SECONDS = 5.0
 POST_MOTION_RECORD_SECONDS = 1.0
-FLASH_MEAN_RELATIVE_INCREASE = 0.25
-FLASH_MEAN_ABSOLUTE_INCREASE = 20.0
-FLASH_MEAN_MAD_MULTIPLIER = 8.0
+# 2026-09-01 现场 RAW 回放：基线约 95.92、正常波动小于 2，手机手电筒峰值约 114.81。
+# 下面三项取 max 后要求相对基线出现约 +8 的明显增亮，并连续保持 FLASH_MIN_DURATION_SECONDS。
+FLASH_MEAN_RELATIVE_INCREASE = 0.08
+FLASH_MEAN_ABSOLUTE_INCREASE = 8.0
+FLASH_MEAN_MAD_MULTIPLIER = 6.0
 FLASH_SATURATION_THRESHOLD = 245
-FLASH_SATURATION_RELATIVE_INCREASE = 0.02
+FLASH_SATURATION_RELATIVE_INCREASE = 0.005
 FLASH_RECOVERY_MEAN_TOLERANCE = 8.0
 FLASH_RECOVERY_SATURATION_TOLERANCE = 0.01
 
@@ -368,7 +370,7 @@ HIK_FRAME_TIMEOUT_MS = 1000
 # 本段定义程序如何找到 UR10 控制器。
 # 输入：实验室网络中的机器人 IP 和 dashboard 端口；输出：robot.py 建立状态读取或运动控制连接。
 # 实验作用：只有 robot_test/experiment 会真正使用；示例地址不能证明与你的网络配置一致。
-ROBOT_HOST = "192.168.0.10"
+ROBOT_HOST = "192.168.125.12"
 ROBOT_DASHBOARD_PORT = 29999
 ROBOT_CONNECT_TIMEOUT_S = 5.0
 
@@ -380,7 +382,7 @@ ROBOT_TEST_ALLOW_MOTION = False
 # 本段专门保护“以当前 TCP 为 A 点”的三个相对运动实验。
 # 输入：实验室现场确认后的人工开关；输出：是否允许 x_line/xy_line/xy_l 三个新模式发送运动命令。
 # 实验作用：这些模式不依赖 POINT_A/B/C，但仍必须有独立的真机运动许可，默认绝不运动。
-ROBOT_RELATIVE_MOTION_ENABLED = False
+ROBOT_RELATIVE_MOTION_ENABLED = True
 
 # 本段是所有真机运动前的总安全闸。
 # 输入：人工示教并确认后的 A/B/C 位姿和工作区；输出：是否允许 robot.py 发送运动命令。
@@ -463,10 +465,15 @@ ROBOT_EXPERIMENT_STOP_SPEED_MM_S = 0.2
 ROBOT_RETURN_WARNING_MM = 0.5
 ROBOT_RELATIVE_BLEND_MM = 0.0
 
-# 本段给代码层面加一个 TCP 工作区边界。
-# 输入：待执行轨迹中的所有 TCP 点；输出：通过检查或拒绝执行。
-# 实验作用：这是额外保险，不等于 UR 控制器自身安全设置，也无法识别桌面和夹具。
-# 三个范围分别限制 TCP 的 x、y、z，单位 m；实机前必须按实验台重新填写。
+# 本段给三个相对运动实验定义“以本次实际 A 点为中心”的动态工作区半径。
+# 输入：机器人连接后读取的当前 TCP；输出：本次运行 X/Y/Z 各自 [A-0.20, A+0.20] m 的边界。
+# 实验作用：相对运动不再受示例绝对坐标边界影响，同时仍限制目标不能偏离实际起点超过 20 cm。
+ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M = 0.20
+
+# 本段给旧的绝对 A/B/C 轨迹保留固定 TCP 工作区边界。
+# 输入：绝对轨迹中的所有 TCP 点；输出：通过检查或拒绝执行。
+# 实验作用：它不用于三个相对运动实验；相对模式使用上面的“实际 A 点 ±20 cm”动态边界。
+# 这是额外保险，不等于 UR 控制器自身安全设置，也无法识别桌面、夹具和电缆。
 WORKSPACE_LIMITS_M: Final[dict[str, tuple[float, float]]] = {
     "x": (-0.80, 0.20),
     "y": (-0.80, 0.80),
@@ -805,6 +812,9 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if ROBOT_RETURN_WARNING_MM <= 0:
         raise ValueError("ROBOT_RETURN_WARNING_MM 必须为正数。")
+
+    if ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M <= 0:
+        raise ValueError("ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M 必须为正数。")
 
     for name, value in {
         "BRIGHTNESS_BASELINE_SECONDS": BRIGHTNESS_BASELINE_SECONDS,

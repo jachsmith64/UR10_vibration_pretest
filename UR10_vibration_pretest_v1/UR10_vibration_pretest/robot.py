@@ -155,6 +155,27 @@ def _segment_length(start: Waypoint, end: Waypoint) -> float:
     return float(np.linalg.norm(_position(end.pose) - _position(start.pose)))
 
 
+def build_relative_workspace_limits(
+    start_pose: list[float],
+) -> dict[str, tuple[float, float]]:
+    """以本次实际 TCP 起点为中心，生成 X/Y/Z 各自正负固定距离的动态工作区。"""
+
+    if len(start_pose) != 6 or not all(math.isfinite(value) for value in start_pose):
+        raise ValueError("相对工作区起点必须是 6 个有限数值。")
+
+    half_range_m = float(config.ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M)
+    if not math.isfinite(half_range_m) or half_range_m <= 0:
+        raise ValueError("ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M 必须是有限正数。")
+
+    return {
+        axis_name: (
+            float(start_pose[axis_index]) - half_range_m,
+            float(start_pose[axis_index]) + half_range_m,
+        )
+        for axis_index, axis_name in enumerate(("x", "y", "z"))
+    }
+
+
 def validate_trajectory(
     trajectory: list[Waypoint],
     *,
@@ -181,9 +202,17 @@ def validate_trajectory(
     if not trajectory:
         raise ValueError("轨迹不能为空。")
 
+    if pose_source not in {"absolute", "relative"}:
+        raise ValueError(f"未知 pose_source={pose_source!r}。")
+
     # 本段准备检查结果说明。它不是给机器人用的，而是给终端和报告中人读的。
     messages: list[str] = []
     axes = ("x", "y", "z")
+    workspace_limits = (
+        build_relative_workspace_limits(trajectory[0].pose)
+        if pose_source == "relative"
+        else config.WORKSPACE_LIMITS_M
+    )
 
     # 本段逐个检查路径点本身。
     # 输入：每个 Waypoint；输出：确认 pose、速度、加速度、blend 和 xyz 工作区都基本合理。
@@ -203,12 +232,13 @@ def validate_trajectory(
         # 本段只检查 TCP 的 xyz 是否在软件工作区内。
         # 姿态 rx/ry/rz 不在这里设统一范围，因为不同末端工具和安装方式差异很大。
         for axis_index, axis_name in enumerate(axes):
-            lower, upper = config.WORKSPACE_LIMITS_M[axis_name]
+            lower, upper = workspace_limits[axis_name]
             value = waypoint.pose[axis_index]
             if not lower <= value <= upper:
+                workspace_kind = "本次相对工作区" if pose_source == "relative" else "软件工作区"
                 raise ValueError(
                     f"{waypoint.name} 点 {axis_name}={value:.4f} m "
-                    f"超出软件工作区 [{lower:.4f}, {upper:.4f}] m。"
+                    f"超出{workspace_kind} [{lower:.4f}, {upper:.4f}] m。"
                 )
 
         messages.append(
@@ -260,9 +290,6 @@ def validate_trajectory(
     # 本段只在真机流程中启用。
     # 输入：for_real_robot 和 ROBOT_POSES_CONFIRMED；输出：允许真机继续或拒绝示例点位。
     # 实验作用：dry-run 可以用示例点学习流程，但真机绝不能用未确认点位。
-    if pose_source not in {"absolute", "relative"}:
-        raise ValueError(f"未知 pose_source={pose_source!r}。")
-
     if for_real_robot and pose_source == "absolute" and not config.ROBOT_POSES_CONFIRMED:
         raise PermissionError(
             "ROBOT_POSES_CONFIRMED=False。示例位姿只能用于 dry_run；"
@@ -452,6 +479,7 @@ def build_relative_motion_trajectory(
     computed: dict[str, Any] = {
         "experiment_mode": experiment_mode,
         "start_pose_a": list(start_pose),
+        "relative_workspace_limits_m": build_relative_workspace_limits(start_pose),
         "x_direction": x_direction,
         "y_direction": y_direction,
         "acceleration_m_s2": acceleration,

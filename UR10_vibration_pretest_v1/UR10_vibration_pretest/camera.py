@@ -3851,6 +3851,7 @@ def relative_motion_raw_camera_worker(
     camera_dir = Path(run_dir) / "camera"
     sample_dir = camera_dir / "sample_frames"
     failure: dict[str, str] = {}
+    failure_reported = False
     baseline_samples: list[tuple[float, float, int]] = []
     gate: dict[str, Any] = {
         "state": "baseline",
@@ -3870,8 +3871,17 @@ def relative_motion_raw_camera_worker(
         return (now_ns - start_ns) / 1_000_000_000.0
 
     def fail_after_sealing(message: str) -> None:
+        nonlocal failure_reported
         if not failure:
             failure["message"] = message
+            try:
+                error_queue.put(
+                    f"相对运动相机进程异常：RuntimeError: {message}",
+                    timeout=1.0,
+                )
+                failure_reported = True
+            except Full:
+                pass
             stop_event.set()
 
     def before_capture(iterator: Iterator[FramePacket], first_packet: FramePacket) -> None:
@@ -3910,6 +3920,14 @@ def relative_motion_raw_camera_worker(
                     1.0,
                 )
                 baseline_saturation = float(np.median(sats))
+                flash_mean_threshold = max(
+                    baseline_mean * (1.0 + float(config.FLASH_MEAN_RELATIVE_INCREASE)),
+                    baseline_mean + float(config.FLASH_MEAN_ABSOLUTE_INCREASE),
+                    baseline_mean + float(config.FLASH_MEAN_MAD_MULTIPLIER) * baseline_mad,
+                )
+                flash_saturation_threshold = (
+                    baseline_saturation + float(config.FLASH_SATURATION_RELATIVE_INCREASE)
+                )
                 gate.update(
                     {
                         "state": "wait_flash_on",
@@ -3926,6 +3944,8 @@ def relative_motion_raw_camera_worker(
                     baseline_mean=baseline_mean,
                     baseline_mad=baseline_mad,
                     baseline_saturation=baseline_saturation,
+                    flash_mean_threshold=flash_mean_threshold,
+                    flash_saturation_threshold=flash_saturation_threshold,
                 )
                 _record_camera_event(record_queue, stop_event, "flash_wait_started")
                 print("[状态] 请现在打开手机手电筒，再关闭，正在等待同步信号。", flush=True)
@@ -3956,7 +3976,10 @@ def relative_motion_raw_camera_worker(
             if seconds_since(gate["flash_wait_start_ns"], now_ns) > float(
                 config.FLASH_WAIT_TIMEOUT_SECONDS
             ):
-                fail_after_sealing("5 秒内没有检测到手电筒同步信号，机械臂不会运动。")
+                fail_after_sealing(
+                    f"{config.FLASH_WAIT_TIMEOUT_SECONDS:g} 秒内没有检测到手电筒同步信号，"
+                    "机械臂不会运动。"
+                )
                 return
             if flash_is_on:
                 if gate["flash_on_start_ns"] is None:
@@ -4033,13 +4056,14 @@ def relative_motion_raw_camera_worker(
         if failure:
             raise RuntimeError(failure["message"])
     except Exception as exc:
-        try:
-            error_queue.put(
-                f"相对运动相机进程异常：{type(exc).__name__}: {exc}",
-                timeout=1.0,
-            )
-        except Full:
-            pass
+        if not failure_reported:
+            try:
+                error_queue.put(
+                    f"相对运动相机进程异常：{type(exc).__name__}: {exc}",
+                    timeout=1.0,
+                )
+            except Full:
+                pass
         stop_event.set()
 
 
