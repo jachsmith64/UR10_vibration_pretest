@@ -27,7 +27,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from queue import Full
+from queue import Empty, Full
 from typing import Any
 
 import numpy as np
@@ -263,7 +263,7 @@ def validate_trajectory(
             if pose_source == "relative"
             else config.MAX_SEGMENT_LENGTH_M
         )
-        if length > max_segment_length_m:
+        if length > max_segment_length_m + 1e-9:
             raise ValueError(
                 f"{start.name}→{end.name} 长 {length:.4f} m，"
                 f"超过允许上限 {max_segment_length_m:.4f} m。"
@@ -456,6 +456,13 @@ def build_relative_motion_trajectory(
     输出的最后一个 Waypoint 始终回到 A，且所有点保持 A 的 Rx/Ry/Rz。
     """
 
+    mode_aliases = {
+        "x_line": "x_line_experiment",
+        "xy_line": "xy_line_experiment",
+        "l_shape": "xy_l_experiment",
+    }
+    experiment_mode = mode_aliases.get(experiment_mode, experiment_mode)
+
     acceleration = _finite_positive(
         "acceleration_m_s2",
         float(parameters.get("acceleration_m_s2", config.ROBOT_EXPERIMENT_ACCELERATION_M_S2)),
@@ -491,13 +498,19 @@ def build_relative_motion_trajectory(
             "speed_mm_s",
             float(parameters.get("speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
         )
-        total_time_s = _finite_positive(
-            "total_time_s",
-            float(parameters.get("total_time_s", config.ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S)),
+        legacy_total_time_s = float(parameters.get("total_time_s", 0.0))
+        fallback_one_way_time_s = (
+            legacy_total_time_s / 2.0
+            if "total_time_s" in parameters
+            else config.ROBOT_EXPERIMENT_DEFAULT_X_LINE_ONE_WAY_TIME_S
         )
-        if total_time_s > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
-            raise ValueError("total_time_s 超出允许上限。")
-        distance_m = speed_m_s * total_time_s / 2.0
+        one_way_time_s = _finite_positive(
+            "one_way_time_s",
+            float(parameters.get("one_way_time_s", fallback_one_way_time_s)),
+        )
+        if one_way_time_s > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
+            raise ValueError("one_way_time_s 超出允许上限。")
+        distance_m = speed_m_s * one_way_time_s
         point_b = Waypoint(
             "B",
             _offset_pose(start_pose, sign_x * distance_m, 0.0),
@@ -509,7 +522,9 @@ def build_relative_motion_trajectory(
         waypoints = [point_a, point_b, point_a_return]
         computed.update(
             {
-                "nominal_total_motion_time_s": total_time_s,
+                "one_way_time_s": one_way_time_s,
+                "nominal_total_motion_time_s": 2.0 * one_way_time_s,
+                "nominal_one_way_distance_mm": distance_m * 1000.0,
                 "one_way_distance_m": distance_m,
                 "dx_m": sign_x * distance_m,
                 "dy_m": 0.0,
@@ -521,9 +536,15 @@ def build_relative_motion_trajectory(
             "speed_mm_s",
             float(parameters.get("speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
         )
-        total_time_s = _finite_positive(
-            "total_time_s",
-            float(parameters.get("total_time_s", config.ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S)),
+        legacy_total_time_s = float(parameters.get("total_time_s", 0.0))
+        fallback_one_way_time_s = (
+            legacy_total_time_s / 2.0
+            if "total_time_s" in parameters
+            else config.ROBOT_EXPERIMENT_DEFAULT_XY_LINE_ONE_WAY_TIME_S
+        )
+        one_way_time_s = _finite_positive(
+            "one_way_time_s",
+            float(parameters.get("one_way_time_s", fallback_one_way_time_s)),
         )
         angle_deg = float(parameters.get("angle_deg", config.ROBOT_EXPERIMENT_DEFAULT_ANGLE_DEG))
         if (
@@ -533,9 +554,9 @@ def build_relative_motion_trajectory(
             raise ValueError(
                 f"angle_deg 必须在 0 到 {config.ROBOT_EXPERIMENT_MAX_ANGLE_DEG:.1f} 之间。"
             )
-        if total_time_s > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
-            raise ValueError("total_time_s 超出允许上限。")
-        distance_m = speed_m_s * total_time_s / 2.0
+        if one_way_time_s > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
+            raise ValueError("one_way_time_s 超出允许上限。")
+        distance_m = speed_m_s * one_way_time_s
         angle_rad = math.radians(angle_deg)
         dx_m = sign_x * distance_m * math.cos(angle_rad)
         dy_m = sign_y * distance_m * math.sin(angle_rad)
@@ -550,7 +571,9 @@ def build_relative_motion_trajectory(
         waypoints = [point_a, point_b, point_a_return]
         computed.update(
             {
-                "nominal_total_motion_time_s": total_time_s,
+                "one_way_time_s": one_way_time_s,
+                "nominal_total_motion_time_s": 2.0 * one_way_time_s,
+                "nominal_one_way_distance_mm": distance_m * 1000.0,
                 "one_way_distance_m": distance_m,
                 "angle_deg": angle_deg,
                 "dx_m": dx_m,
@@ -559,57 +582,67 @@ def build_relative_motion_trajectory(
             }
         )
     elif experiment_mode == "xy_l_experiment":
-        x_speed_m_s = _validate_speed_mm_s(
-            "x_speed_mm_s",
-            float(parameters.get("x_speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
+        speed_m_s = _validate_speed_mm_s(
+            "speed_mm_s",
+            float(
+                parameters.get(
+                    "speed_mm_s",
+                    parameters.get("x_speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S),
+                )
+            ),
         )
-        y_speed_m_s = _validate_speed_mm_s(
-            "y_speed_mm_s",
-            float(parameters.get("y_speed_mm_s", config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)),
+        legacy_one_way_time_s = float(
+            parameters.get("x_one_way_time_s", config.ROBOT_EXPERIMENT_DEFAULT_X_ONE_WAY_TIME_S)
+        ) + float(
+            parameters.get("y_one_way_time_s", config.ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S)
         )
-        x_time_s = _finite_positive(
-            "x_one_way_time_s",
-            float(parameters.get("x_one_way_time_s", config.ROBOT_EXPERIMENT_DEFAULT_X_ONE_WAY_TIME_S)),
+        one_way_time_s = _finite_positive(
+            "one_way_time_s",
+            float(parameters.get("one_way_time_s", legacy_one_way_time_s)),
         )
-        y_time_s = _finite_positive(
-            "y_one_way_time_s",
-            float(parameters.get("y_one_way_time_s", config.ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S)),
-        )
-        if max(x_time_s, y_time_s) > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
-            raise ValueError("L 折线单段时间超出允许上限。")
-        dx_m = sign_x * x_speed_m_s * x_time_s
-        dy_m = sign_y * y_speed_m_s * y_time_s
+        if one_way_time_s > config.ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S:
+            raise ValueError("L 折线 one_way_time_s 超出允许上限。")
+        x_time_s = one_way_time_s / 2.0
+        y_time_s = one_way_time_s / 2.0
+        dx_m = sign_x * speed_m_s * x_time_s
+        dy_m = sign_y * speed_m_s * y_time_s
         point_b = Waypoint(
             "B",
             _offset_pose(start_pose, dx_m, 0.0),
-            x_speed_m_s,
+            speed_m_s,
             acceleration,
             blend_m,
         )
         point_c = Waypoint(
             "C",
             _offset_pose(start_pose, dx_m, dy_m),
-            y_speed_m_s,
+            speed_m_s,
             acceleration,
             0.0,
         )
         point_b_return = Waypoint(
             "B_return",
             point_b.pose,
-            y_speed_m_s,
+            speed_m_s,
             acceleration,
             0.0,
         )
-        point_a_return = Waypoint("A_return", list(start_pose), x_speed_m_s, acceleration, 0.0)
+        point_a_return = Waypoint("A_return", list(start_pose), speed_m_s, acceleration, 0.0)
         waypoints = [point_a, point_b, point_c, point_b_return, point_a_return]
         computed.update(
             {
-                "nominal_total_motion_time_s": 2.0 * (x_time_s + y_time_s),
+                "one_way_time_s": one_way_time_s,
+                "nominal_total_motion_time_s": 2.0 * one_way_time_s,
+                "nominal_one_way_distance_mm": speed_m_s * one_way_time_s * 1000.0,
+                "x_leg_time_s": x_time_s,
+                "y_leg_time_s": y_time_s,
                 "dx_m": dx_m,
                 "dy_m": dy_m,
                 "point_b": point_b.pose,
                 "point_c": point_c.pose,
                 "blend_m": blend_m,
+                "blend_radius_mm": blend_m * 1000.0,
+                "corner_mode": "BL01" if math.isclose(blend_m, 0.001, abs_tol=1e-12) else "CUSTOM",
             }
         )
     else:
@@ -889,12 +922,7 @@ class URRobot:
                 "或先切换到 robot_dry_run。"
             ) from exc
 
-        # 本段建立只读状态接口。输出的 receive 只能读取关节角、TCP 位姿、速度等状态。
-        self.receive = rtde_receive.RTDEReceiveInterface(
-            config.ROBOT_HOST,
-            float(config.ROBOT_RTDE_FREQUENCY),
-        )
-
+        rtde_control: Any = None
         if require_control:
             # 本段只有 require_control=True 时执行。
             # Control 接口能够发送运动命令，所以只有真机运动确实需要时才创建。
@@ -904,10 +932,55 @@ class URRobot:
                 self.disconnect()
                 raise RuntimeError("无法导入 rtde_control，ur-rtde 安装可能不完整。") from exc
 
-            self.control = rtde_control.RTDEControlInterface(
-                config.ROBOT_HOST,
-                float(config.ROBOT_RTDE_FREQUENCY),
-            )
+        attempts = int(config.ROBOT_RTDE_CONNECT_ATTEMPTS)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                if require_control:
+                    # ur_rtde 官方运动示例先创建 Control，再创建 Receive。对CB3也更稳妥：
+                    # 先让 Control 上传并启动自己的脚本，再订阅独立的状态输出。
+                    print(
+                        f"[机器人] RTDE连接尝试 {attempt}/{attempts}："
+                        "先建立Control，再建立Receive（尚未发送运动）",
+                        flush=True,
+                    )
+                    self.control = rtde_control.RTDEControlInterface(
+                        config.ROBOT_HOST,
+                        float(config.ROBOT_RTDE_FREQUENCY),
+                    )
+                else:
+                    print(
+                        f"[机器人] RTDE只读连接尝试 {attempt}/{attempts}",
+                        flush=True,
+                    )
+
+                self.receive = rtde_receive.RTDEReceiveInterface(
+                    config.ROBOT_HOST,
+                    float(config.ROBOT_RTDE_FREQUENCY),
+                )
+                for name, interface in (("Control", self.control), ("Receive", self.receive)):
+                    if interface is None:
+                        continue
+                    is_connected = getattr(interface, "isConnected", None)
+                    if is_connected is not None and not bool(is_connected()):
+                        raise RuntimeError(f"RTDE{name}Interface 建立后报告未连接。")
+                print("[机器人] RTDE接口建立完成。", flush=True)
+                return
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"[机器人警告] RTDE连接尝试 {attempt}/{attempts} 失败："
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                self.disconnect()
+                if attempt < attempts:
+                    time.sleep(float(config.ROBOT_RTDE_CONNECT_RETRY_DELAY_S))
+
+        raise RuntimeError(
+            f"RTDE连续 {attempts} 次连接失败；最后错误："
+            f"{type(last_error).__name__}: {last_error}"
+        ) from last_error
 
     @staticmethod
     def _safe_call(
@@ -1151,7 +1224,18 @@ class URRobot:
         实验作用：正常结束或异常退出时释放 RTDE 连接，避免下次运行被旧连接占用。
         """
 
-        for interface_name in ("control", "receive"):
+        # RTDEControlInterface 会在控制器上上传控制脚本。官方示例在结束时调用
+        # stopScript()；只断开socket可能让CB3短时间保留旧脚本，影响下一次连接。
+        if self.control is not None:
+            stop_script = getattr(self.control, "stopScript", None)
+            if stop_script is not None:
+                try:
+                    stop_script()
+                except Exception as exc:
+                    print(f"[机器人警告] stopScript 调用失败：{exc}", flush=True)
+
+        # 先停Receive后台接收线程，再断开Control连接。
+        for interface_name in ("receive", "control"):
             interface = getattr(self, interface_name)
             if interface is not None:
                 try:
@@ -1741,6 +1825,335 @@ def relative_motion_robot_worker(
         stop_event.set()
     finally:
         if motion_started and not normal_motion_finished:
+            robot.stop_motion()
+        robot.disconnect()
+
+
+def _batch_status(status_queue: Any, event: str, **extra: Any) -> None:
+    """Send one small robot state-machine acknowledgement to the batch coordinator."""
+
+    status_queue.put(
+        {"source": "robot", "event": event, "host_ns": time.perf_counter_ns(), **extra},
+        timeout=1.0,
+    )
+
+
+def batch_robot_worker(
+    record_queue: Any,
+    error_queue: Any,
+    command_queue: Any,
+    status_queue: Any,
+    stop_event: Any,
+) -> None:
+    """Keep one UR connection alive while the coordinator executes a batch plan.
+
+    Commands are deliberately coarse grained (open/run/close/shutdown).  The worker
+    owns the RTDE interfaces for its entire lifetime, so no segment can accidentally
+    reconnect or replace the A pose.  A is always the stopped TCP pose read at startup.
+    """
+
+    robot = URRobot()
+    start_pose: list[float] | None = None
+    active_file: Any = None
+    active_base: str | None = None
+    motion_started = False
+    motion_finished = True
+    stop_speed_m_s = float(config.ROBOT_EXPERIMENT_STOP_SPEED_MM_S) / 1000.0
+    period = 1.0 / float(config.ROBOT_RECORD_HZ)
+
+    def write_state(state: dict[str, Any]) -> None:
+        if active_file is not None:
+            active_file.write(json.dumps(state, ensure_ascii=False, allow_nan=True) + "\n")
+        if active_base is not None:
+            _put_record(record_queue, {**state, "segment_base": active_base}, stop_event)
+
+    try:
+        if not config.ROBOT_RELATIVE_MOTION_ENABLED:
+            raise PermissionError("ROBOT_RELATIVE_MOTION_ENABLED=False，批量真机运动被锁定。")
+        robot.connect(require_control=True)
+        first_state = robot.read_state()
+        if _dashboard_safety_status_is_normal(robot.dashboard_info) is False:
+            raise RuntimeError("Dashboard 报告机器人安全状态不是 NORMAL。")
+        if _rtde_safety_mode_is_normal(first_state) is False:
+            raise RuntimeError("RTDE 报告机器人安全状态不是 NORMAL。")
+        if _tcp_speed_norm_m_s(first_state) > stop_speed_m_s:
+            raise RuntimeError("当前 TCP 尚未静止，拒绝把当前位置定义为批次 A 点。")
+        start_pose = [float(value) for value in first_state["actual_tcp_pose"]]
+        _batch_status(status_queue, "READY", start_pose=start_pose, dashboard=robot.dashboard_info)
+
+        next_sample = time.perf_counter()
+        while not stop_event.is_set():
+            try:
+                command = command_queue.get(timeout=max(0.001, period))
+            except Empty:
+                command = None
+
+            if command is not None:
+                action = str(command.get("action", ""))
+                if action == "SHUTDOWN":
+                    break
+                if action == "OPEN_SEGMENT":
+                    if active_file is not None:
+                        raise RuntimeError("上一段机器人记录尚未关闭。")
+                    output_path = Path(command["robot_path"])
+                    if output_path.exists():
+                        raise FileExistsError(f"拒绝覆盖机器人记录：{output_path}")
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    active_file = output_path.open("x", encoding="utf-8", buffering=1)
+                    active_base = str(command["segment_base"])
+                    active_file.write(
+                        json.dumps(
+                            {
+                                "kind": "META",
+                                "created_at": datetime.now().isoformat(timespec="milliseconds"),
+                                "segment_base": active_base,
+                                "robot_host": config.ROBOT_HOST,
+                                "batch_start_pose": start_pose,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    write_state(robot.read_state())
+                    _batch_status(status_queue, "SEGMENT_OPENED", segment_base=active_base)
+                elif action == "CLOSE_SEGMENT":
+                    if active_file is None:
+                        raise RuntimeError("没有可关闭的机器人分段记录。")
+                    write_state(robot.read_state())
+                    closing_base = active_base
+                    active_file.close()
+                    active_file = None
+                    active_base = None
+                    _batch_status(status_queue, "SEGMENT_CLOSED", segment_base=closing_base)
+                elif action == "RUN_TRAJECTORY":
+                    if active_file is None or active_base != str(command["segment_base"]):
+                        raise RuntimeError("机器人运动命令与当前分段记录不匹配。")
+                    row = dict(command["row"])
+                    parameters = {
+                        "speed_mm_s": float(row["speed_mm_s"]),
+                        "one_way_time_s": float(row["one_way_time_s"]),
+                        "angle_deg": float(row.get("angle_deg", 45.0)),
+                        "x_direction": str(row.get("x_direction", "+X")),
+                        "y_direction": str(row.get("y_direction", "+Y")),
+                        "blend_mm": float(config.ROBOT_RELATIVE_BLEND_MM),
+                        "acceleration_m_s2": float(config.ROBOT_EXPERIMENT_ACCELERATION_M_S2),
+                    }
+                    before = robot.read_state()
+                    if _tcp_speed_norm_m_s(before) > stop_speed_m_s:
+                        raise RuntimeError("开始本段前 TCP 速度高于静止阈值。")
+                    current_pose = np.asarray(before["actual_tcp_pose"][:3], dtype=float)
+                    a_xyz = np.asarray(start_pose[:3], dtype=float)
+                    start_error_mm = float(np.linalg.norm(current_pose - a_xyz) * 1000.0)
+                    if start_error_mm > float(config.ROBOT_RETURN_WARNING_MM):
+                        raise RuntimeError(
+                            f"开始本段前没有回到 A 点，误差 {start_error_mm:.3f} mm。"
+                        )
+                    trajectory, computed = build_relative_motion_trajectory(
+                        str(row["trajectory_type"]), start_pose, parameters
+                    )
+                    validate_trajectory(trajectory, for_real_robot=True, pose_source="relative")
+                    robot.verify_controller_safety_limits(trajectory)
+                    active_file.write(
+                        json.dumps(
+                            {"kind": "TRAJECTORY", "computed": computed,
+                             "waypoints": [asdict(point) for point in trajectory]},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    command_host_ns = time.perf_counter_ns()
+                    robot.execute_trajectory(trajectory)
+                    motion_started = True
+                    motion_finished = False
+                    _batch_status(
+                        status_queue,
+                        "MOTION_STARTED",
+                        segment_base=active_base,
+                        system_start_ns=command_host_ns,
+                        actual_start_pose=before["actual_tcp_pose"],
+                    )
+                    deadline = time.perf_counter() + float(config.ROBOT_MOTION_TIMEOUT_S)
+                    while robot.motion_in_progress():
+                        if stop_event.is_set():
+                            robot.stop_motion()
+                            raise RuntimeError("批量实验收到停止请求，已调用 stopL。")
+                        if time.perf_counter() >= deadline:
+                            robot.stop_motion()
+                            raise TimeoutError("本段运动超过超时上限，已调用 stopL。")
+                        write_state(robot.read_state())
+                        next_sample += period
+                        time.sleep(max(0.0, next_sample - time.perf_counter()))
+                    stopped = _wait_until_tcp_stopped(robot, stop_speed_m_s, 5.0)
+                    write_state(stopped)
+                    end_pose = [float(value) for value in stopped["actual_tcp_pose"]]
+                    return_error_mm = float(
+                        np.linalg.norm(np.asarray(end_pose[:3]) - a_xyz) * 1000.0
+                    )
+                    if return_error_mm > float(config.ROBOT_RETURN_WARNING_MM):
+                        raise RuntimeError(
+                            f"本段结束后没有回到 A 点，误差 {return_error_mm:.3f} mm。"
+                        )
+                    motion_finished = True
+                    _batch_status(
+                        status_queue,
+                        "MOTION_FINISHED",
+                        segment_base=active_base,
+                        system_end_ns=int(stopped["host_ns"]),
+                        actual_end_pose=end_pose,
+                        return_error_mm=return_error_mm,
+                        tcp_speed_m_s=_tcp_speed_norm_m_s(stopped),
+                        computed=computed,
+                    )
+                else:
+                    raise ValueError(f"未知机器人批量命令：{action!r}")
+
+            if active_file is not None and time.perf_counter() >= next_sample:
+                write_state(robot.read_state())
+                next_sample = time.perf_counter() + period
+    except Exception as exc:
+        try:
+            error_queue.put(f"批量机器人进程异常：{type(exc).__name__}: {exc}", timeout=1.0)
+        except Full:
+            pass
+        stop_event.set()
+    finally:
+        if motion_started and not motion_finished:
+            robot.stop_motion()
+        if active_file is not None:
+            active_file.close()
+        robot.disconnect()
+
+
+def boundary_check_robot_worker(
+    error_queue: Any,
+    status_queue: Any,
+    envelope: dict[str, dict[str, Any]],
+    stop_event: Any,
+) -> None:
+    """Execute the operator-confirmed envelope routes from the current stopped A."""
+
+    robot = URRobot()
+    motion_active = False
+    speed_m_s = float(config.BOUNDARY_CHECK_SPEED_MM_S) / 1000.0
+    acceleration = float(config.BOUNDARY_CHECK_ACCELERATION_M_S2)
+    stop_speed_m_s = float(config.ROBOT_EXPERIMENT_STOP_SPEED_MM_S) / 1000.0
+
+    def pose_offset(a: list[float], offset_mm: list[float]) -> list[float]:
+        pose = list(a)
+        for index in range(3):
+            pose[index] += float(offset_mm[index]) / 1000.0
+        return pose
+
+    def move_leg(current: list[float], target: list[float], label: str) -> list[float]:
+        nonlocal motion_active
+        trajectory = [
+            Waypoint("leg_start", list(current), speed_m_s, acceleration, 0.0),
+            Waypoint(label, list(target), speed_m_s, acceleration, 0.0),
+        ]
+        validate_trajectory(trajectory, for_real_robot=True, pose_source="relative")
+        robot.verify_controller_safety_limits(trajectory)
+        robot.execute_trajectory(trajectory)
+        motion_active = True
+        deadline = time.perf_counter() + float(config.ROBOT_MOTION_TIMEOUT_S)
+        while robot.motion_in_progress():
+            if stop_event.is_set():
+                robot.stop_motion()
+                raise RuntimeError("视野边界检查收到停止请求，已调用 stopL。")
+            if time.perf_counter() >= deadline:
+                robot.stop_motion()
+                raise TimeoutError(f"边界检查移动到 {label} 超时。")
+            time.sleep(0.02)
+        stopped = _wait_until_tcp_stopped(robot, stop_speed_m_s, 5.0)
+        motion_active = False
+        return [float(value) for value in stopped["actual_tcp_pose"]]
+
+    def dwell(label: str) -> None:
+        _batch_status(status_queue, "DWELL", point=label)
+        deadline = time.perf_counter() + float(config.BOUNDARY_CHECK_DWELL_SECONDS)
+        while time.perf_counter() < deadline:
+            if stop_event.wait(0.05):
+                raise RuntimeError("视野边界检查在停留阶段收到停止请求。")
+
+    try:
+        if not config.ROBOT_RELATIVE_MOTION_ENABLED:
+            raise PermissionError("ROBOT_RELATIVE_MOTION_ENABLED=False，边界检查被锁定。")
+        robot.connect(require_control=True)
+        first = robot.read_state()
+        if _dashboard_safety_status_is_normal(robot.dashboard_info) is False or (
+            _rtde_safety_mode_is_normal(first) is False
+        ):
+            raise RuntimeError("机器人安全状态不是 NORMAL。")
+        if _tcp_speed_norm_m_s(first) > stop_speed_m_s:
+            raise RuntimeError("TCP 尚未静止，拒绝定义边界检查 A 点。")
+        a = [float(value) for value in first["actual_tcp_pose"]]
+        # Validate every requested endpoint against the single real A-centred
+        # workspace before acknowledging READY or sending the first move.
+        boundary_points = [Waypoint("A", list(a), speed_m_s, acceleration, 0.0)]
+        for trajectory_type in ("x_line", "xy_line", "l_shape"):
+            if trajectory_type not in envelope:
+                continue
+            item = envelope[trajectory_type]
+            if trajectory_type == "l_shape":
+                boundary_points.append(
+                    Waypoint(
+                        "L_B_max",
+                        pose_offset(a, item["point_b_offset_mm"]),
+                        speed_m_s,
+                        acceleration,
+                        0.0,
+                    )
+                )
+            boundary_points.append(
+                Waypoint(
+                    f"{trajectory_type}_max",
+                    pose_offset(a, item["farthest_offset_mm"]),
+                    speed_m_s,
+                    acceleration,
+                    0.0,
+                )
+            )
+            boundary_points.append(
+                Waypoint("A_return", list(a), speed_m_s, acceleration, 0.0)
+            )
+        validate_trajectory(boundary_points, for_real_robot=True, pose_source="relative")
+        robot.verify_controller_safety_limits(boundary_points)
+        _batch_status(status_queue, "READY", start_pose=a)
+        current = list(a)
+        for trajectory_type in ("x_line", "xy_line", "l_shape"):
+            if trajectory_type not in envelope:
+                continue
+            item = envelope[trajectory_type]
+            if trajectory_type == "l_shape":
+                b = pose_offset(a, item["point_b_offset_mm"])
+                c = pose_offset(a, item["farthest_offset_mm"])
+                current = move_leg(current, b, "L_B_max")
+                dwell("L_B_max")
+                current = move_leg(current, c, "L_C_max")
+                dwell("L_C_max")
+                current = move_leg(current, b, "L_B_return")
+                current = move_leg(current, a, "A_return")
+            else:
+                far = pose_offset(a, item["farthest_offset_mm"])
+                current = move_leg(current, far, f"{trajectory_type}_max")
+                dwell(f"{trajectory_type}_max")
+                current = move_leg(current, a, "A_return")
+            end_error_mm = float(
+                np.linalg.norm(np.asarray(current[:3]) - np.asarray(a[:3])) * 1000.0
+            )
+            if end_error_mm > float(config.ROBOT_RETURN_WARNING_MM):
+                raise RuntimeError(
+                    f"{trajectory_type} 边界路线结束后未回 A，误差 {end_error_mm:.3f} mm。"
+                )
+            _batch_status(status_queue, "ROUTE_FINISHED", trajectory_type=trajectory_type)
+        _batch_status(status_queue, "FINISHED", actual_end_pose=current)
+    except Exception as exc:
+        try:
+            error_queue.put(f"边界检查机器人异常：{type(exc).__name__}: {exc}", timeout=1.0)
+        except Full:
+            pass
+        stop_event.set()
+    finally:
+        if motion_active:
             robot.stop_motion()
         robot.disconnect()
 

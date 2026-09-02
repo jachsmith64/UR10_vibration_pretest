@@ -21,11 +21,12 @@ UR10 末端振动预实验的唯一总入口。
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import multiprocessing as mp
 import queue
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,31 @@ def record_writer_worker(record_queue: Any, output_path: Path) -> None:
             file.write(line + "\n")
 
 
+def segmented_record_writer_worker(record_queue: Any, batch_dir: Path) -> None:
+    """Route interleaved camera/robot/event records to each segment RUNLOG file."""
+
+    batch_dir = Path(batch_dir)
+    files: dict[str, Any] = {}
+    try:
+        while True:
+            record = record_queue.get()
+            if record is None:
+                break
+            segment_base = record.get("segment_base")
+            if not segment_base:
+                continue
+            segment_base = str(segment_base)
+            file = files.get(segment_base)
+            if file is None:
+                path = batch_dir / f"{segment_base}_RUNLOG.txt"
+                file = path.open("x", encoding="utf-8", buffering=1)
+                files[segment_base] = file
+            file.write(json.dumps(record, ensure_ascii=False, allow_nan=True) + "\n")
+    finally:
+        for file in files.values():
+            file.close()
+
+
 def _record_event(record_queue: Any, name: str, **extra: Any) -> None:
     """
     把主程序观察到的实验流程节点写进日志。
@@ -118,6 +144,18 @@ def _pop_worker_error(error_queue: Any) -> str | None:
         return str(error_queue.get_nowait())
     except queue.Empty:
         # 没有错误是正常状态，调用方会继续检查 ready、stop 或超时。
+        return None
+
+
+def _wait_for_worker_error(error_queue: Any, timeout_s: float = 0.5) -> str | None:
+    """Allow a multiprocessing Queue feeder to publish an error before masking it."""
+
+    immediate = _pop_worker_error(error_queue)
+    if immediate:
+        return immediate
+    try:
+        return str(error_queue.get(timeout=max(0.0, float(timeout_s))))
+    except queue.Empty:
         return None
 
 
@@ -305,11 +343,26 @@ def _sleep_with_stop_checks(
         time.sleep(0.05)
 
 
-def _relative_parameters_from_args(arguments: argparse.Namespace) -> dict[str, Any]:
+def _relative_parameters_from_args(
+    arguments: argparse.Namespace,
+    selected_mode: str,
+) -> dict[str, Any]:
     """把命令行/UI 参数整理给 robot.py 的纯轨迹函数。"""
+
+    default_times = {
+        "x_line_experiment": config.ROBOT_EXPERIMENT_DEFAULT_X_LINE_ONE_WAY_TIME_S,
+        "xy_line_experiment": config.ROBOT_EXPERIMENT_DEFAULT_XY_LINE_ONE_WAY_TIME_S,
+        "xy_l_experiment": config.ROBOT_EXPERIMENT_DEFAULT_L_ONE_WAY_TIME_S,
+    }
+    one_way_time_s = (
+        float(arguments.one_way_time_s)
+        if arguments.one_way_time_s is not None
+        else float(default_times[selected_mode])
+    )
 
     return {
         "speed_mm_s": arguments.speed_mm_s,
+        "one_way_time_s": one_way_time_s,
         "total_time_s": arguments.total_time_s,
         "angle_deg": arguments.angle_deg,
         "x_direction": arguments.x_direction,
@@ -459,7 +512,7 @@ def run_relative_motion_experiment_mode(
             "ROBOT_RELATIVE_MOTION_ENABLED=False。请在实验室完成通信测试和现场安全确认后再改为 True。"
         )
 
-    parameters = _relative_parameters_from_args(arguments)
+    parameters = _relative_parameters_from_args(arguments, selected_mode)
     stop_request_path = arguments.stop_request_path
     if stop_request_path is not None and not stop_request_path.is_absolute():
         stop_request_path = (config.PROJECT_DIR / stop_request_path).resolve()
@@ -496,7 +549,7 @@ def run_relative_motion_experiment_mode(
     # 纯计算预检只验证 UI/CLI 数字，不连接机器人；真实 A 点会在 robot worker 中重算。
     build_relative_motion_trajectory(
         selected_mode,
-        list(config.POINT_A),
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         parameters,
     )
 
@@ -663,6 +716,654 @@ def run_relative_motion_experiment_mode(
         )
 
     return run_dir
+
+
+class _StatusInbox:
+    """Match acknowledgements from a shared multiprocessing status queue."""
+
+    def __init__(self, status_queue: Any) -> None:
+        self.queue = status_queue
+        self.pending: list[dict[str, Any]] = []
+
+    def wait(
+        self,
+        source: str,
+        event: str,
+        error_queue: Any,
+        stop_event: Any,
+        stop_request_path: Path | None,
+        *,
+        segment_base: str | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        deadline = time.perf_counter() + timeout_s
+        while True:
+            for index, item in enumerate(self.pending):
+                if (
+                    item.get("source") == source
+                    and item.get("event") == event
+                    and (segment_base is None or item.get("segment_base") == segment_base)
+                ):
+                    return self.pending.pop(index)
+            worker_error = _pop_worker_error(error_queue)
+            if worker_error:
+                raise RuntimeError(worker_error)
+            external_stop = _external_stop_requested(stop_request_path)
+            if external_stop:
+                stop_event.set()
+                raise RuntimeError(f"等待 {source}/{event} 时收到用户停止请求。")
+            if stop_event.is_set():
+                worker_error = _wait_for_worker_error(error_queue)
+                raise RuntimeError(worker_error or f"等待 {source}/{event} 时收到停止请求。")
+            if time.perf_counter() >= deadline:
+                raise TimeoutError(f"等待 {source}/{event} 超时。")
+            try:
+                self.pending.append(self.queue.get(timeout=0.05))
+            except queue.Empty:
+                pass
+
+
+def _batch_safe_sleep(
+    seconds: float,
+    error_queue: Any,
+    stop_event: Any,
+    stop_request_path: Path | None,
+) -> None:
+    deadline = time.perf_counter() + float(seconds)
+    while time.perf_counter() < deadline:
+        worker_error = _pop_worker_error(error_queue)
+        if worker_error:
+            raise RuntimeError(worker_error)
+        external_stop = _external_stop_requested(stop_request_path)
+        if external_stop:
+            stop_event.set()
+            raise RuntimeError("批量状态机收到用户停止请求。")
+        if stop_event.wait(min(0.05, max(0.0, deadline - time.perf_counter()))):
+            worker_error = _wait_for_worker_error(error_queue)
+            raise RuntimeError(worker_error or "批量状态机收到停止请求。")
+
+
+def _batch_segment_meta(
+    path: Path,
+    batch_id: str,
+    row: dict[str, Any],
+    segment: dict[str, Any],
+    flash: dict[str, Any],
+) -> None:
+    payload = {
+        "kind": "BATCH_SEGMENT_META",
+        "batch_id": batch_id,
+        "condition_id": row["condition_id"],
+        "trajectory_type": row["trajectory_type"],
+        "preset_id": row["preset_id"],
+        "repeat_index": row["repeat_index"],
+        "speed_mm_s": row["speed_mm_s"],
+        "one_way_time_s": row["one_way_time_s"],
+        "nominal_one_way_distance_mm": row["nominal_one_way_distance_mm"],
+        "blend_radius_mm": (
+            config.ROBOT_RELATIVE_BLEND_MM if row["trajectory_type"] == "l_shape" else 0.0
+        ),
+        "corner_mode": "BL01" if row["trajectory_type"] == "l_shape" else "STOP",
+        "acceleration_m_s2": config.ROBOT_EXPERIMENT_ACCELERATION_M_S2,
+        "flash": flash,
+        "segment": segment,
+        "vision_processing_status": "PENDING_OFFLINE",
+    }
+    with path.open("x", encoding="utf-8") as file:
+        file.write(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=True))
+
+
+def run_batch_experiment_mode(arguments: argparse.Namespace) -> Path:
+    """Run the editable plan with one camera connection and one UR connection."""
+
+    from batch_plan import (
+        allocate_batch,
+        assert_outputs_available,
+        enabled_plan,
+        read_plan,
+        segment_output_paths,
+        segment_stem,
+        write_segments_csv,
+    )
+    from camera import batch_camera_worker
+    from robot import batch_robot_worker, build_relative_motion_trajectory
+
+    if not config.ROBOT_RELATIVE_MOTION_ENABLED:
+        raise PermissionError("ROBOT_RELATIVE_MOTION_ENABLED=False，批量实验被锁定。")
+    if arguments.batch_plan_file is None:
+        raise ValueError("batch_experiment 必须提供 --batch-plan-file。")
+    if not arguments.ui_confirmed:
+        from robot import require_operator_confirmation
+
+        require_operator_confirmation("完整批量实验")
+
+    plan = enabled_plan(read_plan(arguments.batch_plan_file))
+    if not plan:
+        raise ValueError("当前批量计划没有任何启用行。")
+    # Pure numeric preflight: start pose is deliberately synthetic and local; no old A/B/C
+    # point is imported or sent to hardware.  The worker repeats checks around the real A.
+    synthetic_a = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for row in plan:
+        if row["trajectory_type"] == "static":
+            continue
+        build_relative_motion_trajectory(
+            str(row["trajectory_type"]),
+            synthetic_a,
+            {
+                "speed_mm_s": row["speed_mm_s"],
+                "one_way_time_s": row["one_way_time_s"],
+                "angle_deg": row.get("angle_deg", 45.0),
+                "x_direction": row.get("x_direction", "+X"),
+                "y_direction": row.get("y_direction", "+Y"),
+                "blend_mm": config.ROBOT_RELATIVE_BLEND_MM,
+                "acceleration_m_s2": config.ROBOT_EXPERIMENT_ACCELERATION_M_S2,
+            },
+        )
+    naming_keys: set[tuple[str, str, int]] = set()
+    for row in plan:
+        key = (
+            str(row["trajectory_type"]),
+            str(row["condition_id"]),
+            int(row["repeat_index"]),
+        )
+        if key in naming_keys:
+            raise ValueError(
+                "计划中有两行会生成相同的轨迹/条件/重复编号文件："
+                f"{key}。请修改数值、重复序号或禁用其中一行。"
+            )
+        naming_keys.add(key)
+
+    stop_request_path = arguments.stop_request_path
+    if stop_request_path is not None and not stop_request_path.is_absolute():
+        stop_request_path = (config.PROJECT_DIR / stop_request_path).resolve()
+    _clear_stop_request_file(stop_request_path)
+    batch_id, batch_dir = allocate_batch(config.OUTPUT_ROOT, arguments.batch_manual_label)
+    all_paths: dict[int, dict[str, Path]] = {}
+    planned_files: set[Path] = set()
+    for row in plan:
+        paths = segment_output_paths(batch_dir, batch_id, row)
+        assert_outputs_available(paths)
+        duplicates = planned_files.intersection(paths.values())
+        if duplicates:
+            duplicate_text = ", ".join(str(path.name) for path in sorted(duplicates))
+            raise ValueError(
+                "计划中存在会生成同名文件的条件/重复序号，请修改后再运行："
+                + duplicate_text
+            )
+        planned_files.update(paths.values())
+        all_paths[int(row["execution_order"])] = paths
+    (batch_dir / "plan.json").write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    context = mp.get_context("spawn")
+    record_queue = context.Queue(maxsize=config.RECORD_QUEUE_MAXSIZE)
+    error_queue = context.Queue(maxsize=config.ERROR_QUEUE_MAXSIZE)
+    camera_commands = context.Queue(maxsize=16)
+    robot_commands = context.Queue(maxsize=16)
+    status_queue = context.Queue(maxsize=64)
+    stop_event = context.Event()
+    writer = context.Process(
+        target=segmented_record_writer_worker,
+        args=(record_queue, batch_dir),
+        name="batch-segment-writer",
+    )
+    camera = context.Process(
+        target=batch_camera_worker,
+        args=(record_queue, error_queue, camera_commands, status_queue, stop_event),
+        name="batch-continuous-camera",
+    )
+    robot = context.Process(
+        target=batch_robot_worker,
+        args=(record_queue, error_queue, robot_commands, status_queue, stop_event),
+        name="batch-continuous-robot",
+    )
+    inbox = _StatusInbox(status_queue)
+    segment_rows: list[dict[str, Any]] = []
+    current_row: dict[str, Any] | None = None
+    flash: dict[str, Any] = {}
+    batch_status = "RUNNING"
+    failure_message: str | None = None
+    robot_start_pose: list[float] | None = None
+
+    writer.start()
+    # 先让CB3独占完成Control/Receive初始化，再启动132 fps相机进程。
+    # 这样RTDE握手不与相机预览、取流和OpenCV初始化争用CPU/网络调度；
+    # 此时机器人只建立连接和读取静止位姿，尚未收到任何运动命令。
+    print("[状态] 正在建立UR10控制和状态连接（此阶段不会运动）", flush=True)
+    robot.start()
+    try:
+        robot_ready = inbox.wait(
+            "robot", "READY", error_queue, stop_event, stop_request_path,
+            timeout_s=config.WORKER_READY_TIMEOUT_S,
+        )
+        robot_start_pose = robot_ready["start_pose"]
+        print("[状态] UR10已连接并确认静止，正在启动工业相机", flush=True)
+        camera.start()
+        camera_ready = inbox.wait(
+            "camera", "READY", error_queue, stop_event, stop_request_path,
+            timeout_s=config.WORKER_READY_TIMEOUT_S,
+        )
+        flash_ready = inbox.wait(
+            "camera",
+            "FLASH_READY",
+            error_queue,
+            stop_event,
+            stop_request_path,
+            timeout_s=(
+                config.BRIGHTNESS_BASELINE_SECONDS
+                + config.FLASH_WAIT_TIMEOUT_SECONDS
+                + config.FLASH_RECOVERY_TIMEOUT_SECONDS
+                + config.VISION_RECOVERY_STABLE_SECONDS
+                + 2.0
+            ),
+        )
+        flash = {
+            "flash_system_ns": int(flash_ready["flash_system_ns"]),
+            "flash_system_time": flash_ready["flash_system_time"],
+            "flash_frame_id": int(flash_ready["frame_id"]),
+            "camera_actual_fps": camera_ready.get("actual_camera_fps"),
+        }
+        flash_zero_ns = int(flash_ready["flash_system_ns"])
+        print(f"[状态] 批次 {batch_id} 开始，硬件在整批期间保持连接", flush=True)
+
+        for current_row in plan:
+            paths = all_paths[int(current_row["execution_order"])]
+            segment_base = segment_stem(batch_id, current_row)
+
+            camera_commands.put(
+                {
+                    "action": "OPEN_SEGMENT",
+                    "segment_base": segment_base,
+                    "video_path": str(paths["video"]),
+                    "vision_path": str(paths["vision"]),
+                },
+                timeout=1.0,
+            )
+            robot_commands.put(
+                {
+                    "action": "OPEN_SEGMENT",
+                    "segment_base": segment_base,
+                    "robot_path": str(paths["robot"]),
+                },
+                timeout=1.0,
+            )
+            inbox.wait(
+                "camera", "SEGMENT_OPENED", error_queue, stop_event, stop_request_path,
+                segment_base=segment_base,
+            )
+            inbox.wait(
+                "robot", "SEGMENT_OPENED", error_queue, stop_event, stop_request_path,
+                segment_base=segment_base,
+            )
+            record_queue.put(
+                {
+                    "kind": "EVENT",
+                    "name": "segment_opened",
+                    "host_ns": time.perf_counter_ns(),
+                    "segment_base": segment_base,
+                },
+                timeout=1.0,
+            )
+
+            motion_started: dict[str, Any] | None = None
+            motion_finished: dict[str, Any] | None = None
+            if current_row["trajectory_type"] == "static":
+                print("[状态] 正在记录5秒静止基线", flush=True)
+                _batch_safe_sleep(
+                    config.BATCH_STATIC_BASELINE_SECONDS,
+                    error_queue,
+                    stop_event,
+                    stop_request_path,
+                )
+            else:
+                print("[状态] 当前分段先记录1秒运动前静止画面", flush=True)
+                _batch_safe_sleep(
+                    config.BATCH_PRE_MOTION_SECONDS,
+                    error_queue,
+                    stop_event,
+                    stop_request_path,
+                )
+                robot_commands.put(
+                    {"action": "RUN_TRAJECTORY", "segment_base": segment_base, "row": current_row},
+                    timeout=1.0,
+                )
+                motion_started = inbox.wait(
+                    "robot", "MOTION_STARTED", error_queue, stop_event, stop_request_path,
+                    segment_base=segment_base,
+                )
+                print(
+                    f"[状态] 执行计划顺序 {current_row['execution_order']:02d}；"
+                    f"本批启用 {len(plan)} 段；"
+                    f"{current_row['trajectory_type']} {current_row['condition_id']} "
+                    f"R{current_row['repeat_index']:02d}",
+                    flush=True,
+                )
+                motion_finished = inbox.wait(
+                    "robot",
+                    "MOTION_FINISHED",
+                    error_queue,
+                    stop_event,
+                    stop_request_path,
+                    segment_base=segment_base,
+                    timeout_s=config.ROBOT_MOTION_TIMEOUT_S + 10.0,
+                )
+                print("[状态] 已回到A点，继续记录1秒残余振动", flush=True)
+                _batch_safe_sleep(
+                    config.BATCH_POST_MOTION_SECONDS,
+                    error_queue,
+                    stop_event,
+                    stop_request_path,
+                )
+
+            camera_commands.put(
+                {"action": "CLOSE_SEGMENT", "segment_base": segment_base}, timeout=1.0
+            )
+            robot_commands.put(
+                {"action": "CLOSE_SEGMENT", "segment_base": segment_base}, timeout=1.0
+            )
+            camera_closed = inbox.wait(
+                "camera", "SEGMENT_CLOSED", error_queue, stop_event, stop_request_path,
+                segment_base=segment_base,
+            )
+            inbox.wait(
+                "robot", "SEGMENT_CLOSED", error_queue, stop_event, stop_request_path,
+                segment_base=segment_base,
+            )
+            flash_wall_time = datetime.fromisoformat(str(flash["flash_system_time"]))
+            camera_start_ns = int(camera_closed["system_start_ns"])
+            camera_end_ns = int(camera_closed["system_end_ns"])
+            system_start_time = (
+                flash_wall_time
+                + timedelta(seconds=(camera_start_ns - flash_zero_ns) / 1_000_000_000.0)
+            ).isoformat(timespec="milliseconds")
+            system_end_time = (
+                flash_wall_time
+                + timedelta(seconds=(camera_end_ns - flash_zero_ns) / 1_000_000_000.0)
+            ).isoformat(timespec="milliseconds")
+            actual_start_pose = (
+                motion_started["actual_start_pose"] if motion_started else robot_start_pose
+            )
+            actual_end_pose = (
+                motion_finished["actual_end_pose"] if motion_finished else robot_start_pose
+            )
+            segment = {
+                "batch_id": batch_id,
+                "execution_order": current_row["execution_order"],
+                "condition_id": current_row["condition_id"],
+                "trajectory_type": current_row["trajectory_type"],
+                "preset_id": current_row["preset_id"],
+                "repeat_index": current_row["repeat_index"],
+                "speed_mm_s": current_row["speed_mm_s"],
+                "one_way_time_s": current_row["one_way_time_s"],
+                "nominal_one_way_distance_mm": current_row["nominal_one_way_distance_mm"],
+                "actual_start_pose": actual_start_pose,
+                "actual_end_pose": actual_end_pose,
+                "system_start_time": system_start_time,
+                "system_end_time": system_end_time,
+                "batch_elapsed_start_s": (
+                    camera_start_ns - flash_zero_ns
+                ) / 1_000_000_000.0,
+                "batch_elapsed_end_s": (
+                    camera_end_ns - flash_zero_ns
+                ) / 1_000_000_000.0,
+                "first_frame_id": camera_closed["first_frame_id"],
+                "last_frame_id": camera_closed["last_frame_id"],
+                "flash_system_time": flash["flash_system_time"],
+                "status": "COMPLETED",
+                "output_video": str(paths["video"]),
+                "manual_label": current_row["manual_label"],
+            }
+            segment_rows.append(segment)
+            _batch_segment_meta(paths["meta"], batch_id, current_row, segment, flash)
+            write_segments_csv(batch_dir / "segments.csv", segment_rows)
+
+        batch_status = "COMPLETED"
+        print("[状态] 批量运动与录像采集完成，机械臂停在A点", flush=True)
+    except Exception as exc:
+        failure_message = f"{type(exc).__name__}: {exc}"
+        batch_status = "ABORTED" if _external_stop_requested(stop_request_path) else "FAILED"
+        stop_event.set()
+        completed_orders = {int(item["execution_order"]) for item in segment_rows}
+        for row in plan:
+            if int(row["execution_order"]) in completed_orders:
+                continue
+            paths = all_paths[int(row["execution_order"])]
+            status = (
+                "FAILED"
+                if current_row is not None
+                and int(row["execution_order"]) == int(current_row["execution_order"])
+                else "ABORTED"
+            )
+            segment_rows.append(
+                {
+                    "batch_id": batch_id,
+                    **{key: row.get(key) for key in (
+                        "execution_order", "condition_id", "trajectory_type", "preset_id",
+                        "repeat_index", "speed_mm_s", "one_way_time_s",
+                        "nominal_one_way_distance_mm", "manual_label",
+                    )},
+                    "actual_start_pose": robot_start_pose,
+                    "actual_end_pose": None,
+                    "system_start_time": "",
+                    "system_end_time": "",
+                    "batch_elapsed_start_s": "",
+                    "batch_elapsed_end_s": "",
+                    "first_frame_id": "",
+                    "last_frame_id": "",
+                    "flash_system_time": flash.get("flash_system_time", ""),
+                    "status": status,
+                    "output_video": str(paths["video"]),
+                }
+            )
+        write_segments_csv(batch_dir / "segments.csv", segment_rows)
+        print(f"[状态] 批量实验{batch_status}：{failure_message}", flush=True)
+        raise
+    finally:
+        stop_event.set()
+        for command_queue in (camera_commands, robot_commands):
+            try:
+                command_queue.put({"action": "SHUTDOWN"}, timeout=0.2)
+            except Exception:
+                pass
+        for process in (camera, robot):
+            if process.pid is not None:
+                _join_or_terminate(process)
+        try:
+            record_queue.put(None, timeout=2.0)
+        except Exception:
+            pass
+        _join_or_terminate(writer)
+        summary = {
+            "kind": "BATCH_SUMMARY",
+            "batch_id": batch_id,
+            "status": batch_status,
+            "failure_message": failure_message,
+            "manual_label": arguments.batch_manual_label,
+            "flash": flash,
+            "sony_target_file": f"{batch_id}_SONY.mp4",
+            "segment_count": len(plan),
+            "completed_count": sum(item.get("status") == "COMPLETED" for item in segment_rows),
+            "camera_restarted_between_segments": False,
+            "vision_processing_status": (
+                "PENDING_OFFLINE" if batch_status == "COMPLETED" else "NOT_STARTED"
+            ),
+        }
+        (batch_dir / "batch_META.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _clear_stop_request_file(stop_request_path)
+
+    return batch_dir
+
+
+def run_boundary_check_mode(arguments: argparse.Namespace) -> Path:
+    """Run the low-speed, no-flash, operator-observed envelope route."""
+
+    from batch_plan import compute_plan_envelope, enabled_plan, read_plan
+    from camera import boundary_camera_preview_worker
+    from robot import boundary_check_robot_worker
+
+    if arguments.batch_plan_file is None:
+        raise ValueError("boundary_check 必须提供 --batch-plan-file。")
+    if not arguments.ui_confirmed:
+        from robot import require_operator_confirmation
+
+        require_operator_confirmation("计算并检查视野边界")
+    plan = enabled_plan(read_plan(arguments.batch_plan_file))
+    envelope = compute_plan_envelope(plan)
+    if not envelope:
+        raise ValueError("当前启用计划没有运动轨迹，无法执行边界检查。")
+    stop_request_path = arguments.stop_request_path
+    if stop_request_path is not None and not stop_request_path.is_absolute():
+        stop_request_path = (config.PROJECT_DIR / stop_request_path).resolve()
+    _clear_stop_request_file(stop_request_path)
+    output_dir = config.OUTPUT_ROOT / f"boundary_check_{datetime.now():%Y%m%d_%H%M%S}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    (output_dir / "envelope.json").write_text(
+        json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    context = mp.get_context("spawn")
+    error_queue = context.Queue(maxsize=config.ERROR_QUEUE_MAXSIZE)
+    status_queue = context.Queue(maxsize=32)
+    stop_event = context.Event()
+    camera = context.Process(
+        target=boundary_camera_preview_worker,
+        args=(error_queue, status_queue, stop_event),
+        name="boundary-camera-preview",
+    )
+    robot = context.Process(
+        target=boundary_check_robot_worker,
+        args=(error_queue, status_queue, envelope, stop_event),
+        name="boundary-robot",
+    )
+    inbox = _StatusInbox(status_queue)
+    camera.start()
+    try:
+        inbox.wait(
+            "camera", "READY", error_queue, stop_event, stop_request_path,
+            timeout_s=config.WORKER_READY_TIMEOUT_S,
+        )
+        robot.start()
+        ready = inbox.wait(
+            "robot", "READY", error_queue, stop_event, stop_request_path,
+            timeout_s=config.WORKER_READY_TIMEOUT_S,
+        )
+        print(f"[状态] 边界检查A点：{ready['start_pose']}", flush=True)
+        finished = inbox.wait(
+            "robot", "FINISHED", error_queue, stop_event, stop_request_path,
+            timeout_s=config.ROBOT_MOTION_TIMEOUT_S * max(1, len(envelope)),
+        )
+        (output_dir / "result.json").write_text(
+            json.dumps({"status": "COMPLETED", **finished}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print("[状态] 视野边界检查完成，已回到A点；不会自动开始正式实验", flush=True)
+    finally:
+        stop_event.set()
+        for process in (robot, camera):
+            if process.pid is not None:
+                _join_or_terminate(process)
+        _clear_stop_request_file(stop_request_path)
+    return output_dir
+
+
+def run_batch_vision_offline_mode(arguments: argparse.Namespace) -> Path:
+    """Explicitly process a finished batch; this mode never opens camera or UR."""
+
+    from camera import write_batch_segment_vision
+
+    batch_dir = arguments.batch_dir
+    if batch_dir is None:
+        candidates = sorted(
+            (
+                path
+                for path in config.OUTPUT_ROOT.iterdir()
+                if path.is_dir() and (path / "segments.csv").exists()
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            raise FileNotFoundError("outputs 中没有包含 segments.csv 的批次目录。")
+        batch_dir = candidates[0]
+    if not batch_dir.is_absolute():
+        batch_dir = (config.PROJECT_DIR / batch_dir).resolve()
+    segments_path = batch_dir / "segments.csv"
+    if not segments_path.exists():
+        raise FileNotFoundError(f"批次目录缺少 segments.csv：{segments_path}")
+    with segments_path.open("r", encoding="utf-8-sig", newline="") as file:
+        segments = list(csv.DictReader(file))
+
+    processed_segments = 0
+    skipped_segments = 0
+    try:
+        for segment in segments:
+            if segment.get("status") != "COMPLETED":
+                continue
+            video_path = Path(segment["output_video"])
+            if not video_path.is_absolute():
+                video_path = batch_dir / video_path
+            elif not video_path.exists():
+                # Allow an intact batch folder to be copied to another computer.
+                video_path = batch_dir / video_path.name
+            vision_path = video_path.with_name(video_path.name.replace("_HIK.avi", "_VISION.txt"))
+            timestamp_path = video_path.with_name(
+                video_path.name.replace("_HIK.avi", "_FRAME_TIMESTAMPS.csv")
+            )
+            if vision_path.exists():
+                print(f"[离线识别] 已存在，跳过且不覆盖：{vision_path.name}", flush=True)
+                skipped_segments += 1
+                continue
+            segment_base = video_path.name.removesuffix("_HIK.avi")
+            count = write_batch_segment_vision(
+                video_path, timestamp_path, vision_path, segment_base
+            )
+            meta_path = video_path.with_name(video_path.name.replace("_HIK.avi", "_META.json"))
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta["vision_processing"] = {
+                    "mode": "explicit_batch_vision_offline",
+                    "processed_at": datetime.now().isoformat(timespec="seconds"),
+                    "frame_count": count,
+                    "timestamp_sidecar": str(timestamp_path),
+                    "uses_original_hardware_frame_id_and_host_ns": True,
+                }
+                meta["vision_processing_status"] = "COMPLETED"
+                meta_path.write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            processed_segments += 1
+            print(
+                f"[离线识别] {processed_segments} 段完成：{vision_path.name}，{count} 帧",
+                flush=True,
+            )
+    except Exception:
+        batch_meta_path = batch_dir / "batch_META.json"
+        if batch_meta_path.exists():
+            batch_meta = json.loads(batch_meta_path.read_text(encoding="utf-8"))
+            batch_meta["vision_processing_status"] = "FAILED"
+            batch_meta_path.write_text(
+                json.dumps(batch_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        raise
+
+    batch_meta_path = batch_dir / "batch_META.json"
+    if batch_meta_path.exists():
+        batch_meta = json.loads(batch_meta_path.read_text(encoding="utf-8"))
+        batch_meta["vision_processing_status"] = "COMPLETED"
+        batch_meta["vision_processed_at"] = datetime.now().isoformat(timespec="seconds")
+        batch_meta["vision_processed_segments"] = processed_segments
+        batch_meta["vision_skipped_existing_segments"] = skipped_segments
+        batch_meta_path.write_text(
+            json.dumps(batch_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    print(
+        f"[状态] 批次离线视觉完成：新生成 {processed_segments} 段，跳过 {skipped_segments} 段",
+        flush=True,
+    )
+    return batch_dir
 
 
 def run_experiment_mode() -> Path:
@@ -909,6 +1610,14 @@ def _parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument("--speed-mm-s", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S)
+    parser.add_argument(
+        "--one-way-time-s",
+        type=float,
+        default=None,
+        help=(
+            "A 到最远点的单程时间；省略时按轨迹使用缩短后的 X/D 或已验证的 L 默认值。"
+        ),
+    )
     parser.add_argument("--total-time-s", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S)
     parser.add_argument("--angle-deg", type=float, default=config.ROBOT_EXPERIMENT_DEFAULT_ANGLE_DEG)
     parser.add_argument("--x-direction", choices=["+X", "-X"], default="+X")
@@ -926,6 +1635,23 @@ def _parse_arguments() -> argparse.Namespace:
         default=config.ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S,
     )
     parser.add_argument("--blend-mm", type=float, default=config.ROBOT_RELATIVE_BLEND_MM)
+    parser.add_argument(
+        "--batch-plan-file",
+        type=Path,
+        default=None,
+        help="batch_experiment / boundary_check 使用的已编辑计划 JSON。",
+    )
+    parser.add_argument(
+        "--batch-manual-label",
+        default="",
+        help="批次基础名称末尾的可选人工标签。",
+    )
+    parser.add_argument(
+        "--batch-dir",
+        type=Path,
+        default=None,
+        help="batch_vision_offline 要处理的已完成批次目录；省略时取最新批次。",
+    )
     parser.add_argument(
         "--ui-confirmed",
         action="store_true",
@@ -1000,6 +1726,15 @@ def main() -> Path:
 
     if selected_mode in RELATIVE_MOTION_MODES:
         return run_relative_motion_experiment_mode(selected_mode, arguments)
+
+    if selected_mode == "batch_experiment":
+        return run_batch_experiment_mode(arguments)
+
+    if selected_mode == "batch_vision_offline":
+        return run_batch_vision_offline_mode(arguments)
+
+    if selected_mode == "boundary_check":
+        return run_boundary_check_mode(arguments)
 
     if selected_mode == "analyze":
         return run_analysis_mode(arguments.analysis_file)

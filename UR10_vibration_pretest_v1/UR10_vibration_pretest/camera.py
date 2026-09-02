@@ -27,13 +27,14 @@ import importlib
 import csv
 import json
 import math
+import os
 import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from queue import Full
+from queue import Empty, Full
 from typing import Any, Callable, Iterator, TypedDict, cast
 
 import cv2
@@ -2335,25 +2336,30 @@ def create_synthetic_demo_sequence(
 # 7. 视觉测试模式与完整实验子进程
 # =============================================================================
 
-def _resize_for_preview(image: np.ndarray) -> np.ndarray:
+def _resize_for_preview(
+    image: np.ndarray,
+    max_width: int | None = None,
+) -> np.ndarray:
     """
     生成适合屏幕预览的图像副本。
 
     输入：debug 图或其他 OpenCV 图像。
-    输出：宽度不超过 config.PREVIEW_MAX_WIDTH 的显示副本。
+    输出：宽度不超过指定上限的显示副本；未指定时使用 config.PREVIEW_MAX_WIDTH。
 
     实验作用：
     只影响人眼预览窗口，不改变算法输入、不改变日志、不改变保存的原始调试图。
     """
 
+    width_limit = int(config.PREVIEW_MAX_WIDTH if max_width is None else max_width)
+
     # 本段判断是否需要缩小。
     # 图像本来就适合屏幕显示时，直接返回，避免无意义重采样。
-    if image.shape[1] <= config.PREVIEW_MAX_WIDTH:
+    if image.shape[1] <= width_limit:
         return image
 
     # 本段按比例缩放显示图。
     # 输出只用于 cv2.imshow，保持宽高比例不变，避免预览图变形误导判断。
-    scale = config.PREVIEW_MAX_WIDTH / image.shape[1]
+    scale = width_limit / image.shape[1]
     size = (int(image.shape[1] * scale), int(image.shape[0] * scale))
 
     return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
@@ -4065,6 +4071,558 @@ def relative_motion_raw_camera_worker(
             except Full:
                 pass
         stop_event.set()
+
+
+class _FlashGate:
+    """The existing sparse-brightness flashlight rule as a reusable state machine."""
+
+    def __init__(self) -> None:
+        self.state = "baseline"
+        self.baseline_start_ns: int | None = None
+        self.samples: list[tuple[float, float]] = []
+        self.baseline_mean: float | None = None
+        self.baseline_mad: float | None = None
+        self.baseline_saturation: float | None = None
+        self.flash_wait_start_ns: int | None = None
+        self.flash_on_candidate_ns: int | None = None
+        self.flash_system_ns: int | None = None
+        self.flash_system_time: str | None = None
+        self.flash_off_ns: int | None = None
+        self.recovery_start_ns: int | None = None
+
+    @staticmethod
+    def _elapsed(start_ns: int | None, now_ns: int) -> float:
+        return 0.0 if start_ns is None else (now_ns - start_ns) / 1_000_000_000.0
+
+    def update(self, frame: np.ndarray, host_ns: int) -> list[dict[str, Any]]:
+        mean_brightness, saturation_ratio = _sparse_brightness_metrics(frame)
+        events: list[dict[str, Any]] = []
+        if self.state == "baseline":
+            if self.baseline_start_ns is None:
+                self.baseline_start_ns = host_ns
+            self.samples.append((mean_brightness, saturation_ratio))
+            if self._elapsed(self.baseline_start_ns, host_ns) >= float(
+                config.BRIGHTNESS_BASELINE_SECONDS
+            ):
+                means = np.asarray([sample[0] for sample in self.samples], dtype=float)
+                sats = np.asarray([sample[1] for sample in self.samples], dtype=float)
+                self.baseline_mean = float(np.median(means))
+                self.baseline_mad = max(
+                    float(np.median(np.abs(means - self.baseline_mean))), 1.0
+                )
+                self.baseline_saturation = float(np.median(sats))
+                self.flash_wait_start_ns = host_ns
+                self.state = "wait_flash_on"
+                events.append(
+                    {
+                        "event": "BASELINE_READY",
+                        "baseline_mean": self.baseline_mean,
+                        "baseline_mad": self.baseline_mad,
+                        "baseline_saturation": self.baseline_saturation,
+                    }
+                )
+            return events
+
+        assert self.baseline_mean is not None
+        assert self.baseline_mad is not None
+        assert self.baseline_saturation is not None
+        mean_threshold = max(
+            self.baseline_mean * (1.0 + float(config.FLASH_MEAN_RELATIVE_INCREASE)),
+            self.baseline_mean + float(config.FLASH_MEAN_ABSOLUTE_INCREASE),
+            self.baseline_mean
+            + float(config.FLASH_MEAN_MAD_MULTIPLIER) * self.baseline_mad,
+        )
+        saturation_threshold = self.baseline_saturation + float(
+            config.FLASH_SATURATION_RELATIVE_INCREASE
+        )
+        flash_on = mean_brightness >= mean_threshold or saturation_ratio >= saturation_threshold
+        recovered = (
+            mean_brightness
+            <= self.baseline_mean + float(config.FLASH_RECOVERY_MEAN_TOLERANCE)
+            and saturation_ratio
+            <= self.baseline_saturation + float(config.FLASH_RECOVERY_SATURATION_TOLERANCE)
+        )
+        if self.state == "wait_flash_on":
+            if self._elapsed(self.flash_wait_start_ns, host_ns) > float(
+                config.FLASH_WAIT_TIMEOUT_SECONDS
+            ):
+                raise TimeoutError(
+                    f"{config.FLASH_WAIT_TIMEOUT_SECONDS:g} 秒内没有检测到手电筒同步信号。"
+                )
+            if flash_on:
+                if self.flash_on_candidate_ns is None:
+                    self.flash_on_candidate_ns = host_ns
+                if self._elapsed(self.flash_on_candidate_ns, host_ns) >= float(
+                    config.FLASH_MIN_DURATION_SECONDS
+                ):
+                    self.flash_system_ns = int(self.flash_on_candidate_ns)
+                    detection_age_ns = time.perf_counter_ns() - self.flash_system_ns
+                    flash_epoch_ns = time.time_ns() - detection_age_ns
+                    self.flash_system_time = datetime.fromtimestamp(
+                        flash_epoch_ns / 1_000_000_000.0
+                    ).astimezone().isoformat(timespec="milliseconds")
+                    self.state = "wait_flash_off"
+                    events.append({"event": "FLASH_ON"})
+            else:
+                self.flash_on_candidate_ns = None
+        elif self.state == "wait_flash_off":
+            if not flash_on:
+                self.flash_off_ns = host_ns
+                self.recovery_start_ns = None
+                self.state = "recovering"
+                events.append({"event": "FLASH_OFF"})
+        elif self.state == "recovering":
+            if self._elapsed(self.flash_off_ns, host_ns) > float(
+                config.FLASH_RECOVERY_TIMEOUT_SECONDS
+            ):
+                raise TimeoutError("手电筒关闭后视野没有在限定时间内稳定恢复。")
+            if recovered:
+                if self.recovery_start_ns is None:
+                    self.recovery_start_ns = host_ns
+                if self._elapsed(self.recovery_start_ns, host_ns) >= float(
+                    config.VISION_RECOVERY_STABLE_SECONDS
+                ):
+                    self.state = "done"
+                    events.append({"event": "FLASH_READY"})
+            else:
+                self.recovery_start_ns = None
+        return events
+
+
+def _camera_status(status_queue: Any, event: str, **extra: Any) -> None:
+    status_queue.put(
+        {"source": "camera", "event": event, "host_ns": time.perf_counter_ns(), **extra},
+        timeout=1.0,
+    )
+
+
+def _update_batch_frame_gap_stats(
+    frame_id: int,
+    previous_frame_id: int | None,
+    received_frames: int,
+    missing_frames: int,
+) -> tuple[int, int, int]:
+    """Update strict frame-loss statistics after the batch-camera warm-up."""
+
+    current_frame_id = int(frame_id)
+    received_frames += 1
+    if previous_frame_id is not None:
+        gap = current_frame_id - int(previous_frame_id) - 1
+        if gap > 0:
+            missing_frames += gap
+            if gap > int(config.BATCH_MAX_CONSECUTIVE_MISSING_FRAMES):
+                raise RuntimeError(
+                    "工业相机正式监测阶段连续缺失 "
+                    f"{gap} 帧（上一帧 {previous_frame_id}，当前帧 {current_frame_id}，"
+                    f"已接收 {received_frames} 帧），超过单次允许上限 "
+                    f"{int(config.BATCH_MAX_CONSECUTIVE_MISSING_FRAMES)} 帧，"
+                    "判定为严重溢出或传输丢帧。"
+                )
+
+    if received_frames >= 100:
+        ratio = missing_frames / max(1, missing_frames + received_frames)
+        if ratio > float(config.BATCH_MAX_MISSING_RATIO):
+            raise RuntimeError(
+                f"工业相机正式监测阶段累计缺帧率 {ratio:.2%} 超过批量上限 "
+                f"{float(config.BATCH_MAX_MISSING_RATIO):.2%}"
+                f"（已接收 {received_frames} 帧，累计缺失 {missing_frames} 帧）。"
+            )
+
+    return current_frame_id, received_frames, missing_frames
+
+
+def batch_camera_worker(
+    record_queue: Any,
+    error_queue: Any,
+    command_queue: Any,
+    status_queue: Any,
+    stop_event: Any,
+) -> None:
+    """Continuously stream one camera connection and split only the output files.
+
+    Hardware frame_id and host_ns are never rebased between segments.  This
+    real-time worker does no checkerboard/circle recognition; it records AVI and
+    a timestamp sidecar for the explicit offline-vision mode.
+    """
+
+    active: dict[str, Any] | None = None
+    gate = _FlashGate()
+    previous_frame_id: int | None = None
+    received_frames = 0
+    missing_frames = 0
+    preview_last_ns = 0
+    idle_preview_period_ns = int(1_000_000_000 / float(config.BATCH_PREVIEW_FPS))
+    recording_preview_period_ns = int(
+        1_000_000_000 / float(config.BATCH_RECORDING_PREVIEW_FPS)
+    )
+    preview_window_name = "UR10 batch continuous camera"
+
+    def close_segment() -> None:
+        nonlocal active
+        if active is None:
+            raise RuntimeError("没有可关闭的相机分段记录。")
+        active["video"].release()
+        active["timestamps"].close()
+        _camera_status(
+            status_queue,
+            "SEGMENT_CLOSED",
+            segment_base=active["segment_base"],
+            first_frame_id=active["first_frame_id"],
+            last_frame_id=active["last_frame_id"],
+            system_start_ns=active["system_start_ns"],
+            system_end_ns=active["system_end_ns"],
+            frame_count=active["frame_count"],
+        )
+        active = None
+
+    try:
+        # OpenCV 首次创建窗口可能阻塞上百毫秒。先于相机取流创建窗口，避免这段
+        # GUI 初始化时间落进正式 frame_id 连续性检查。
+        if config.SHOW_PREVIEW:
+            cv2.namedWindow(preview_window_name)
+
+        with HikCameraSource() as source:
+            iterator = iter(source)
+            fps = float(source.actual_camera_fps or config.EXPECTED_VISION_FPS or 30.0)
+
+            # 相机和并行进程刚启动时先持续排空 SDK 帧，并完成第一次 imshow。
+            # 预热帧不是实验数据，不参与手电筒基线或正式缺帧率；预热结束后
+            # first 会成为新的 frame_id 基准，后续检查仍使用原来的严格阈值。
+            warmup_start_ns: int | None = None
+            first: FramePacket | None = None
+            warmup_frames = 0
+            print(
+                f"[状态] 工业相机正在预热 {config.BATCH_CAMERA_WARMUP_SECONDS:g} 秒，"
+                "初始化预览并排空启动帧",
+                flush=True,
+            )
+            while first is None:
+                packet = next(iterator)
+                if stop_event.is_set():
+                    return
+                warmup_frames += 1
+                if warmup_start_ns is None:
+                    warmup_start_ns = int(packet.host_ns)
+                if (
+                    config.SHOW_PREVIEW
+                    and int(packet.host_ns) - preview_last_ns >= idle_preview_period_ns
+                ):
+                    preview_last_ns = int(packet.host_ns)
+                    cv2.imshow(
+                        preview_window_name,
+                        _resize_for_preview(
+                            packet.frame,
+                            max_width=int(config.BATCH_PREVIEW_MAX_WIDTH),
+                        ),
+                    )
+                    if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                        raise RuntimeError("相机预览窗口收到 q/Esc。")
+                if (
+                    int(packet.host_ns) - warmup_start_ns
+                    >= int(float(config.BATCH_CAMERA_WARMUP_SECONDS) * 1_000_000_000)
+                ):
+                    first = packet
+
+            _camera_status(status_queue, "READY", actual_camera_fps=fps)
+            print(
+                f"[状态] 工业相机预热完成（排空 {warmup_frames} 帧），"
+                "已重新建立帧号基准，正在记录0.5秒亮度基线",
+                flush=True,
+            )
+
+            for packet in (item for pair in ((first,), iterator) for item in pair):
+                if stop_event.is_set():
+                    break
+                frame = packet.frame
+                previous_frame_id, received_frames, missing_frames = (
+                    _update_batch_frame_gap_stats(
+                        int(packet.frame_id),
+                        previous_frame_id,
+                        received_frames,
+                        missing_frames,
+                    )
+                )
+
+                if gate.state != "done":
+                    for event in gate.update(frame, int(packet.host_ns)):
+                        if event["event"] == "BASELINE_READY":
+                            print(
+                                f"[状态] 请打开再关闭手机手电筒；最长等待 {config.FLASH_WAIT_TIMEOUT_SECONDS:g} 秒",
+                                flush=True,
+                            )
+                        elif event["event"] == "FLASH_ON":
+                            print("[状态] 已检测到亮度明显跳变，请关闭手电筒", flush=True)
+                        elif event["event"] == "FLASH_OFF":
+                            print("[状态] 已检测到手电筒关闭，等待画面稳定", flush=True)
+                        elif event["event"] == "FLASH_READY":
+                            _camera_status(
+                                status_queue,
+                                "FLASH_READY",
+                                flash_system_ns=gate.flash_system_ns,
+                                flash_system_time=gate.flash_system_time,
+                                frame_id=int(packet.frame_id),
+                            )
+                            print("[状态] 手电筒同步完成，批量运动门禁已放行", flush=True)
+
+                while True:
+                    try:
+                        command = command_queue.get_nowait()
+                    except Empty:
+                        break
+                    action = str(command.get("action", ""))
+                    if action == "SHUTDOWN":
+                        stop_event.set()
+                        break
+                    if action == "OPEN_SEGMENT":
+                        if gate.state != "done":
+                            raise RuntimeError("手电筒门禁未完成，拒绝打开正式分段。")
+                        if active is not None:
+                            raise RuntimeError("上一段相机记录尚未关闭。")
+                        video_path = Path(command["video_path"])
+                        vision_path = Path(command["vision_path"])
+                        timestamp_path = video_path.with_name(
+                            video_path.name.replace("_HIK.avi", "_FRAME_TIMESTAMPS.csv")
+                        )
+                        for path in (video_path, vision_path, timestamp_path):
+                            if path.exists():
+                                raise FileExistsError(f"拒绝覆盖相机输出：{path}")
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        height, width = gray.shape[:2]
+                        writer = cv2.VideoWriter(
+                            str(video_path),
+                            cv2.VideoWriter_fourcc(*str(config.BATCH_VIDEO_CODEC)),
+                            fps,
+                            (width, height),
+                            False,
+                        )
+                        if not writer.isOpened():
+                            raise RuntimeError(f"无法创建分段录像：{video_path}")
+                        timestamp_file = timestamp_path.open(
+                            "x", encoding="utf-8-sig", newline="", buffering=262_144
+                        )
+                        timestamp_writer = csv.DictWriter(
+                            timestamp_file,
+                            fieldnames=(
+                                "segment_frame_index",
+                                "frame_id",
+                                "host_ns",
+                                "camera_timestamp_raw",
+                            ),
+                        )
+                        timestamp_writer.writeheader()
+                        active = {
+                            "segment_base": str(command["segment_base"]),
+                            "video": writer,
+                            "vision_path": vision_path,
+                            "timestamps": timestamp_file,
+                            "timestamp_writer": timestamp_writer,
+                            "timestamp_path": timestamp_path,
+                            "first_frame_id": None,
+                            "last_frame_id": None,
+                            "system_start_ns": None,
+                            "system_end_ns": None,
+                            "frame_count": 0,
+                            "start_on_next_frame": True,
+                        }
+                        # VideoWriter 初始化发生在刚取到当前帧之后，可能占用数个相机周期。
+                        # 当前帧不写入新分段；从下一帧重新建立连续性基准并正式记录。
+                        previous_frame_id = None
+                        _camera_status(
+                            status_queue, "SEGMENT_OPENED", segment_base=active["segment_base"]
+                        )
+                    elif action == "CLOSE_SEGMENT":
+                        close_segment()
+                        # release()/文件落盘可能短暂阻塞。下一帧属于段间空闲期，
+                        # 不把文件封口耗时误判为相机传输丢帧。
+                        previous_frame_id = None
+                    else:
+                        raise ValueError(f"未知相机批量命令：{action!r}")
+
+                debug = frame
+                if active is not None:
+                    if active.pop("start_on_next_frame", False):
+                        # The next iteration is the first recorded frame.  Skipping this
+                        # already-retrieved frame keeps writer-open latency outside the AVI.
+                        pass
+                    else:
+                        gray = (
+                            frame
+                            if frame.ndim == 2
+                            else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        )
+                        active["video"].write(gray)
+                        active["timestamp_writer"].writerow(
+                            {
+                                "segment_frame_index": active["frame_count"],
+                                "frame_id": int(packet.frame_id),
+                                "host_ns": int(packet.host_ns),
+                                "camera_timestamp_raw": packet.camera_timestamp_raw,
+                            }
+                        )
+                        if not _put_record(
+                            record_queue,
+                            {
+                                "kind": "CAMERA_FRAME",
+                                "segment_base": active["segment_base"],
+                                "frame_id": int(packet.frame_id),
+                                "host_ns": int(packet.host_ns),
+                                "camera_timestamp_raw": packet.camera_timestamp_raw,
+                                "segment_frame_index": active["frame_count"],
+                            },
+                            stop_event,
+                        ):
+                            raise RuntimeError("批量记录队列严重溢出，已停止后续计划。")
+                        if active["first_frame_id"] is None:
+                            active["first_frame_id"] = int(packet.frame_id)
+                            active["system_start_ns"] = int(packet.host_ns)
+                        active["last_frame_id"] = int(packet.frame_id)
+                        active["system_end_ns"] = int(packet.host_ns)
+                        active["frame_count"] += 1
+
+                # 正式录像期间仍显示运动，但预览使用较小尺寸和独立低帧率；
+                # active["video"].write(gray) 始终保存完整图像，不使用这个预览副本。
+                preview_period_ns = (
+                    recording_preview_period_ns
+                    if active is not None
+                    else idle_preview_period_ns
+                )
+                if (
+                    config.SHOW_PREVIEW
+                    and int(packet.host_ns) - preview_last_ns >= preview_period_ns
+                ):
+                    preview_last_ns = int(packet.host_ns)
+                    cv2.imshow(
+                        preview_window_name,
+                        _resize_for_preview(
+                            debug,
+                            max_width=int(config.BATCH_PREVIEW_MAX_WIDTH),
+                        ),
+                    )
+                    if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                        raise RuntimeError("相机预览窗口收到 q/Esc。")
+    except StopIteration:
+        try:
+            error_queue.put("批量相机没有返回任何图像。", timeout=1.0)
+        except Full:
+            pass
+        stop_event.set()
+    except Exception as exc:
+        try:
+            error_queue.put(f"批量相机进程异常：{type(exc).__name__}: {exc}", timeout=1.0)
+        except Full:
+            pass
+        stop_event.set()
+    finally:
+        if active is not None:
+            try:
+                active["video"].release()
+                active["timestamps"].close()
+            except Exception:
+                pass
+        cv2.destroyAllWindows()
+
+
+def write_batch_segment_vision(
+    video_path: Path,
+    timestamp_path: Path,
+    vision_path: Path,
+    segment_base: str,
+) -> int:
+    """Run the unchanged VisionProcessor after hardware capture has safely ended."""
+
+    video_path = Path(video_path)
+    timestamp_path = Path(timestamp_path)
+    vision_path = Path(vision_path)
+    if vision_path.exists():
+        raise FileExistsError(f"拒绝覆盖视觉结果：{vision_path}")
+    temp_vision_path = vision_path.with_name(vision_path.name + f".{os.getpid()}.tmp")
+    with timestamp_path.open("r", encoding="utf-8-sig", newline="") as timestamp_file:
+        timestamps = list(csv.DictReader(timestamp_file))
+    processor = VisionProcessor()
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"无法打开批量分段录像做离线识别：{video_path}")
+    processed = 0
+    try:
+        with temp_vision_path.open("x", encoding="utf-8", buffering=1) as output:
+            output.write(
+                json.dumps(
+                    {
+                        "kind": "META",
+                        "mode": "batch_offline_vision",
+                        "segment_base": segment_base,
+                        "source_video": str(video_path),
+                        "source_timestamps": str(timestamp_path),
+                        "vision_method": config.VISION_METHOD,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if processed >= len(timestamps):
+                    raise RuntimeError("AVI 帧数多于侧车时间戳行数。")
+                timing = timestamps[processed]
+                packet = FramePacket(
+                    frame=frame,
+                    frame_id=int(timing["frame_id"]),
+                    host_ns=int(timing["host_ns"]),
+                    camera_timestamp_raw=(
+                        None
+                        if timing["camera_timestamp_raw"] in ("", "None")
+                        else int(timing["camera_timestamp_raw"])
+                    ),
+                    source_name=f"batch_video:{video_path.name}",
+                    capture_index=processed,
+                )
+                result, _ = processor.process_frame(packet)
+                result["analysis_time_s"] = packet.host_ns * 1e-9
+                result["segment_base"] = segment_base
+                output.write(json.dumps(result, ensure_ascii=False, allow_nan=True) + "\n")
+                processed += 1
+    finally:
+        capture.release()
+    if processed != len(timestamps):
+        raise RuntimeError(
+            f"AVI 实际解码 {processed} 帧，与时间戳 {len(timestamps)} 行不一致。"
+        )
+    if vision_path.exists():
+        raise FileExistsError(f"离线识别期间目标文件已出现，拒绝覆盖：{vision_path}")
+    temp_vision_path.replace(vision_path)
+    return processed
+
+
+def boundary_camera_preview_worker(
+    error_queue: Any,
+    status_queue: Any,
+    stop_event: Any,
+) -> None:
+    """Keep a live camera preview open during the manually judged envelope check."""
+
+    try:
+        with HikCameraSource() as source:
+            iterator = iter(source)
+            first = next(iterator)
+            _camera_status(status_queue, "READY", first_frame_id=int(first.frame_id))
+            for packet in (item for pair in ((first,), iterator) for item in pair):
+                if stop_event.is_set():
+                    break
+                cv2.imshow("UR10 view-boundary check (operator judges view)", _resize_for_preview(packet.frame))
+                if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                    stop_event.set()
+                    break
+    except Exception as exc:
+        try:
+            error_queue.put(f"边界检查相机异常：{type(exc).__name__}: {exc}", timeout=1.0)
+        except Full:
+            pass
+        stop_event.set()
+    finally:
+        cv2.destroyAllWindows()
 
 
 def camera_worker(

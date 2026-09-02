@@ -62,6 +62,9 @@ VALID_RUN_MODES: Final[set[str]] = {
     "x_line_experiment",  # 以当前 TCP 为 A 点，执行 X 方向往返相对运动并采 RAW。
     "xy_line_experiment", # 以当前 TCP 为 A 点，执行 X-Y 倾斜直线往返并采 RAW。
     "xy_l_experiment",    # 以当前 TCP 为 A 点，执行 X-Y 平面 L 折线往返并采 RAW。
+    "batch_experiment",   # 相机和 UR 各初始化一次，按 UI 计划连续执行分段批量实验。
+    "batch_vision_offline", # 批次采集结束后，另行读取 AVI 和侧车时间戳做视觉识别。
+    "boundary_check",     # 不等待手电筒，只显示实时画面并低速检查当前计划最大包络。
     "analyze",        # 读取已有 TXT/JSONL 记录并生成振动分析结果。
 }
 
@@ -373,6 +376,10 @@ HIK_FRAME_TIMEOUT_MS = 1000
 ROBOT_HOST = "192.168.125.12"
 ROBOT_DASHBOARD_PORT = 29999
 ROBOT_CONNECT_TIMEOUT_S = 5.0
+# CB3 在上一次RTDE控制脚本刚释放或网络瞬时抖动时，可能主动关闭新会话。
+# 重试仅发生在任何轨迹下发之前；每次失败都会先停止/断开已创建的接口。
+ROBOT_RTDE_CONNECT_ATTEMPTS = 3
+ROBOT_RTDE_CONNECT_RETRY_DELAY_S = 1.0
 
 # 本段把 robot_test 拆成“只连机读取”和“允许低速动一下”两级。
 # 输入：ROBOT_TEST_ALLOW_MOTION；输出：robot_test 是否会发送 A→B 测试运动。
@@ -450,20 +457,55 @@ ROBOT_TEST_ACCELERATION_M_S2 = 0.05
 # 本段服务三个相对运动实验的默认 UI 参数和安全范围。
 # 输入：启动器或命令行传入的 mm/s、秒、角度、方向；输出：main.py/robot.py 二次校验后的相对轨迹。
 # 实验作用：每次从当前实际 TCP 作为 A 点，只改 X/Y，不复用示例 POINT_A/B/C。
-ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S = 3.0
-ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S = 15.0
-ROBOT_EXPERIMENT_DEFAULT_X_ONE_WAY_TIME_S = 3.75
-ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S = 3.75
+ROBOT_EXPERIMENT_DEFAULT_SPEED_MM_S = 1.0
+ROBOT_EXPERIMENT_DEFAULT_ONE_WAY_TIME_S = 9.0
+# P01 的 L 时间保持 9 s；X/D 每轴缩为同预设 L 单轴位移的 2/3。
+# 现场输入只保留 0.1 s，并向下取整以保证实际包络不超过 2/3 目标。
+ROBOT_EXPERIMENT_DEFAULT_X_LINE_ONE_WAY_TIME_S = 3.0
+ROBOT_EXPERIMENT_DEFAULT_XY_LINE_ONE_WAY_TIME_S = 4.2
+ROBOT_EXPERIMENT_DEFAULT_L_ONE_WAY_TIME_S = ROBOT_EXPERIMENT_DEFAULT_ONE_WAY_TIME_S
+# 旧命令行参数只作为兼容入口；新 UI 和批量计划统一使用 ONE_WAY_TIME。
+ROBOT_EXPERIMENT_DEFAULT_TOTAL_TIME_S = 2.0 * ROBOT_EXPERIMENT_DEFAULT_ONE_WAY_TIME_S
+ROBOT_EXPERIMENT_DEFAULT_X_ONE_WAY_TIME_S = ROBOT_EXPERIMENT_DEFAULT_ONE_WAY_TIME_S / 2.0
+ROBOT_EXPERIMENT_DEFAULT_Y_ONE_WAY_TIME_S = ROBOT_EXPERIMENT_DEFAULT_ONE_WAY_TIME_S / 2.0
 ROBOT_EXPERIMENT_DEFAULT_ANGLE_DEG = 45.0
-ROBOT_EXPERIMENT_ACCELERATION_M_S2 = 0.01
+ROBOT_EXPERIMENT_ACCELERATION_M_S2 = 0.10
 ROBOT_EXPERIMENT_MIN_SPEED_MM_S = 0.5
-ROBOT_EXPERIMENT_MAX_SPEED_MM_S = 10.0
-ROBOT_EXPERIMENT_MAX_SEGMENT_MM = 50.0
+ROBOT_EXPERIMENT_MAX_SPEED_MM_S = 20.0
+ROBOT_EXPERIMENT_MAX_SEGMENT_MM = 100.0
 ROBOT_EXPERIMENT_MAX_TOTAL_TIME_S = 120.0
 ROBOT_EXPERIMENT_MAX_ANGLE_DEG = 90.0
 ROBOT_EXPERIMENT_STOP_SPEED_MM_S = 0.2
 ROBOT_RETURN_WARNING_MM = 0.5
-ROBOT_RELATIVE_BLEND_MM = 0.0
+ROBOT_RELATIVE_BLEND_MM = 1.0
+
+# 批量状态机：每段运动前记录 1 s，回到 A 后记录 1 s。
+# 相邻运动之间不再额外等待；这两段画面共同提供约 2 s 的分析窗口。
+BATCH_STATIC_BASELINE_SECONDS = 5.0
+BATCH_PRE_MOTION_SECONDS = 1.0
+BATCH_POST_MOTION_SECONDS = 1.0
+BATCH_VIDEO_CODEC = "MJPG"
+# 批量相机刚启动时，Windows 创建预览窗口和并行子进程加载可能造成一次短暂停顿。
+# 预热期间持续取帧并初始化预览，但不做正式缺帧统计，也不进入手电筒亮度基线。
+# 预热结束后重新建立 frame_id 基准；正式批量期间的缺帧保护仍保持不变。
+BATCH_CAMERA_WARMUP_SECONDS = 1.0
+# 手电筒门禁和段间空闲时保留正常预览。
+BATCH_PREVIEW_FPS = 10.0
+# 整个批量流程始终使用相同的小画幅预览，避免静止/运动切换时窗口忽大忽小；
+# 正式录像仍使用相机完整分辨率和真实帧率，不会因此裁剪或降低保存分辨率。
+BATCH_RECORDING_PREVIEW_FPS = 10.0
+BATCH_PREVIEW_MAX_WIDTH = 700
+# 批量累计缺帧率只有严格超过 15% 才中止；零星单帧缺失保留在时间戳中，
+# 后续离线分析按真实 frame_id/time 基准处理。连续大段断流仍由下一项独立拦截。
+BATCH_MAX_MISSING_RATIO = 0.15
+# 132 fps 下允许单次连续缺失最多 30 帧（约 0.23 s）；只有超过 30 帧
+# 才立即判定为严重断流。累计零星缺帧另由上面的 15% 阈值约束。
+BATCH_MAX_CONSECUTIVE_MISSING_FRAMES = 30
+
+# 计划最大包络人工检查使用固定低速参数；检查完成后不会自动进入批量实验。
+BOUNDARY_CHECK_SPEED_MM_S = 10.0
+BOUNDARY_CHECK_ACCELERATION_M_S2 = 0.05
+BOUNDARY_CHECK_DWELL_SECONDS = 2.0
 
 # 本段给三个相对运动实验定义“以本次实际 A 点为中心”的动态工作区半径。
 # 输入：机器人连接后读取的当前 TCP；输出：本次运行 X/Y/Z 各自 [A-0.20, A+0.20] m 的边界。
@@ -770,11 +812,15 @@ def validate_config(run_mode: str | None = None) -> None:
         "x_line_experiment",
         "xy_line_experiment",
         "xy_l_experiment",
+        "batch_experiment",
+        "boundary_check",
     }
     relative_motion_modes = {
         "x_line_experiment",
         "xy_line_experiment",
         "xy_l_experiment",
+        "batch_experiment",
+        "boundary_check",
     }
 
     if selected_mode in robot_modes and CONTROL_MODE == "sfc":
@@ -791,6 +837,11 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if ROBOT_CONNECTION_TEST_SECONDS <= 0:
         raise ValueError("ROBOT_CONNECTION_TEST_SECONDS 必须为正数。")
+
+    if ROBOT_RTDE_CONNECT_ATTEMPTS < 1:
+        raise ValueError("ROBOT_RTDE_CONNECT_ATTEMPTS 必须至少为 1。")
+    if ROBOT_RTDE_CONNECT_RETRY_DELAY_S < 0:
+        raise ValueError("ROBOT_RTDE_CONNECT_RETRY_DELAY_S 不能为负数。")
 
     if ROBOT_RECORD_HZ <= 0:
         raise ValueError("ROBOT_RECORD_HZ 必须为正数。")
@@ -815,6 +866,30 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M <= 0:
         raise ValueError("ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M 必须为正数。")
+
+    for name, value in {
+        "BATCH_STATIC_BASELINE_SECONDS": BATCH_STATIC_BASELINE_SECONDS,
+        "BATCH_PRE_MOTION_SECONDS": BATCH_PRE_MOTION_SECONDS,
+        "BATCH_POST_MOTION_SECONDS": BATCH_POST_MOTION_SECONDS,
+        "BATCH_CAMERA_WARMUP_SECONDS": BATCH_CAMERA_WARMUP_SECONDS,
+        "BATCH_PREVIEW_FPS": BATCH_PREVIEW_FPS,
+        "BATCH_RECORDING_PREVIEW_FPS": BATCH_RECORDING_PREVIEW_FPS,
+        "BATCH_PREVIEW_MAX_WIDTH": BATCH_PREVIEW_MAX_WIDTH,
+        "BOUNDARY_CHECK_SPEED_MM_S": BOUNDARY_CHECK_SPEED_MM_S,
+        "BOUNDARY_CHECK_ACCELERATION_M_S2": BOUNDARY_CHECK_ACCELERATION_M_S2,
+        "BOUNDARY_CHECK_DWELL_SECONDS": BOUNDARY_CHECK_DWELL_SECONDS,
+    }.items():
+        if value <= 0:
+            raise ValueError(f"{name} 必须为正数。")
+
+    if len(BATCH_VIDEO_CODEC) != 4:
+        raise ValueError("BATCH_VIDEO_CODEC 必须是 4 个字符的 FourCC。")
+
+    if not 0.0 <= BATCH_MAX_MISSING_RATIO <= 1.0:
+        raise ValueError("BATCH_MAX_MISSING_RATIO 必须在 0 到 1 之间。")
+
+    if BATCH_MAX_CONSECUTIVE_MISSING_FRAMES < 1:
+        raise ValueError("BATCH_MAX_CONSECUTIVE_MISSING_FRAMES 必须至少为 1。")
 
     for name, value in {
         "BRIGHTNESS_BASELINE_SECONDS": BRIGHTNESS_BASELINE_SECONDS,
