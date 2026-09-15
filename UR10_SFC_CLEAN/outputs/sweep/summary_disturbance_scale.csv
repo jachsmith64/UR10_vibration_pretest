@@ -1,0 +1,7 @@
+scale,case_id,mode,e_rms_um,peak_abs_um,ptp_um,vib_rms_um,asfc_vs_this_level_linear_rms_pct,asfc_vs_this_level_linear_peak_pct,vs_A0_at_s1_rms_pct,note
+0.5,s0.50_Alinear,Alinear,6.54141,38.2052,73.6765,4.21702,nan,nan,60.7139,相对 A0 一列以 s=1.0 的 A0 为分母（每档只跑了 Alinear/ASFC）
+0.5,s0.50_ASFC_strong,ASFC,5.45489,34.1037,65.0458,2.78847,16.6098,10.7353,67.2392,相对 A0 一列以 s=1.0 的 A0 为分母（每档只跑了 Alinear/ASFC）
+1,Alinear,Alinear,12.3347,70.5742,141.137,8.43575,nan,nan,25.9206,相对 A0 一列以 s=1.0 的 A0 为分母（每档只跑了 Alinear/ASFC）
+1,ASFC_strong,ASFC,9.65149,59.515,118.275,5.00695,21.7536,15.6704,42.0355,相对 A0 一列以 s=1.0 的 A0 为分母（每档只跑了 Alinear/ASFC）
+1.5,s1.50_Alinear,Alinear,18.3107,105.678,208.598,12.657,nan,nan,-9.9699,相对 A0 一列以 s=1.0 的 A0 为分母（每档只跑了 Alinear/ASFC）
+1.5,s1.50_ASFC_strong,ASFC,13.7762,85.2672,168.655,6.99745,24.7643,19.314,17.2634,相对 A0 一列以 s=1.0 的 A0 为分母（每档只跑了 Alinear/ASFC）

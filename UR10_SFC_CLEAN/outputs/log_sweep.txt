@@ -1,0 +1,175 @@
+[批处理] 冻结 Fd：fd_frozen.csv（sha12=58858d990d4f，62853 点，t∈[0.000, 62.852] s）
+[批处理] 名义轨迹 62853 点，远点 153.5 mm
+[批处理] phase 列已还原：{np.int64(0): np.int64(1927), np.int64(1): np.int64(29184), np.int64(2): np.int64(1065), np.int64(3): np.int64(29494), np.int64(4): np.int64(1183)}（编码 ('start', 'fwd_steady', 'turn', 'ret_steady', 'stop')）
+[批处理] 参考列 e_raw/b/e_vib 各 62853 点（e_vib rms=18.123 µm）
+
+[1] A0（无控制基准，只跑一次）
+  → A0                           mode=A0               K=  5000.0 B0=  400.0 n=3.00 μ=0.0000e+00 r= 0.00
+      e_rms=16.651 µm  峰值=102.349 µm  F_shr/F_lin=nan
+
+[2] 由 A0 速度分布定 v_ref
+  v_ref = 6.6799e-04 m/s（|v| 的 75 百分位，已去首尾各 3 s；rms=5.9472e-04，峰值=3.1296e-03）
+
+[3] Alinear（线性阻抗基准，只跑一次）
+  → Alinear                      mode=Alinear          K=  5000.0 B0=  400.0 n=1.00 μ=0.0000e+00 r= 0.00
+      e_rms=12.335 µm  峰值=70.574 µm  F_shr/F_lin=0.0000
+
+[4] ASFC 正式组（参数由 config.ROUND_GROUPS 指定，不做任何寻优）
+  → ASFC_default                 mode=ASFC             K=  5000.0 B0=  400.0 n=3.00 μ=8.9644e+08 r= 1.00
+      e_rms=11.590 µm  峰值=68.483 µm  F_shr/F_lin=1.2544
+  → ASFC_medium                  mode=ASFC             K=  5000.0 B0=  400.0 n=2.00 μ=1.1976e+06 r= 2.00
+      e_rms=10.835 µm  峰值=65.602 µm  F_shr/F_lin=1.8391
+  → ASFC_strong                  mode=ASFC             K=  5000.0 B0=  400.0 n=1.50 μ=6.1906e+04 r= 4.00
+      e_rms=9.651 µm  峰值=59.515 µm  F_shr/F_lin=3.3405
+
+[5] 正式组对比（纯数值，无图）
+[分析] 由时间戳反推采样率 f_s = 200.0000 Hz（物理步长 1000 Hz，抽稀步长 5）
+
+============================================================================
+正式组对照结果（同一冻结 Fd、同一起始状态、同一名义轨迹）
+============================================================================
+组                   总RMS(µm)      峰值(µm)      峰峰(µm)     慢成分(µm)     振动带(µm)
+A0                    16.651     102.349     192.531      11.108      11.071
+Alinear               12.335      70.574     141.137       8.061       8.436
+ASFC_default          11.590      68.483     134.324       8.074       7.035
+ASFC_medium           10.835      65.602     129.094       7.756       6.255
+ASFC_strong            9.651      59.515     118.275       7.204       5.007
+----------------------------------------------------------------------------
+  Alinear 相对 A0  rms_um                         +25.92%
+  Alinear 相对 A0  vib_rms_um                     +23.80%
+  Alinear 相对 A0  peak_abs_um                    +31.05%
+  ASFC_default 相对 A0  rms_um                    +30.39%
+  ASFC_default 相对 A0  vib_rms_um                +36.46%
+  ASFC_default 相对 A0  peak_abs_um               +33.09%
+  ASFC_medium 相对 A0  rms_um                     +34.93%
+  ASFC_medium 相对 A0  vib_rms_um                 +43.50%
+  ASFC_medium 相对 A0  peak_abs_um                +35.90%
+  ASFC_strong 相对 A0  rms_um                     +42.04%
+  ASFC_strong 相对 A0  vib_rms_um                 +54.77%
+  ASFC_strong 相对 A0  peak_abs_um                +41.85%
+  ASFC_strong 相对 Alinear  rms_um                +21.75%
+  ASFC_strong 相对 Alinear  vib_rms_um            +40.65%
+  ASFC_strong 相对 Alinear  peak_abs_um           +15.67%
+----------------------------------------------------------------------------
+  剪切项激活（ASFC_strong）：|v| rms=2.945e-04 峰值=1.258e-03 m/s
+      F_linear rms=0.1178 N  F_shear rms=0.3936 N  (剪切/线性=3.3413)
+      剪切项恒与速度反向：True   P_shear>0 比例：0.00e+00
+  输入一致性：Fd 最大差 0.000e+00，y_d 最大差 0.000e+00，沿程最大差 0.000e+00，Fd SHA 一致 True
+============================================================================
+
+  已写出 summary_main.csv
+
+[6] 测试A：Fd_test = s·Fd，只跑 Alinear 与 ASFC_strong
+  → s0.50_Alinear                mode=Alinear          K=  5000.0 B0=  400.0 n=1.00 μ=0.0000e+00 r= 0.00  [s=0.5]
+      e_rms=6.541 µm  峰值=38.205 µm  F_shr/F_lin=0.0000
+  → s0.50_ASFC_strong            mode=ASFC             K=  5000.0 B0=  400.0 n=1.50 μ=6.1906e+04 r= 4.00  [s=0.5]
+      e_rms=5.455 µm  峰值=34.104 µm  F_shr/F_lin=2.5348
+  = s=1.00 复用正式组 Alinear / ASFC_strong
+  → s1.50_Alinear                mode=Alinear          K=  5000.0 B0=  400.0 n=1.00 μ=0.0000e+00 r= 0.00  [s=1.5]
+      e_rms=18.311 µm  峰值=105.678 µm  F_shr/F_lin=0.0000
+  → s1.50_ASFC_strong            mode=ASFC             K=  5000.0 B0=  400.0 n=1.50 μ=6.1906e+04 r= 4.00  [s=1.5]
+      e_rms=13.776 µm  峰值=85.267 µm  F_shr/F_lin=3.9319
+  额外改善随幅值变化：s=0.5 → +16.61%  s=1 → +21.75%  s=1.5 → +24.76%
+  额外改善随扰动幅值增大而增大
+  已写出 summary_disturbance_scale.csv
+
+[7] 测试B：b̂ = b + Δb，重新重建 Fd 并只跑 ASFC_strong
+[重建] 读入实验数据 971 帧，dt 中位 7.56 ms，丢帧 4.54%
+[重建] 切窗 iA/iB/iP/iC/iD = 1926/3461/3862/4524/6573
+[慢偏移] b_pre =   -0.044 µm  (n=1285)
+[慢偏移] b_out =  +24.153 µm  (n=1536, x 3.20..11.00 mm)
+[慢偏移] b_ret =  -18.964 µm  (n=2050, x 10.67..0.17 mm)
+[慢偏移] b_post=   +4.094 µm  (n=1142)
+[慢偏移] 窗口敏感性：fwd 2.76 µm、ret 1.22 µm（±100 点内缩）
+[慢偏移] b(t) 范围 -18.96..24.15 µm
+[慢偏移] e_raw rms 35.526 → e_vib rms 27.996 µm (−21.2%)
+[慢偏移] 验收 通过：26/26 项
+
+  --- Δb = -10.0 µm → 重建到 bias_packets\bias-10 ---
+[重建] 测试B：慢偏移含误差 Δb = -10.0 µm，用 e_vib^err = e_raw − b̂ 重建
+[重建] e_vib rms 29.797 µm（e_raw rms 35.526 µm）
+[重建] 模板 62.85 s（62853 点），远点 153.5 mm，前向复制 ×19 返向 ×14，缝跳跃 均值 0.075 / 最大 0.138 µm
+[重建] 复用已标定的 Plant 频响（测试B 不重复标定）
+[重建] 反演初值 Fd：rms 0.812 N，峰值 4.110 N，带限 ≤ 30 Hz（45 Hz 渐减到 0）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 16.56 µm
+[重建] 迭代 1：e_sim rms 16.56 µm，corr 0.9572，残差 rms 6.72 µm（残差/目标 33.0%）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 18.31 µm
+[重建] 迭代 2：e_sim rms 18.31 µm，corr 0.9903，残差 rms 3.33 µm（残差/目标 16.3%）  ← 已达验收门槛
+[重建] 残差 rms ≤ 4.08 µm（目标的 20%），提前收敛
+[重建] TCP 施力点检查：max|q_applyFT − J_tcp^T·F| = 0.000e+00（参考量级 6.910e-01），通过
+[重建] 已冻结 fd_frozen.csv  sha256=710c122ad40a…
+  → ASFC_strong_bias-10          mode=ASFC             K=  5000.0 B0=  400.0 n=1.50 μ=6.1906e+04 r= 4.00  [Δb=-10 µm]
+      e_rms=10.711 µm  峰值=65.572 µm  F_shr/F_lin=3.3403
+
+  --- Δb = -5.0 µm → 重建到 bias_packets\bias-5 ---
+[重建] 测试B：慢偏移含误差 Δb = -5.0 µm，用 e_vib^err = e_raw − b̂ 重建
+[重建] e_vib rms 28.475 µm（e_raw rms 35.526 µm）
+[重建] 模板 62.85 s（62853 点），远点 153.5 mm，前向复制 ×19 返向 ×14，缝跳跃 均值 0.075 / 最大 0.138 µm
+[重建] 复用已标定的 Plant 频响（测试B 不重复标定）
+[重建] 反演初值 Fd：rms 0.807 N，峰值 4.162 N，带限 ≤ 30 Hz（45 Hz 渐减到 0）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 15.53 µm
+[重建] 迭代 1：e_sim rms 15.53 µm，corr 0.9629，残差 rms 6.06 µm（残差/目标 32.5%）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 16.88 µm
+[重建] 迭代 2：e_sim rms 16.88 µm，corr 0.9920，残差 rms 2.99 µm（残差/目标 16.1%）  ← 已达验收门槛
+[重建] 残差 rms ≤ 3.73 µm（目标的 20%），提前收敛
+[重建] TCP 施力点检查：max|q_applyFT − J_tcp^T·F| = 0.000e+00（参考量级 6.910e-01），通过
+[重建] 已冻结 fd_frozen.csv  sha256=bf9599b9a304…
+  → ASFC_strong_bias-5           mode=ASFC             K=  5000.0 B0=  400.0 n=1.50 μ=6.1906e+04 r= 4.00  [Δb=-5 µm]
+      e_rms=9.650 µm  峰值=62.166 µm  F_shr/F_lin=3.3404
+
+  --- Δb = +5.0 µm → 重建到 bias_packets\bias+5 ---
+[重建] 测试B：慢偏移含误差 Δb = +5.0 µm，用 e_vib^err = e_raw − b̂ 重建
+[重建] e_vib rms 28.403 µm（e_raw rms 35.526 µm）
+[重建] 模板 62.85 s（62853 点），远点 153.5 mm，前向复制 ×19 返向 ×14，缝跳跃 均值 0.075 / 最大 0.138 µm
+[重建] 复用已标定的 Plant 频响（测试B 不重复标定）
+[重建] 反演初值 Fd：rms 0.808 N，峰值 4.268 N，带限 ≤ 30 Hz（45 Hz 渐减到 0）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 16.76 µm
+[重建] 迭代 1：e_sim rms 16.76 µm，corr 0.9701，残差 rms 5.14 µm（残差/目标 27.1%）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 17.66 µm
+[重建] 迭代 2：e_sim rms 17.66 µm，corr 0.9940，残差 rms 2.53 µm（残差/目标 13.3%）  ← 已达验收门槛
+[重建] 残差 rms ≤ 3.79 µm（目标的 20%），提前收敛
+[重建] TCP 施力点检查：max|q_applyFT − J_tcp^T·F| = 0.000e+00（参考量级 6.910e-01），通过
+[重建] 已冻结 fd_frozen.csv  sha256=ff17181e7a9c…
+  → ASFC_strong_bias+5           mode=ASFC             K=  5000.0 B0=  400.0 n=1.50 μ=6.1906e+04 r= 4.00  [Δb=+5 µm]
+      e_rms=10.716 µm  峰值=62.562 µm  F_shr/F_lin=3.3406
+
+  --- Δb = +10.0 µm → 重建到 bias_packets\bias+10 ---
+[重建] 测试B：慢偏移含误差 Δb = +10.0 µm，用 e_vib^err = e_raw − b̂ 重建
+[重建] e_vib rms 29.659 µm（e_raw rms 35.526 µm）
+[重建] 模板 62.85 s（62853 点），远点 153.5 mm，前向复制 ×19 返向 ×14，缝跳跃 均值 0.075 / 最大 0.138 µm
+[重建] 复用已标定的 Plant 频响（测试B 不重复标定）
+[重建] 反演初值 Fd：rms 0.814 N，峰值 4.320 N，带限 ≤ 30 Hz（45 Hz 渐减到 0）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 18.81 µm
+[重建] 迭代 1：e_sim rms 18.81 µm，corr 0.9715，残差 rms 4.95 µm（残差/目标 23.6%）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 19.72 µm
+[重建] 迭代 2：e_sim rms 19.72 µm，corr 0.9944，残差 rms 2.45 µm（残差/目标 11.7%）  ← 已达验收门槛
+[重建] 残差 rms ≤ 4.20 µm（目标的 20%），提前收敛
+[重建] TCP 施力点检查：max|q_applyFT − J_tcp^T·F| = 0.000e+00（参考量级 6.910e-01），通过
+[重建] 已冻结 fd_frozen.csv  sha256=c6f4a5564863…
+  → ASFC_strong_bias+10          mode=ASFC             K=  5000.0 B0=  400.0 n=1.50 μ=6.1906e+04 r= 4.00  [Δb=+10 µm]
+      e_rms=12.576 µm  峰值=65.609 µm  F_shr/F_lin=3.3408
+  零偏差 ASFC_strong：rms 9.651 µm，峰值 59.515 µm
+  Δb=-10.0 µm → rms 10.711 µm (+10.98%)，峰值 65.572 µm (+10.18%)
+  Δb= -5.0 µm → rms 9.650 µm (-0.02%)，峰值 62.166 µm (+4.45%)
+  Δb= +5.0 µm → rms 10.716 µm (+11.03%)，峰值 62.562 µm (+5.12%)
+  Δb=+10.0 µm → rms 12.576 µm (+30.30%)，峰值 65.609 µm (+10.24%)
+  已写出 summary_bias_robustness.csv
+
+[8] 测试C：逐事件比较「峰值 / 上升速度 / 恢复时间 / 反向过冲」（纯离线）
+  事件数 30（由 A0 定位），配对 30 个
+  峰值：ASFC 峰值更低（更低 30 / 持平 0 / 更高 0，中位变化 -7.295 µm）
+  回正：ASFC 回正更慢（存在阻碍回正）（更慢 25 / 更快 3，中位变化 +0.0050 s）
+  过冲：ASFC 反向过冲更小（更小 28 / 更大 0，中位变化 -9.838 µm）
+  已写出 summary_event_response.csv
+
+[9] 测试D：分相统计（稳态段 vs 突变段）
+  start        ASFC 相对 Alinear RMS 改善  +12.58%   峰值改善  +16.74%   （线性相对 A0 +31.80%）
+  fwd_steady   ASFC 相对 Alinear RMS 改善  +28.65%   峰值改善   +3.23%   （线性相对 A0 +25.33%）
+  turn         ASFC 相对 Alinear RMS 改善  +12.50%   峰值改善  +15.66%   （线性相对 A0 +22.20%）
+  ret_steady   ASFC 相对 Alinear RMS 改善  +21.45%   峰值改善  +23.87%   （线性相对 A0 +25.40%）
+  stop         ASFC 相对 Alinear RMS 改善  +19.75%   峰值改善  +46.96%   （线性相对 A0 +29.91%）
+  突变段平均改善 +14.94%  vs  稳态段 +25.05%
+  结论：SFC 的相对收益在稳态段与突变段相当（未表现出只对突变段有效）
+  已写出 summary_phasewise.csv
+
+[10] 汇总落盘

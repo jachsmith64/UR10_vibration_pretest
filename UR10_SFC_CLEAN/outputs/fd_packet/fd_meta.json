@@ -1,0 +1,596 @@
+{
+  "kind": "equivalent_disturbance_force",
+  "disclaimer": "Fd 是等效扰动力，不是真实机械臂实际受到的物理外力。",
+  "recon_source": "vib",
+  "source_note": "先扣除理想慢偏移 b(t)，只重建净振动 e_vib（§六 唯一口径）",
+  "data_id": "P05R01",
+  "source_csv": "C:\\Users\\PC\\Desktop\\code\\pre_program\\UR10_SFC_CLEAN\\data\\P05R01\\D1_时序.csv",
+  "source_csv_sha256": "d8d76ea3a259f8dc631547391ed0ec546b39014c608b90d16e229b68d8ad99fe",
+  "source_sampling": {
+    "n": 971,
+    "dt_median_s": 0.007558578812797201,
+    "dt_max_s": 0.022675736438391603,
+    "gap_pct": 4.536082474226804,
+    "note": "相机原始帧 ~132 Hz，含丢帧；未重采样"
+  },
+  "grid_dt_s": 0.001,
+  "drift_baseline": {
+    "method": "四个稳定常值 + 启动/转向/停止三段余弦平滑过渡（w = 0.5(1−cos(πs))，形状固定、无拟合自由度）",
+    "bias_um": 0.0,
+    "is_bias_test": false,
+    "levels_um": {
+      "b_pre": -0.04357626579889941,
+      "b_out": 24.153245683590335,
+      "b_ret": -18.963546885254893,
+      "b_post": 4.094273430892298
+    },
+    "windows": {
+      "pre_motion": {
+        "i0": 0,
+        "i1": 1284,
+        "n": 1285,
+        "rule": "整段中位数"
+      },
+      "fwd_steady": {
+        "i0": 1926,
+        "i1": 3461,
+        "n": 1536,
+        "rule": "X_outbound 稳态窗中位数",
+        "x0_mm": 3.2016483637809756,
+        "x1_mm": 11.004918866586685
+      },
+      "ret_steady": {
+        "i0": 4524,
+        "i1": 6573,
+        "n": 2050,
+        "rule": "X_return 稳态窗中位数",
+        "x0_mm": 10.667213398476253,
+        "x1_mm": 0.1731699035402315
+      },
+      "post_stop": {
+        "i0": 6614,
+        "i1": 7755,
+        "n": 1142,
+        "rule": "整段中位数"
+      }
+    },
+    "window_sensitivity": {
+      "fwd": {
+        "values_um": [
+          24.153,
+          23.795,
+          22.99,
+          23.557,
+          23.063,
+          22.08,
+          22.496,
+          22.08,
+          21.391
+        ],
+        "min_um": 21.39083440164717,
+        "max_um": 24.153245683590335,
+        "span_um": 2.762411281943166
+      },
+      "ret": {
+        "values_um": [
+          -18.964,
+          -19.564,
+          -19.675,
+          -18.951,
+          -19.564,
+          -19.688,
+          -18.469,
+          -18.951,
+          -19.299
+        ],
+        "min_um": -19.688177623585315,
+        "max_um": -18.468628330912793,
+        "span_um": 1.2195492926725215
+      }
+    },
+    "transitions": [
+      {
+        "name": "start",
+        "i0": 1285,
+        "i1": 1925,
+        "n": 641,
+        "span_s": 0.6400000000000001,
+        "from_level": "b_pre",
+        "to_level": "b_out",
+        "b_start_um": -0.04357626579889941,
+        "b_end_um": 24.153245683590335,
+        "delta_um": 24.196821949389236,
+        "monotone": true,
+        "max_step_um": 0.05938769749837469,
+        "max_rate_um_per_s": 59.387697498374635,
+        "form": "w = 0.5(1−cos(πs))",
+        "level_delta_um": 24.196821949389236
+      },
+      {
+        "name": "turn",
+        "i0": 3462,
+        "i1": 4523,
+        "n": 1062,
+        "span_s": 1.0609999999999995,
+        "from_level": "b_out",
+        "to_level": "b_ret",
+        "b_start_um": 24.153245683590335,
+        "b_end_um": -18.963546885254893,
+        "delta_um": -43.11679256884523,
+        "monotone": true,
+        "max_step_um": 0.06383381211020378,
+        "max_rate_um_per_s": 63.83381211020372,
+        "form": "w = 0.5(1−cos(πs))",
+        "level_delta_um": -43.11679256884523
+      },
+      {
+        "name": "stop",
+        "i0": 6574,
+        "i1": 6613,
+        "n": 40,
+        "span_s": 0.03900000000000059,
+        "from_level": "b_ret",
+        "to_level": "b_post",
+        "b_start_um": -18.963546885254893,
+        "b_end_um": 4.094273430892298,
+        "delta_um": 23.05782031614719,
+        "monotone": true,
+        "max_step_um": 0.9284448119036366,
+        "max_rate_um_per_s": 928.4448119036357,
+        "form": "w = 0.5(1−cos(πs))",
+        "level_delta_um": 23.05782031614719
+      }
+    ],
+    "b_range_um": [
+      -18.963546885254893,
+      24.153245683590335
+    ],
+    "steady_segment_checks": {
+      "fwd_steady": {
+        "segment": "fwd_steady",
+        "n": 1536,
+        "median_raw_um": 24.153245683590335,
+        "median_vib_um": 0.0,
+        "mean_raw_um": 23.44040232427842,
+        "mean_vib_um": -0.7128433593119133,
+        "rms_raw_um": 28.266112719386225,
+        "rms_vib_um": 15.81229941519972,
+        "abs_median_reduction_pct": 100.0,
+        "abs_mean_reduction_pct": 96.95891158585795,
+        "rms_reduction_pct": 44.05916521957792,
+        "vib_band_retention": 1.0,
+        "note": "中位数为 0 是构造使然（b 取的就是该窗中位数）；请以 mean / RMS 与过渡段行为为准"
+      },
+      "ret_steady": {
+        "segment": "ret_steady",
+        "n": 2050,
+        "median_raw_um": -18.963546885254893,
+        "median_vib_um": -1.7763568394002505e-15,
+        "mean_raw_um": -19.715371333478057,
+        "mean_vib_um": -0.7518244482231639,
+        "rms_raw_um": 25.856098566971752,
+        "rms_vib_um": 16.74536372519201,
+        "abs_median_reduction_pct": 100.0,
+        "abs_mean_reduction_pct": 96.18660772091818,
+        "rms_reduction_pct": 35.23630921417386,
+        "vib_band_retention": 1.0000000000000002,
+        "note": "中位数为 0 是构造使然（b 取的就是该窗中位数）；请以 mean / RMS 与过渡段行为为准"
+      }
+    },
+    "overall": {
+      "rms_raw_um": 35.52556593274111,
+      "rms_vib_um": 27.996128175724166,
+      "b_min_um": -18.963546885254893,
+      "b_max_um": 24.153245683590335,
+      "b_range_um": 43.11679256884523,
+      "fs_hz": 999.9999999999991,
+      "n_samples": 7756,
+      "rms_reduction_pct": 21.194420297968158
+    },
+    "post_stop_stationarity": {
+      "whole_phase_median_um": 4.094273430892298,
+      "tail_0p5s_median_um": 10.488965914927975,
+      "tail_0p5s_span_um": 11.85040039162508,
+      "octants": [
+        {
+          "part": "1/8",
+          "t0_s": 6.614,
+          "t1_s": 6.755,
+          "n": 142,
+          "median_um": -6.975111491604315
+        },
+        {
+          "part": "2/8",
+          "t0_s": 6.756,
+          "t1_s": 6.898000000000001,
+          "n": 143,
+          "median_um": -5.828983671699942
+        },
+        {
+          "part": "3/8",
+          "t0_s": 6.899,
+          "t1_s": 7.041,
+          "n": 143,
+          "median_um": -4.8241969017103825
+        },
+        {
+          "part": "4/8",
+          "t0_s": 7.042,
+          "t1_s": 7.184,
+          "n": 143,
+          "median_um": -1.4695342168972432
+        },
+        {
+          "part": "5/8",
+          "t0_s": 7.1850000000000005,
+          "t1_s": 7.3260000000000005,
+          "n": 142,
+          "median_um": 7.823371445821345
+        },
+        {
+          "part": "6/8",
+          "t0_s": 7.327,
+          "t1_s": 7.469,
+          "n": 143,
+          "median_um": 12.245316097162144
+        },
+        {
+          "part": "7/8",
+          "t0_s": 7.47,
+          "t1_s": 7.612,
+          "n": 143,
+          "median_um": 11.114984608435245
+        },
+        {
+          "part": "8/8",
+          "t0_s": 7.613,
+          "t1_s": 7.755,
+          "n": 143,
+          "median_um": 9.171604320565754
+        }
+      ],
+      "monotone_trend": false
+    },
+    "acceptance": {
+      "passed": true,
+      "checks": {
+        "分段无缝覆盖": true,
+        "pre_motion 段为常值": true,
+        "fwd_steady 段为常值": true,
+        "ret_steady 段为常值": true,
+        "post_stop 段为常值": true,
+        "start 过渡单调": true,
+        "start 过渡端点与常值段一致": true,
+        "start 过渡斜率符合余弦上界（比值 1.0000 ≤ 1）": true,
+        "start 瞬态保留（ptp 131.0 ≥ 硬下界 102.8 µm）": true,
+        "turn 过渡单调": true,
+        "turn 过渡端点与常值段一致": true,
+        "turn 过渡斜率符合余弦上界（比值 1.0000 ≤ 1）": true,
+        "turn 瞬态保留（ptp 155.3 ≥ 硬下界 133.0 µm）": true,
+        "stop 过渡单调": true,
+        "stop 过渡端点与常值段一致": true,
+        "stop 过渡斜率符合余弦上界（比值 1.0000 ≤ 1）": true,
+        "stop 瞬态保留（ptp 33.6 ≥ 硬下界 -0.3 µm）": true,
+        "fwd_steady 中位数在容差内（|0.000| ≤ 2.000 µm）": true,
+        "fwd_steady 比原始更居中（|中位数|）": true,
+        "fwd_steady 比原始更居中（|均值|）": true,
+        "fwd_steady RMS 下降": true,
+        "ret_steady 中位数在容差内（|-0.000| ≤ 2.000 µm）": true,
+        "ret_steady 比原始更居中（|中位数|）": true,
+        "ret_steady 比原始更居中（|均值|）": true,
+        "ret_steady RMS 下降": true,
+        "整体 RMS 下降": true
+      }
+    },
+    "notes": [
+      "稳态段 e_vib 的中位数为 0 是构造必然（b_out/b_ret 就是该窗中位数），不能当作「去偏移效果好」的证据；请用 mean/RMS 与过渡段 ptp 判断。",
+      "post_stop 段不平稳：整段中位数 4.094 µm，但尾 0.5 s 中位数为 10.489 µm，段内中位数单调爬升 -6.98 → 9.17 µm。本模块按 §三.4 取整段中位数，因此 post_stop 段会残留约 ±10 µm 的慢沉降，这一段对 e_vib 的贡献是真实的、未被建模的慢变化，已如实保留。",
+      "过渡段只由四个稳定值和固定的余弦形状决定，不跟随原始数据中的瞬态尖峰；瞬态是否被保留由 per_segment 的 ptp 与数学硬下界共同核对。"
+    ],
+    "files": {
+      "raw_reference": "raw_reference.csv",
+      "drift_baseline": "drift_baseline.csv",
+      "vibration_reference": "vibration_reference.csv",
+      "raw_plus_baseline_table": "raw_plus_baseline_table.csv",
+      "drift_baseline_summary": "drift_baseline_summary.json"
+    },
+    "files_template_grid": {
+      "e_raw": "ref_e_raw_um.csv",
+      "b": "ref_b_um.csv",
+      "e_vib": "ref_e_vib_um.csv"
+    },
+    "note_template_grid": "记录网格（7.755 s）与模板网格（62.85 s）两套：上面四个 CSV 在记录网格上，含原始相位名，供人工检查；ref_*.csv 在模板网格上，与 Fd 等长，供时序 CSV 的参考列。"
+  },
+  "template": {
+    "dur_s": 62.852000000000004,
+    "n_samples": 62853,
+    "max_along_mm": 153.4588690505027,
+    "n_segments": 38,
+    "segments": [
+      [
+        "start",
+        0,
+        1927
+      ],
+      [
+        "mid_fwd",
+        1927,
+        3463
+      ],
+      [
+        "mid_fwd",
+        3463,
+        4999
+      ],
+      [
+        "mid_fwd",
+        4999,
+        6535
+      ],
+      [
+        "mid_fwd",
+        6535,
+        8071
+      ],
+      [
+        "mid_fwd",
+        8071,
+        9607
+      ],
+      [
+        "mid_fwd",
+        9607,
+        11143
+      ],
+      [
+        "mid_fwd",
+        11143,
+        12679
+      ],
+      [
+        "mid_fwd",
+        12679,
+        14215
+      ],
+      [
+        "mid_fwd",
+        14215,
+        15751
+      ],
+      [
+        "mid_fwd",
+        15751,
+        17287
+      ],
+      [
+        "mid_fwd",
+        17287,
+        18823
+      ],
+      [
+        "mid_fwd",
+        18823,
+        20359
+      ],
+      [
+        "mid_fwd",
+        20359,
+        21895
+      ],
+      [
+        "mid_fwd",
+        21895,
+        23431
+      ],
+      [
+        "mid_fwd",
+        23431,
+        24967
+      ],
+      [
+        "mid_fwd",
+        24967,
+        26503
+      ],
+      [
+        "mid_fwd",
+        26503,
+        28039
+      ],
+      [
+        "mid_fwd",
+        28039,
+        29575
+      ],
+      [
+        "mid_fwd",
+        29575,
+        31111
+      ],
+      [
+        "turn_fwd",
+        31111,
+        31513
+      ],
+      [
+        "turn_ret",
+        31513,
+        32176
+      ],
+      [
+        "mid_ret",
+        32176,
+        34226
+      ],
+      [
+        "mid_ret",
+        34226,
+        36276
+      ],
+      [
+        "mid_ret",
+        36276,
+        38326
+      ],
+      [
+        "mid_ret",
+        38326,
+        40376
+      ],
+      [
+        "mid_ret",
+        40376,
+        42426
+      ],
+      [
+        "mid_ret",
+        42426,
+        44476
+      ],
+      [
+        "mid_ret",
+        44476,
+        46526
+      ],
+      [
+        "mid_ret",
+        46526,
+        48576
+      ],
+      [
+        "mid_ret",
+        48576,
+        50626
+      ],
+      [
+        "mid_ret",
+        50626,
+        52676
+      ],
+      [
+        "mid_ret",
+        52676,
+        54726
+      ],
+      [
+        "mid_ret",
+        54726,
+        56776
+      ],
+      [
+        "mid_ret",
+        56776,
+        58826
+      ],
+      [
+        "mid_ret",
+        58826,
+        60876
+      ],
+      [
+        "mid_ret_last",
+        60876,
+        61670
+      ],
+      [
+        "stop",
+        61670,
+        62853
+      ]
+    ],
+    "phase_names": [
+      "start",
+      "fwd_steady",
+      "turn",
+      "ret_steady",
+      "stop"
+    ],
+    "seam_jump_mean_um": 0.07476814686198005,
+    "seam_jump_max_um": 0.1382503634184329,
+    "n_fwd_repeat": 19,
+    "n_ret_repeat": 14,
+    "e_rms_um": 18.123475330679646,
+    "e_ptp_um": 216.86082344432344,
+    "e_median_um": -0.14842530458497194,
+    "e_mean_um": -0.6501985929020296
+  },
+  "cuts": {
+    "iA": 1926,
+    "iB": 3461,
+    "iP": 3862,
+    "iC": 4524,
+    "iD": 6573
+  },
+  "force_application": {
+    "method": "mujoco.mj_applyFT(force=[0,Fd,0], torque=0, point=TCP site, body=wrist_3_link)",
+    "point": "TCP site 'attachment_site' 的世界坐标",
+    "note": "Fd 作用在 TCP 空间点，而非 wrist_3_link 刚体质心；广义力与 J_tcp^T·[0,F,0] 数值一致（见 fd_meta 的 tcp_force_check）。",
+    "tcp_force_check": {
+      "f_test_N": 1.0,
+      "max_abs_err": 0.0,
+      "ref_max_abs": 0.6910000000000001,
+      "rel_err": 0.0,
+      "passed": true,
+      "qfrc_from_applyFT": [
+        -0.6910000000000001,
+        0.0,
+        0.0,
+        0.0,
+        -0.10000000000000009,
+        0.0
+      ],
+      "qfrc_from_Jtcp": [
+        -0.6910000000000001,
+        0.0,
+        0.0,
+        0.0,
+        -0.10000000000000009,
+        0.0
+      ]
+    }
+  },
+  "plant": {
+    "dc_um_per_n": 94.88920252961886,
+    "n_bins": 3000,
+    "probe_dur_s": 60.0,
+    "probe_fmax_hz": 50.0,
+    "probe_amp_n": 0.05,
+    "config": "INIT_Q",
+    "excitation_point": "TCP site（与 Fd 作用点一致）"
+  },
+  "inversion": {
+    "f_pass_hz": 30.0,
+    "f_stop_hz": 45.0,
+    "method": "Fd = irfft( rfft(e_des)/G · cos_taper )"
+  },
+  "refine": {
+    "iters_done": 2,
+    "lr": 0.7,
+    "history": [
+      {
+        "iter": 1,
+        "e_sim_rms_um": 15.60264753563599,
+        "corr": 0.9672247663959572,
+        "residual_rms_um": 5.519970129745006,
+        "residual_over_target": 0.30457569693604686,
+        "gate_pass": false
+      },
+      {
+        "iter": 2,
+        "e_sim_rms_um": 16.65095395137629,
+        "corr": 0.993236423359794,
+        "residual_rms_um": 2.7175634729746694,
+        "residual_over_target": 0.14994714994724792,
+        "gate_pass": true
+      }
+    ]
+  },
+  "frozen": {
+    "file": "fd_frozen.csv",
+    "sha256": "58858d990d4f36176992fea6e5590f4a8ab64bca1face89aaacc6ea25d261187",
+    "n_samples": 62853,
+    "Fd_rms_N": 0.9442105103053342,
+    "Fd_ptp_N": 9.122062518327184,
+    "Fd_peak_abs_N": 4.641861783178404
+  }
+}

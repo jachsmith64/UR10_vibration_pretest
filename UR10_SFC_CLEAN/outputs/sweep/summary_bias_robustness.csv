@@ -1,0 +1,5 @@
+bias_um,case_id,status,e_rms_um,peak_abs_um,ptp_um,vib_rms_um,rms_change_vs_nobias_pct,peak_change_vs_nobias_pct,note
+-10,ASFC_strong_bias-10,OK,10.7115,65.5724,118.993,5.00703,10.9827,10.1779,正数 = 比零偏差更差
+-5,ASFC_strong_bias-5,OK,9.64987,62.1662,118.634,5.00699,-0.0167871,4.45474,正数 = 比零偏差更差
+5,ASFC_strong_bias+5,OK,10.7158,62.5621,117.916,5.00691,11.028,5.11991,正数 = 比零偏差更差
+10,ASFC_strong_bias+10,OK,12.5759,65.6092,117.557,5.00687,30.3006,10.2398,正数 = 比零偏差更差

@@ -1,0 +1,28 @@
+# 行尾策略 —— 这一条不是洁癖，是正确性要求。
+#
+# 背景：disturbance.load_frozen 会用 sha256_file() 哈希 fd_frozen.csv 的
+# 【原始字节】，并与 fd_meta.json 里记录的 sha256 比对，不符就 raise。
+# 而 git 默认（core.autocrlf=true）在提交时把 CRLF 规范成 LF、检出时再转回，
+# 于是仓库 blob 里是 LF、Windows 工作树是 CRLF。本机正好自洽，
+# 但任何 autocrlf=false/input 的环境（Linux、macOS、CI）clone 出来会是 LF，
+# 字节一变哈希就对不上，--check / --sweep 会直接报「冻结 Fd 哈希不符」。
+#
+# 所以：所有【数据】文件一律 -text（等价于 binary），git 两个方向都不碰，
+# 保证在任何平台上 clone 出来的字节都与生成时逐字节相同，
+# 冻结包的 SHA-256 才有意义。
+*.csv  -text
+*.npz  -text
+
+# 同理保护：这些文件的内容也会被哈希或按字节比较。
+data/**/*.csv  -text
+
+# 源码与文档保持文本处理（仓库内统一 LF），这样 diff 干净、不会整文件改行尾。
+*.py    text
+*.md    text
+*.xml   text
+*.txt   text
+*.json  text
+*.toml  text
+*.cfg   text
+.gitignore     text
+.gitattributes text

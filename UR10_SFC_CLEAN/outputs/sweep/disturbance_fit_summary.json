@@ -1,0 +1,57 @@
+{
+  "recon_source": "vib",
+  "source_note": "只对去慢偏移后的净振动 e_vib 重建（§六 唯一口径）",
+  "drift_baseline_method": "四个稳定常值 + 启动/转向/停止三段余弦平滑过渡（w = 0.5(1−cos(πs))，形状固定、无拟合自由度）",
+  "drift_levels_um": {
+    "b_pre": -0.04357626579889941,
+    "b_out": 24.153245683590335,
+    "b_ret": -18.963546885254893,
+    "b_post": 4.094273430892298
+  },
+  "drift_acceptance_passed": true,
+  "frozen_file": "fd_frozen.csv",
+  "sha256": "58858d990d4f36176992fea6e5590f4a8ab64bca1face89aaacc6ea25d261187",
+  "target_e_rms_um": 18.123475330679646,
+  "sim_e_rms_um": 16.65095395137629,
+  "residual_rms_um": 2.7175634729746694,
+  "residual_over_target": 0.14994714994724792,
+  "corr": 0.993236423359794,
+  "e_ptp_target_um": 216.86082344432344,
+  "gate": {
+    "corr_min": 0.98,
+    "residual_frac_max": 0.2,
+    "passed": true
+  },
+  "refine_iters_used": 2,
+  "force_application": {
+    "method": "mujoco.mj_applyFT(force=[0,Fd,0], torque=0, point=TCP site, body=wrist_3_link)",
+    "point": "TCP site 'attachment_site' 的世界坐标",
+    "note": "Fd 作用在 TCP 空间点，而非 wrist_3_link 刚体质心；广义力与 J_tcp^T·[0,F,0] 数值一致（见 fd_meta 的 tcp_force_check）。",
+    "tcp_force_check": {
+      "f_test_N": 1.0,
+      "max_abs_err": 0.0,
+      "ref_max_abs": 0.6910000000000001,
+      "rel_err": 0.0,
+      "passed": true,
+      "qfrc_from_applyFT": [
+        -0.6910000000000001,
+        0.0,
+        0.0,
+        0.0,
+        -0.10000000000000009,
+        0.0
+      ],
+      "qfrc_from_Jtcp": [
+        -0.6910000000000001,
+        0.0,
+        0.0,
+        0.0,
+        -0.10000000000000009,
+        0.0
+      ]
+    }
+  },
+  "plant_dc_um_per_n": 94.88920252961886,
+  "frozen_Fd_rms_N": 0.9442105103053342,
+  "frozen_Fd_peak_abs_N": 4.641861783178404
+}

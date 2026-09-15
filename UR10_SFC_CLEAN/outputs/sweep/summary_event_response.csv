@@ -1,0 +1,4 @@
+case_id,n_events,peak_abs_median_um,peak_abs_mean_um,rise_rate_median_um_per_s,recover_median_s,recover_mean_s,recover_n_valid,overshoot_median_um
+A0,30,37.84,43.315,139.007,0.04,0.0498276,29,16.7805
+Alinear,30,29.394,31.7767,109.001,0.035,0.0517241,29,13.2364
+ASFC_strong,30,21.8068,24.2616,82.6676,0.04,0.0655172,29,1.98895

@@ -1,0 +1,42 @@
+# APF_SFC_MuJoCo_V1_1 是独立仓库（自己的 .git），不要被本仓库当作嵌套仓库跟踪。
+APF_SFC_MuJoCo_V1_1/
+
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------------------------------------------------------------- 交接用的 ZIP 交付物
+# 这些是给外部复核用的打包产物，内容都能由工作树里已跟踪的文件重建，
+# 不进版本库（否则每次改一个字就多一份十几 MB 的二进制 diff）。
+SFC_sim_V1_*.zip
+SFC_sim_V1_clean.zip
+
+# ---------------------------------------------------------------- 临时 / 校验残留
+# _verifyzip.py 解压核对时会在这里铺一份副本，跑完即可删，不跟踪。
+UR10_SFC_CLEAN/outputs/_unzip_check/
+UR10_SFC_CLEAN/outputs/_exit.txt
+
+# ---------------------------------------------------------------- 大体积 / 可再生成的中间产物
+# 里程碑只保留「冻结包 + 汇总表 + 5 条主时序」；下面这些能从它们重算出来：
+#   q_traj.npz      名义关节轨迹，--reconstruct 时重算（3.4 MB）
+#   fd_packet_raw/  V1.2 时期的旧冻结包，已被 outputs/fd_packet/ 取代
+#   bias_packets/   测试B 的 4 次完整重建（31 MB），结论已在 summary_bias_robustness.csv
+UR10_SFC_CLEAN/outputs/q_traj.npz
+UR10_SFC_CLEAN/outputs/fd_packet_raw/
+UR10_SFC_CLEAN/outputs/bias_packets/
+
+# 测试A/测试B 的逐条时序（17 MB）：本轮只留 5 个正式组的主时序，
+# 这 8 条的结论已经落进 summary_disturbance_scale.csv / summary_bias_robustness.csv。
+# 需要重画那些图时重跑 python main.py --sweep 即可。
+UR10_SFC_CLEAN/outputs/sweep/traces/s0.50_*.csv
+UR10_SFC_CLEAN/outputs/sweep/traces/s1.50_*.csv
+UR10_SFC_CLEAN/outputs/sweep/traces/ASFC_strong_bias*.csv
+
+# ---------------------------------------------------------------- 旧版本地归档
+# V1.1/V1.2 时期的图片备份，仅为本地留档，不属于 V1.3 交付（§十四：本轮无图）。
+UR10_SFC_CLEAN/reference/
+
+# 传输用归档（APF_SFC_MuJoCo_V1_1 自身是独立仓库，其 rar 中转包不入库）。
+*.rar

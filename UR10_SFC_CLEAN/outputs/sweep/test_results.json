@@ -1,0 +1,147 @@
+{
+  "testA_disturbance_scale": [
+    {
+      "scale": 0.5,
+      "case_id": "s0.50_Alinear",
+      "e_rms_um": 6.541405047672638,
+      "peak_abs_um": 38.20517265884504,
+      "ptp_um": 73.67645124378708
+    },
+    {
+      "scale": 0.5,
+      "case_id": "s0.50_ASFC_strong",
+      "e_rms_um": 5.454893246228336,
+      "peak_abs_um": 34.103747397790094,
+      "ptp_um": 65.04581323740766
+    },
+    {
+      "scale": 1.0,
+      "case_id": "Alinear",
+      "e_rms_um": 12.334734300841731,
+      "peak_abs_um": 70.57422801537427,
+      "ptp_um": 141.13727820835862
+    },
+    {
+      "scale": 1.0,
+      "case_id": "ASFC_strong",
+      "e_rms_um": 9.651486862001185,
+      "peak_abs_um": 59.514976208707715,
+      "ptp_um": 118.27502632161259
+    },
+    {
+      "scale": 1.5,
+      "case_id": "s1.50_Alinear",
+      "e_rms_um": 18.310744810539074,
+      "peak_abs_um": 105.677891205469,
+      "ptp_um": 208.59771782916204
+    },
+    {
+      "scale": 1.5,
+      "case_id": "s1.50_ASFC_strong",
+      "e_rms_um": 13.776220595876179,
+      "peak_abs_um": 85.26721238588664,
+      "ptp_um": 168.6548801691501
+    }
+  ],
+  "testB_bias_robustness": [
+    {
+      "bias_um": -10.0,
+      "case_id": "ASFC_strong_bias-10",
+      "e_rms_um": 10.711476369110969,
+      "peak_abs_um": 65.57236738397032,
+      "status": "OK"
+    },
+    {
+      "bias_um": -5.0,
+      "case_id": "ASFC_strong_bias-5",
+      "e_rms_um": 9.649866653158844,
+      "peak_abs_um": 62.166211995284826,
+      "status": "OK"
+    },
+    {
+      "bias_um": 5.0,
+      "case_id": "ASFC_strong_bias+5",
+      "e_rms_um": 10.715849277214874,
+      "peak_abs_um": 62.562087604467465,
+      "status": "OK"
+    },
+    {
+      "bias_um": 10.0,
+      "case_id": "ASFC_strong_bias+10",
+      "e_rms_um": 12.575947471454306,
+      "peak_abs_um": 65.60919306450307,
+      "status": "OK"
+    }
+  ],
+  "testC_event_response": {
+    "event_source": "A0",
+    "fs_from_timestamps_hz": 200.00000000000426,
+    "event_win_s": 0.25,
+    "event_min_sep_s": 0.2,
+    "recover_threshold_frac": 0.5,
+    "n_events_found": 30,
+    "n_events_used": 30,
+    "aggregate": {
+      "A0": {
+        "n_events": 30,
+        "peak_abs_median_um": 37.83995,
+        "peak_abs_mean_um": 43.31501000000001,
+        "rise_rate_median_um_per_s": 139.0067,
+        "recover_median_s": 0.04000000000000625,
+        "recover_mean_s": 0.04982758620689663,
+        "overshoot_median_um": 16.7805,
+        "recover_n_valid": 29
+      },
+      "Alinear": {
+        "n_events": 30,
+        "peak_abs_median_um": 29.394,
+        "peak_abs_mean_um": 31.776650000000004,
+        "rise_rate_median_um_per_s": 109.00092000000001,
+        "recover_median_s": 0.035000000000003695,
+        "recover_mean_s": 0.05172413793103506,
+        "overshoot_median_um": 13.23645,
+        "recover_n_valid": 29
+      },
+      "ASFC_strong": {
+        "n_events": 30,
+        "peak_abs_median_um": 21.80675,
+        "peak_abs_mean_um": 24.261609999999997,
+        "rise_rate_median_um_per_s": 82.6676,
+        "recover_median_s": 0.04000000000000625,
+        "recover_mean_s": 0.06551724137931067,
+        "overshoot_median_um": 1.98895,
+        "recover_n_valid": 29
+      }
+    },
+    "paired_ASFC_vs_Alinear": {
+      "n_paired_events": 30,
+      "peak_lower_count": 30,
+      "peak_equal_count": 0,
+      "peak_higher_count": 0,
+      "peak_median_change_um": -7.295050000000002,
+      "recover_longer_count": 25,
+      "recover_shorter_count": 3,
+      "recover_median_change_s": 0.005000000000002558,
+      "overshoot_lower_count": 28,
+      "overshoot_higher_count": 0,
+      "overshoot_median_change_um": -9.838395,
+      "verdict_peak": "ASFC 峰值更低",
+      "verdict_recover": "ASFC 回正更慢（存在阻碍回正）",
+      "verdict_overshoot": "ASFC 反向过冲更小"
+    }
+  },
+  "testD_phasewise_verdict": {
+    "transient_phases": [
+      "start",
+      "turn",
+      "stop"
+    ],
+    "steady_phases": [
+      "fwd_steady",
+      "ret_steady"
+    ],
+    "mean_asfc_vs_linear_rms_pct_transient": 14.942053105910935,
+    "mean_asfc_vs_linear_rms_pct_steady": 25.04833788483088,
+    "conclusion": "SFC 的相对收益在稳态段与突变段相当（未表现出只对突变段有效）"
+  }
+}

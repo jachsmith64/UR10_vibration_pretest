@@ -1,0 +1,37 @@
+[重建] 读入实验数据 971 帧，dt 中位 7.56 ms，丢帧 4.54%
+[重建] 切窗 iA/iB/iP/iC/iD = 1926/3461/3862/4524/6573
+[慢偏移] b_pre =   -0.044 µm  (n=1285)
+[慢偏移] b_out =  +24.153 µm  (n=1536, x 3.20..11.00 mm)
+[慢偏移] b_ret =  -18.964 µm  (n=2050, x 10.67..0.17 mm)
+[慢偏移] b_post=   +4.094 µm  (n=1142)
+[慢偏移] 窗口敏感性：fwd 2.76 µm、ret 1.22 µm（±100 点内缩）
+[慢偏移] b(t) 范围 -18.96..24.15 µm
+[慢偏移] e_raw rms 35.526 → e_vib rms 27.996 µm (−21.2%)
+[慢偏移] 验收 通过：26/26 项
+[重建] e_vib rms 27.996 µm（e_raw rms 35.526 µm）
+[慢偏移] 写出 raw_reference.csv（7756 行）
+[慢偏移] 写出 drift_baseline.csv（7756 行）
+[慢偏移] 写出 vibration_reference.csv（7756 行）
+[慢偏移] 写出 raw_plus_baseline_table.csv（7756 行）
+[慢偏移] 写出 drift_baseline_summary.json
+[重建] 模板 62.85 s（62853 点），远点 153.5 mm，前向复制 ×19 返向 ×14，缝跳跃 均值 0.075 / 最大 0.138 µm
+[重建] 标定 Plant 频响（sum-of-sines 探针，约 60 s 仿真）…
+[plant] 3000 个 bin（0.017–50.0 Hz），DC 静柔度 = 94.89 µm/N
+[重建] Plant 频响已落盘 plant_frf.npz（供测试B 复用同一份标定）
+[重建] 名义关节轨迹 IK…
+[重建] 反演初值 Fd：rms 0.806 N，峰值 4.215 N，带限 ≤ 30 Hz（45 Hz 渐减到 0）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 15.60 µm
+[重建] 迭代 1：e_sim rms 15.60 µm，corr 0.9672，残差 rms 5.52 µm（残差/目标 30.5%）
+[baseline] 62853 步 / 62.9 s，e_sim rms = 16.65 µm
+[重建] 迭代 2：e_sim rms 16.65 µm，corr 0.9932，残差 rms 2.72 µm（残差/目标 15.0%）  ← 已达验收门槛
+[重建] 残差 rms ≤ 3.62 µm（目标的 20%），提前收敛
+[重建] TCP 施力点检查：max|q_applyFT − J_tcp^T·F| = 0.000e+00（参考量级 6.910e-01），通过
+[重建] 已冻结 fd_frozen.csv  sha256=58858d990d4f…
+
+[完成] 冻结数据包 → C:\Users\PC\Desktop\code\pre_program\UR10_SFC_CLEAN\outputs\fd_packet（口径：只重建净振动 e_vib）
+        慢偏移 b(t)：四个稳定常值 b_pre=-0.044  b_out=+24.153  b_ret=-18.964  b_post=+4.094 µm
+        过渡：启动/远端转向/停止 三段余弦，b(t) 范围 -18.96 ~ 24.15 µm
+        e_raw rms 35.526 → e_vib rms 27.996 µm
+        机器可判验收：通过（26/26 项）
+        Fd rms 0.944 N，峰值 4.642 N，sha256 58858d990d4f…
+        复现：e_sim rms 16.65 µm vs 目标 18.12 µm，corr 0.9932，残差 2.72 µm（15.0%）

@@ -1,0 +1,57 @@
+{
+  "scope": {
+    "main_groups": [
+      "A0",
+      "Alinear",
+      "ASFC_default",
+      "ASFC_medium",
+      "ASFC_strong"
+    ],
+    "testA_scale_factors": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "testA_new_runs": [
+      "s0.50_Alinear",
+      "s0.50_ASFC_strong",
+      "s1.50_Alinear",
+      "s1.50_ASFC_strong"
+    ],
+    "testB_bias_um": [
+      -10.0,
+      -5.0,
+      5.0,
+      10.0
+    ],
+    "testB_new_runs": [
+      "ASFC_strong_bias-10",
+      "ASFC_strong_bias-5",
+      "ASFC_strong_bias+5",
+      "ASFC_strong_bias+10"
+    ],
+    "testC": "离线（event_response_detail.csv + summary_event_response.csv）",
+    "testD": "离线（summary_phasewise.csv）"
+  },
+  "n_runs": 13,
+  "n_ok": 13,
+  "n_invalid": 0,
+  "n_failed": 0,
+  "fd_sha256": "58858d990d4f36176992fea6e5590f4a8ab64bca1face89aaacc6ea25d261187",
+  "all_runs_same_fd_sha": false,
+  "run_ids": [
+    "A0",
+    "Alinear",
+    "ASFC_default",
+    "ASFC_medium",
+    "ASFC_strong",
+    "s0.50_Alinear",
+    "s0.50_ASFC_strong",
+    "s1.50_Alinear",
+    "s1.50_ASFC_strong",
+    "ASFC_strong_bias-10",
+    "ASFC_strong_bias-5",
+    "ASFC_strong_bias+5",
+    "ASFC_strong_bias+10"
+  ]
+}

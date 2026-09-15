@@ -1,0 +1,9 @@
+# UR10 SFC 仿真 —— 运行依赖
+# 实测环境：Windows 11 + Python 3.12（D:/SOFTWARE/python/python.exe）
+# 安装： pip install -r requirements.txt
+
+mujoco>=3.8.0        # 物理仿真（本工程在 3.8.0 上验证）
+numpy>=2.0           # 数值；本工程在 2.4.4 上验证
+matplotlib>=3.7      # analysis.py 出图（Agg 后端，无需 GUI）
+
+# 标准库即可，无需额外安装：csv / json / hashlib / math / argparse / pathlib / dataclasses
