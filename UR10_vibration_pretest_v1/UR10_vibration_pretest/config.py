@@ -63,6 +63,7 @@ VALID_RUN_MODES: Final[set[str]] = {
     "xy_line_experiment", # 以当前 TCP 为 A 点，执行 X-Y 倾斜直线往返并采 RAW。
     "xy_l_experiment",    # 以当前 TCP 为 A 点，执行 X-Y 平面 L 折线往返并采 RAW。
     "batch_experiment",   # 相机和 UR 各初始化一次，按 UI 计划连续执行分段批量实验。
+    "micro_closed_loop",  # 一键XY微动闭环能力测试：反复小幅纠偏逼近 5/20/50 μm 目标。
     "batch_vision_offline", # 批次采集结束后，另行读取 AVI 和侧车时间戳做视觉识别。
     "boundary_check",     # 不等待手电筒，只显示实时画面并低速检查当前计划最大包络。
     "analyze",        # 读取已有 TXT/JSONL 记录并生成振动分析结果。
@@ -502,6 +503,309 @@ BATCH_MAX_MISSING_RATIO = 0.15
 # 才立即判定为严重断流。累计零星缺帧另由上面的 15% 阈值约束。
 BATCH_MAX_CONSECUTIVE_MISSING_FRAMES = 30
 
+# -----------------------------------------------------------------------------
+# 9b. 一键 XY 微动闭环能力测试（micro_closed_loop）
+# -----------------------------------------------------------------------------
+# 本段服务一个独立的一键流程：设备检查 -> 相机预热 -> 静止基线 -> 轴向/符号探针
+# -> X/Y × 5/20/50 μm × ±方向 -> 每个目标反复闭环纠偏 -> 自动收尾。
+#
+# 与前一轮被舍弃的开环微动实验（micro_motion_experiment）的区别：
+# 那一版按固定档位表开环走步、只回答“走一步走多少”；这一版是**闭环**，
+# 用"走一步—停稳—测量—再走一步"逼近一个视觉目标位置，因此会自然产生
+# 大量不同幅值的小命令，并回答“能否逼近 5 μm”与“是否形成持续极限环”。
+#
+# 全程只做最慢的离散闭环，不引入轨迹规划、MPC、PID、APF、SFC。
+# 唯一的控制律就是操作者给出的 command = Kp · error。
+
+# 目标幅值（μm）与两个自由度。方向固定为 +1 / −1 两个。
+MICRO_LOOP_AMPLITUDES_UM: Final[tuple[int, ...]] = (5, 20, 50)
+MICRO_LOOP_AXES: Final[tuple[str, ...]] = ("X", "Y")
+
+# 比例增益。操作者第一版要求固定 Kp = 1.0，这里做成可配置以便离线重调，
+# 但运行时不启用任何自适应。
+MICRO_LOOP_KP = 1.0
+# 纯安全限幅：单步修正量的绝对值上限（μm）。100 μm 远小于 200 mm 相对工作区，
+# 也在机械臂正常微动能力之内，只用于防止符号写反时一路狂奔。
+MICRO_LOOP_MAX_CORRECTION_UM = 100.0
+# 命令死区（μm）。**这不是调参，是必需的**：robot.validate_trajectory 拒绝
+# length <= 1e-6 m（“两点位置重合”），而收敛时 |error| 可能只有 1 μm，
+# Kp=1 时命令 1 μm，正好撞在那条硬线上——那会在一个目标即将成功的时刻
+# 把整轮弄死。低于死区时不发运动，但仍照常录前段/后段、照常测量、照常判收敛。
+MICRO_LOOP_MIN_COMMAND_UM = 2.0
+
+# 迭代终止参数。
+# 迭代上限 6：本轮定位是"10 分钟以内快速判断 5/20/50 μm 三个数量级"，
+# 不是精确标定最小分辨率。配合下面的 STALL_PATIENCE，
+# 走不动的目标会在 3 次内被点名，不会为了硬凑 5 μm 而磨满迭代。
+MICRO_LOOP_MAX_ITER = 6
+MICRO_LOOP_POSITION_TOL_UM = 3.0
+# "连续几次没有明显改善就判 STALLED"。这条让 5 μm 档的目标早退：
+# Kp=1.0 时正常闭环 1–2 步就到位；即使有效增益只有 0.3，
+# 50 μm 目标的误差序列也是 50 → 35 → 24.5 → 17，每次改善远大于 1 μm，
+# 所以这条门不会误伤"收敛得慢但确实在收敛"的目标。
+MICRO_LOOP_STALL_PATIENCE = 3
+MICRO_LOOP_STALL_MIN_IMPROVE_UM = 1.0
+# absolute = 永远用 POSITION_TOL_UM；noise_relative = 放宽到
+# max(POSITION_TOL_UM, NOISE_SIGMA_MULT · 本组实测测量噪声)。
+# 若一次闭环测量的不确定度本身就有 4 μm，“误差 ≤ 3 μm”只是在筛噪声，不是判收敛。
+MICRO_LOOP_POSITION_TOL_MODE = "noise_relative"
+MICRO_LOOP_NOISE_SIGMA_MULT = 2.0
+MICRO_LOOP_CONVERGE_COUNT = 3
+# 判 CONVERGED 之前还必须确认"确实朝目标方向累计走过幅值的这个比例"。
+# 为什么需要它：当有效容差已经和幅值同量级时（5 μm 档很可能如此），
+# "误差落在容差内"几乎不构成证据——机器人一步不走，误差恰好就是幅值本身，
+# 也满足 |error| ≤ tol_eff。没有这道门，5 μm 档会把"完全没动"报成收敛。
+# 门槛还会再抬到本组噪声底之上（σ 以下的位移与没动统计上不可分）。
+# 0.5 的含义：至少要看到走了一半路程，才承认这是朝目标逼近而不是噪声。
+MICRO_LOOP_MIN_DIRECTIONAL_FRACTION = 0.5
+
+# 单次迭代的时间结构：一段连续录制 = 前段 PRE + (运动与稳定) + 后段 POST。
+# 只录一段而不是两段，这样过冲的瞬态才在片子里。
+# 前/后段的长度**不影响测量精度**：在线只分析窗口末尾的
+# MICRO_LOOP_MEASURE_FRAMES 帧，而在"只分析尾部"的架构下，
+# 后段是唯一决定"测到的是停稳后位置"的部分，前段只负责让运动落在窗口内。
+# 后段 0.25 s ≈ 33 帧，是 16 帧分析窗的 2 倍余量；前段 0.15 s 足够覆盖开窗延迟。
+MICRO_LOOP_PRE_SECONDS = 0.15
+MICRO_LOOP_POST_SECONDS = 0.25
+
+# ---- 在线分析的帧预算（决定整轮运行时长，是本轮最关键的取舍） ----
+# 实测：全幅 1936×1464 跑一次 findChessboardCornersSB 要 163–168 ms（本机实测
+# 902 帧，100% 识别成功）。所以在线时长几乎完全等于"分析多少帧"，与等待时间无关：
+# 一段 1.3 s 的窗口有 172 帧，逐帧跑要 28 s，而机械等待只占其中 1.3 s（4%）。
+# 结论：**只分析窗口末尾的固定帧数**——"运动后位置"就在那里，前面的瞬态帧
+# 不进在线路径（窗口照录不误，RAW 全量保留，事后可离线复查）。
+# 实测逐帧视觉抖动约 1.0 μm，N 帧中位数的测量不确定度 ≈ 1.25 × 1.0 / √N：
+#   N=16 → 0.32 μm，比 5 μm 目标细 15 倍，单步分析 2.6 s。
+MICRO_LOOP_MEASURE_FRAMES = 16
+# 取"最后这段时间内的合格帧"的中位数作为本轮稳定位置。
+# 用时间戳而不是"最后 N 帧"：相机实测会零星丢帧，“最后 N 帧”对应的真实时长会变。
+# 窗口要宽到能装下 MEASURE_FRAMES（16 帧 ≈ 0.12 s），0.20 s 留了约 1.7 倍余量。
+MICRO_LOOP_TAIL_WINDOW_S = 0.20
+# 尾部窗口里至少要有多少合格帧，本轮测量才算可用。
+# 低于 MEASURE_FRAMES 是给"个别帧被接受判据剔掉"留余量，不是放宽门禁。
+MICRO_LOOP_MIN_TAIL_FRAMES = 12
+
+# 参考片段与静止基线时长。
+MICRO_LOOP_REFERENCE_SECONDS = 1.0
+# 建立组零点时扫描的帧数。零点只需要"足够好的中位数"，不需要整段：
+# 24 帧的中位数不确定度约 0.26 μm，远好于测量本身，而整段扫 2 遍要几分钟。
+# 建零点时扫的帧数（**两遍**，见 prime：一遍挑 medoid 帧，一遍让正式 tracker 锁存）。
+# 取 20 而不是 24：参考帧只用来挑 medoid 和定零点中位数，多扫 4 帧对这两件事
+# 都没有可测量的改善，却要在 6 个闭环组 + 探针 + 静止基线上各多花
+# 4 × 0.165 × 2 ≈ 1.3 s。必须**大于** MICRO_LOOP_MEASURE_FRAMES——
+# 零点的不确定度不该比单次测量本身还差，这条不变量由配置校验守着。
+MICRO_LOOP_REFERENCE_FRAMES = 20
+MICRO_LOOP_STATIC_SECONDS = 5.0
+# 静止基线只分析其中均匀分布的这么多帧。5 s × 132.23 fps = 661 帧，
+# 全扫要 110 s；抽 40 帧覆盖同样长的时间跨度，统计量足够，耗时 6.6 s。
+MICRO_LOOP_STATIC_ANALYZE_FRAMES = 40
+
+# 相机进程预分配缓冲能容纳的最长窗口（秒）。这个值直接决定那一次 np.empty 的
+# 虚拟地址预留：6.0 s × 132.23 fps × 1936 × 1464 字节 = 2.10 GiB。
+# 本机 15.77 GiB 物理内存，而 np.empty 在 Windows 上是**惰性提交**的——
+# 只有真正写进去的帧才占用物理页，所以典型窗口（约 2 s / 0.7 GiB 实际提交）
+# 与预留上限是两回事，预留给大一点几乎不花钱。反过来预留不够就等于丢数据。
+# 窗口内各阶段的最坏耗时之和约 5.6 s（见上面几个超时），留了约 0.4 s 余量。
+MICRO_LOOP_MAX_WINDOW_SECONDS = 6.0
+# 尾部窗口自身的静态性门禁。片段最后 TAIL_WINDOW_S 内的标准差超过这个值，
+# 说明这一轮测的不是"停稳后的位置"而是"还在动"，该轮测量不可用。
+MICRO_LOOP_TAIL_SIGMA_MAX_UM = 2.0
+
+# 逐帧接受判据。棋盘格**索引错位一格**会让所有点位移同一个向量（约 3 mm），
+# estimateAffinePartial2D 会把它拟合成残差≈0、内点率 1.0、质量分≈1.0 的纯平移——
+# 与"真的移动了 3 mm"在返回字典里完全无法区分。所以必须有一组独立的物理门禁。
+MICRO_LOOP_MAX_PLAUSIBLE_SHIFT_UM = 2000.0
+# 迭代间连续性联锁：单次迭代最大合法变化就是限幅加上漂移，超过 3× 限幅一定是检测问题。
+MICRO_LOOP_MAX_ITER_JUMP_UM = 300.0
+MICRO_LOOP_QUALITY_MIN = 0.5
+MICRO_LOOP_ANGLE_MAX_DEG = 1.0
+MICRO_LOOP_SCALE_TOL = 0.01
+
+# 相机与预览。全幅 1936×1464，不裁剪、不缩放——实测裁剪会把识别率从 100% 打到 35%。
+MICRO_LOOP_CAMERA_WARMUP_SECONDS = 1.0
+MICRO_LOOP_PREVIEW_FPS = 10.0
+MICRO_LOOP_PREVIEW_MAX_WIDTH = 700
+MICRO_LOOP_PROCESS_EVERY_N_FRAMES = 1
+# 画质指标（亮度/模糊/过暗/过曝，4 次全幅遍历，实测约 40 ms/帧）在闭环里没有用处：
+# 图像质量只用于显示，绝不参与控制。关掉它不影响识别链路——识别部分
+# 与 camera.preprocess_frame 逐字等价（同样的高斯模糊核、同一个 CheckerboardTracker）。
+MICRO_LOOP_COMPUTE_METRICS = False
+
+# 轴向 / 符号探针。视觉 +x/+y 与机器人 base X/Y 的对应关系（含符号）无法从代码推出，
+# 而符号反了会让误差每步翻倍直冲限幅，所以启动时必须实测一次。
+MICRO_LOOP_PROBE_UM = 1000.0
+MICRO_LOOP_PROBE_REFERENCE_SECONDS = 1.0
+# 探针专用的运动超时。1 mm 在 MICRO_LOOP_SPEED_MM_S=1 mm/s 下要走 1.0 s，
+# 加上加减速约 1.2 s——若沿用给微动的 MICRO_LOOP_STEP_TIMEOUT_S=1.0 s，
+# 探针会**每一次都超时**，然后退化成"靠固定 settle 猜"，而探针失败是具名中止。
+# 微动的超时和探针的超时必须分开，因为两者的移动量差 10~200 倍。
+MICRO_LOOP_PROBE_TIMEOUT_S = 3.0
+# 增益门禁：|g| > 2 有过冲振荡风险；|g| < 0.3 表示 20 次迭代也走不完 50 μm。
+MICRO_LOOP_GAIN_MIN = 0.3
+MICRO_LOOP_GAIN_MAX = 2.0
+# 正向与反向增益的相对差异上限。回差大到这个程度时闭环不是良定的。
+MICRO_LOOP_PROBE_HYSTERESIS_RATIO = 0.2
+# 交叉耦合只在超过该比例时告警并记录，不补偿（命令律仍是 Kp·error）。
+MICRO_LOOP_CROSS_COUPLING_WARN = 0.3
+
+# 运行期联锁。探针通过仍可能发散，所以运行中还要盯。
+# 每条修正的实测位移与指令方向相反，连续出现该次数即中止。
+MICRO_LOOP_SIGN_FLIP_ABORT_COUNT = 2
+# 本组累计 |命令| 超过该值即中止。这一条必要，因为 validate_trajectory 的
+# 相对工作区**每次调用都以当前位姿重新锚定**（robot.py:215-220），
+# 结构上无法察觉缓慢棘轮式走位。
+MICRO_LOOP_CUM_COMMAND_ABORT_UM = 2000.0
+# 漂移守卫已上移到"按轴共用零点"的 MICRO_LOOP_AXIS_DRIFT_*（见下面）。
+# 上一版按"本组幅值 + 20 μm"设门是个真实缺陷：+A 与 −A 共用参考时，
+# −A 的第一步必须合法地走约 2A 的行程，会被误判成棘轮走位而中止。
+# 保留这两个常量只为了让离线分析脚本还能读到旧名，运行路径不再使用。
+MICRO_LOOP_DRIFT_WARN_UM = 5.0
+MICRO_LOOP_DRIFT_ABORT_UM = 20.0
+
+# 极限环判据。全部可配，便于离线重调而不用改代码。
+# 窗口从 6 收到 3：判据要比较"最近一窗"与"前一窗"，所以可用的迭代上限
+# 必须 ≥ 2×窗口。迭代上限由本轮定位钉死在 6 次，窗口就只能 ≤ 3，
+# 否则 LIMIT_CYCLE 这个状态在整轮实验里**永远不会被判定出来**。
+# 3 帧窗口下的签名是"连续 3 次误差换号且幅值不收缩"——
+# 配合 CYCLE_ABS_KEEP=0.7 仍能区分“收敛型振荡”（环路增益 1.5 时三拍衰到 0.125）
+# 与“真极限环”，不会把正在收敛的振荡误报成极限环。
+MICRO_LOOP_CYCLE_WINDOW = 3
+MICRO_LOOP_CYCLE_MIN_SIGN_CHANGES = 2
+MICRO_LOOP_CYCLE_PTP_KEEP = 0.5
+MICRO_LOOP_CYCLE_ABS_KEEP = 0.7
+
+# ---- 开环微动模式（seq / alt） ----
+# 闭环之前先跑开环，用固定命令序列量出"命令 → 实际位移"的原始响应。
+# 两者指标**严格分开**：闭环的最终残差是"逼近能力"，开环的响应统计才是
+# "最小可靠微动"。绝不能拿闭环残差当最小微动单位。
+#
+# seq（连续同向）：+Δ +Δ +Δ −Δ −Δ −Δ，共 6 步。
+#   看微小命令是否真的产生运动、连续同向能否累积、正负是否对称、
+#   以及有没有"前两步不动、第三步突然跳"的死区/积累。
+# alt（频繁换向）：+Δ −Δ +Δ −Δ +Δ −Δ，共 6 步。
+#   模拟未来 SFC 可能出现的高频正负修正，重点看换向死区、回差、
+#   摩擦、方向延迟，以及是否明显劣于连续同向。
+# 两种模式每个轴每个档位都跑，步数对称，便于直接对比。
+MICRO_LOOP_OPEN_MODES: Final[tuple[str, ...]] = ("seq", "alt")
+MICRO_LOOP_OPEN_SEQ_POSITIVE_STEPS = 3
+MICRO_LOOP_OPEN_SEQ_NEGATIVE_STEPS = 3
+MICRO_LOOP_OPEN_ALT_STEPS = 6
+# 单步"命令 → 实测位移"的合格判据：实测位移落在 [lo, hi] 内算 VALID。
+# 与机器人侧断言（ACHIEVED_*）是两套：这里看的是视觉，那里看的是编码器。
+MICRO_LOOP_OPEN_MIN_RATIO = 0.5
+MICRO_LOOP_OPEN_MAX_RATIO = 1.5
+MICRO_LOOP_OPEN_ZERO_UM = 0.5
+MICRO_LOOP_OPEN_JUMP_UM = 200.0
+
+# 全局漂移守卫（相对**本轴零点**，整个轴的所有块共用一个基准）。
+# 本轮各块都是"走出去再走回来"（seq 与 alt 都以净位移 ≈0 结束），
+# 所以不需要按幅值设门——按幅值设门恰好是上一版的缺陷：−A 目标第一步
+# 合法地跨过 2A 的行程，会被误判成漂移。这里只守"跑飞了"这一件事。
+MICRO_LOOP_AXIS_DRIFT_WARN_UM = 300.0
+MICRO_LOOP_AXIS_DRIFT_ABORT_UM = 1500.0
+
+# 运动参数。1.0 mm/s + 0.10 m/s² 时，加速段本身就覆盖约 5 μm，
+# 因此 5 μm 档全程处于加减速斜坡内（这是被测现象，不是缺陷）。
+MICRO_LOOP_SPEED_MM_S = 1.0
+MICRO_LOOP_ACCELERATION_M_S2 = 0.10
+
+# 基于位置的稳定判据，取代 robot.motion_in_progress()。
+# 后者带固定 200 ms 宽限期，是 5 μm 运动全程（约 14 ms）的 14 倍，对微动零信息量。
+# 窗口取 5 μm 而不是开环版的 1 μm：CB3 的 actual_tcp_pose 由关节编码器换算，
+# 笛卡尔分辨率本身可能就有几 μm，1 μm 窗口可能永远无法满足，
+# 那会让每次迭代白等 10 s 再抛错。超时只降级为"按固定时间等一等"，
+# 真正的有效性由**视觉片段自身的窗内标准差**判定——闭环本就该以视觉为准。
+MICRO_LOOP_STABLE_WINDOW_MS = 100.0
+MICRO_LOOP_STABLE_WINDOW_UM = 5.0
+MICRO_LOOP_STABLE_SPEED_MM_S = 0.01
+MICRO_LOOP_STABLE_HOLD_SECONDS = 0.3
+# 独立 STABILIZE 命令用的超时。它在录制窗口之外，长短不影响内存占用。
+MICRO_LOOP_STABLE_TIMEOUT_S = 3.0
+# 运动前/后的稳定等待超时。它们**在录制窗口之内**，所以必须短：
+# 窗口越短，相机进程需要的内存缓冲越小，见 MICRO_LOOP_MAX_WINDOW_SECONDS。
+# 100 μm 以 1 mm/s 走完约 0.1 s（加加减速约 0.35 s），0.8 / 1.2 s 是 2–12 倍余量。
+MICRO_LOOP_PRE_STABLE_TIMEOUT_S = 0.8
+MICRO_LOOP_POST_STABLE_TIMEOUT_S = 0.8
+# 稳定等待超时后的降级等待。真正的有效性由视觉片段尾窗自身的标准差判定，
+# 编码器稳定性只是旁证，所以降级不是"放弃判断"。
+MICRO_LOOP_MOTION_SETTLE_SECONDS = 0.5
+# motion_in_progress() 的轮询上限。同样在窗口之内。100 μm 以 1 mm/s 走完约 0.35 s
+# （含加减速），1.0 s 是它的约 3 倍。这个值同时是"最坏窗口"的主要构成项，
+# 而最坏窗口 × 窗口数决定了整轮的绝对上界，所以不能随手放大。
+MICRO_LOOP_STEP_TIMEOUT_S = 1.0
+
+# ---- 时长提示线（**只提示，不中止**）----
+# 这个数**不是截止时间**，程序不会因为它跳过任何实验步骤。
+#
+# 上一版把它当成硬预算来用：每开一个窗口前外推总时长，投影超过就抛
+# TimeBudgetExceeded 安全收尾，未跑的目标记 TIME_BUDGET_EXCEEDED。
+# 那会造出一种最坏的结果——X 全跑完了、Y 的闭环还没轮到，就因为"到点了"
+# 直接结束，而机器人、相机、磁盘当时全都正常。**这条策略已删除。**
+#
+# 现在的原则：只要机器人/相机/磁盘正常、没有触发任何真实安全异常，
+# 既定的全部实验（2 轴 × 3 档 × seq/alt 开环 + 12 个闭环目标）就必须跑完。
+# 12~15 分钟是可接受的；真正允许中止的只有通信异常、相机异常、超出工作
+# 空间、异常累计漂移、方向异常、磁盘不足、内存不足这类真实故障，
+# 以及单个目标自身的 MAX_ITER / STALLED / LIMIT_CYCLE（只结束那个目标，
+# 继续下一个目标）。
+#
+# 保留这个常数的用途只有两个：启动前把预计时长显示给操作者，以及运行中
+# 超过它时打一条提示，好让"今天比平时慢"这件事被看见。
+#
+# 取值 900 s（15 分钟）而不是 600 s：按规定规模（12 个闭环目标）算出来，
+# 正常运行就要约 11.3 分钟，取 600 s 会让**每一轮**都触发提示，提示就变成
+# 噪声，真正异常的那一次反而看不见了。取 15 分钟只在明显跑偏时才说话。
+MICRO_LOOP_TIME_NOTICE_S = 900.0
+MICRO_LOOP_RETURN_SPEED_MM_S = 5.0
+
+# 机器人侧位移断言（复用开环版已验证的判据），与视觉侧的 measured_um 并排，
+# 就能把"控制器忽略了命令"与"机械柔性吸收掉了"分开。
+MICRO_LOOP_ACHIEVED_MIN_RATIO = 0.5
+MICRO_LOOP_ACHIEVED_MAX_RATIO = 1.5
+MICRO_LOOP_ACHIEVED_SLACK_UM = 2.0
+MICRO_LOOP_ACHIEVED_FLOOR_UM = 2.0
+
+# 磁盘保护。检查的是**原始数据所在卷**（见 MICRO_LOOP_RAW_ROOT）。
+MICRO_LOOP_MIN_FREE_GB_START = 20.0
+MICRO_LOOP_MIN_FREE_GB_CONTINUE = 10.0
+MICRO_LOOP_TRASH_QUOTA_GB = 2.0
+
+# ---- 原始数据存放策略 ----
+# 本轮总量很小（每步一段约 1.3 s 的窗口），所以**默认全量保留原始实验块**，
+# 不再"处理完即删"。原始 RAW 单独放到一个数据根目录，CSV/JSON/汇总仍留在工程
+# outputs/ 下——RAW 体积大、只是原始素材，和结果表放在一起会让工程目录难以搬运。
+# 启动时会先按分辨率/帧率/窗口数算出预计总量，写进日志与 config.json；
+# 若目标卷放不下，会**在创建目录之前拒绝启动**，绝不在实验结束后静默删除。
+MICRO_LOOP_RAW_ROOT: Final[Path] = Path("D:/UR10_micro_raw")
+# True = 能放下就全量保留；False = 固定只留静止基线 + 每块代表步。
+# 即使为 True，放不下时也会自动降级为代表步模式，并在日志里明写降级原因。
+MICRO_LOOP_KEEP_ALL_RAW = True
+# 全量保留时要求预留的余量（GiB）。低于它就算"放得下"也不全留——
+# 中途窗口因稳定超时被拖长会额外吃空间，留余量比事后补救便宜。
+MICRO_LOOP_KEEP_ALL_RESERVE_GB = 15.0
+
+# ---- 内存保护 ----
+# 相机进程为窗口预分配一块缓冲（MICRO_LOOP_MAX_WINDOW_SECONDS 决定虚拟预留上限，
+# Windows 上 np.empty 是惰性提交的，真正吃内存的是实际写进去的帧数）。
+# 启动前检查可用物理内存，明显不足就拒绝启动；预期占用同时打进日志与 README。
+MICRO_LOOP_MIN_FREE_RAM_GB = 1.5
+
+# 每个目标最多保存几张全分辨率 PNG 证据帧（绝不用 JPEG）。
+# 本轮定位是"快速判断"，所以默认只留 1 张：原始 RAW 已经全量保留，
+# 证据图能提供的信息都能从 RAW 里离线复算，多存只是占用体积。
+MICRO_LOOP_EVIDENCE_MAX = 1
+# 收敛后是否再录一段零命令静止片段做验证。这是唯一能把"真不动点"与
+# "运气好落进去"分开的动作，成本只有一段片段。
+MICRO_LOOP_VERIFY_EFFORT = True
+# 验证不通过时最多重开几次闭环。重开不会重置迭代预算——
+# 总迭代数始终由 MICRO_LOOP_MAX_ITER 封顶，所以验证不会把运行时长拖长。
+MICRO_LOOP_VERIFY_MAX_ATTEMPTS = 3
+
+# 相机就绪前的数据量估算用全幅尺寸；就绪后一律以实际帧尺寸为准。
+MICRO_LOOP_FULL_FRAME_WIDTH = 1936
+MICRO_LOOP_FULL_FRAME_HEIGHT = 1464
+
+
 # 计划最大包络人工检查使用固定低速参数；检查完成后不会自动进入批量实验。
 BOUNDARY_CHECK_SPEED_MM_S = 10.0
 BOUNDARY_CHECK_ACCELERATION_M_S2 = 0.05
@@ -813,6 +1117,7 @@ def validate_config(run_mode: str | None = None) -> None:
         "xy_line_experiment",
         "xy_l_experiment",
         "batch_experiment",
+        "micro_closed_loop",
         "boundary_check",
     }
     relative_motion_modes = {
@@ -820,6 +1125,7 @@ def validate_config(run_mode: str | None = None) -> None:
         "xy_line_experiment",
         "xy_l_experiment",
         "batch_experiment",
+        "micro_closed_loop",
         "boundary_check",
     }
 
@@ -890,6 +1196,308 @@ def validate_config(run_mode: str | None = None) -> None:
 
     if BATCH_MAX_CONSECUTIVE_MISSING_FRAMES < 1:
         raise ValueError("BATCH_MAX_CONSECUTIVE_MISSING_FRAMES 必须至少为 1。")
+
+    # 本段检查一键 XY 微动闭环能力测试的参数。
+    # 输入：目标幅值、增益、死区、终止判据、稳定判据、探针门禁和磁盘配额。
+    # 输出：参数自洽时继续；死区过小、阈值颠倒或磁盘配额顺序写反时抛错。
+    # 实验作用：这些值直接决定“能否逼近 5 μm”与“是否形成极限环”的结论是否成立，
+    # 而且它们全部是软件安全的依据，写错时必须在接触硬件之前停止。
+    if not MICRO_LOOP_AMPLITUDES_UM:
+        raise ValueError("MICRO_LOOP_AMPLITUDES_UM 不能为空。")
+    if any(
+        not isinstance(level, int) or level < 1 for level in MICRO_LOOP_AMPLITUDES_UM
+    ):
+        raise ValueError("MICRO_LOOP_AMPLITUDES_UM 必须都是不小于 1 的整数（μm）。")
+    if list(MICRO_LOOP_AMPLITUDES_UM) != sorted(set(MICRO_LOOP_AMPLITUDES_UM)):
+        raise ValueError("MICRO_LOOP_AMPLITUDES_UM 必须是从小到大且不重复的幅值序列。")
+    if set(MICRO_LOOP_AXES) - {"X", "Y"} or not MICRO_LOOP_AXES:
+        raise ValueError('MICRO_LOOP_AXES 只能包含 "X" 和 "Y"。')
+
+    # 死区必须严格大于 robot.validate_trajectory 的最小线段 1 μm。
+    # 小于等于 1 μm 的命令会命中"两点位置重合"的硬抛，恰好在一个目标
+    # 即将收敛的时刻把整轮弄死——这正是死区存在的唯一理由。
+    if MICRO_LOOP_MIN_COMMAND_UM <= 1.0:
+        raise ValueError(
+            "MICRO_LOOP_MIN_COMMAND_UM 必须大于 1.0 μm。"
+            "robot.validate_trajectory 拒绝 length <= 1e-6 m，"
+            "死区小于等于 1 μm 时收敛前的最后一步会硬抛“两点位置重合”。"
+        )
+    if MICRO_LOOP_MIN_COMMAND_UM >= MICRO_LOOP_MAX_CORRECTION_UM:
+        raise ValueError("MICRO_LOOP_MIN_COMMAND_UM 必须小于 MICRO_LOOP_MAX_CORRECTION_UM。")
+    if MICRO_LOOP_KP <= 0:
+        raise ValueError("MICRO_LOOP_KP 必须为正数。")
+    if MICRO_LOOP_MAX_CORRECTION_UM <= 0:
+        raise ValueError("MICRO_LOOP_MAX_CORRECTION_UM 必须为正数。")
+    if MICRO_LOOP_MAX_CORRECTION_UM >= ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M * 1e6 / 10.0:
+        raise ValueError(
+            "MICRO_LOOP_MAX_CORRECTION_UM 相对 200 mm 相对工作区过大，失去限幅意义。"
+        )
+    if MICRO_LOOP_MAX_CORRECTION_UM < max(MICRO_LOOP_AMPLITUDES_UM):
+        raise ValueError(
+            "MICRO_LOOP_MAX_CORRECTION_UM 不能小于最大目标幅值，否则该幅值永远无法一步到位。"
+        )
+
+    if MICRO_LOOP_MAX_ITER < MICRO_LOOP_CYCLE_WINDOW * 2:
+        raise ValueError(
+            "MICRO_LOOP_MAX_ITER 必须至少是 MICRO_LOOP_CYCLE_WINDOW 的两倍，"
+            "否则极限环判据永远拿不到两个完整窗口。"
+        )
+    if MICRO_LOOP_CYCLE_WINDOW < 3:
+        raise ValueError("MICRO_LOOP_CYCLE_WINDOW 至少为 3，否则换号次数判据没有意义。")
+    if MICRO_LOOP_CYCLE_MIN_SIGN_CHANGES < 2:
+        raise ValueError(
+            "MICRO_LOOP_CYCLE_MIN_SIGN_CHANGES 必须至少为 2；"
+            "只换号 1 次说明是单向逼近后的一次过冲，不是极限环。"
+        )
+    if MICRO_LOOP_CYCLE_MIN_SIGN_CHANGES > MICRO_LOOP_CYCLE_WINDOW - 1:
+        raise ValueError(
+            "MICRO_LOOP_CYCLE_MIN_SIGN_CHANGES 不能超过窗口内的最大可能换号次数。"
+        )
+    if MICRO_LOOP_STALL_PATIENCE < 2:
+        raise ValueError(
+            "MICRO_LOOP_STALL_PATIENCE 至少为 2；只看到 1 次没改善就判 STALLED，"
+            "会把正常的第一步大修正误报成停滞。"
+        )
+    if MICRO_LOOP_STALL_PATIENCE >= MICRO_LOOP_MAX_ITER:
+        raise ValueError(
+            "MICRO_LOOP_STALL_PATIENCE 必须小于 MICRO_LOOP_MAX_ITER，"
+            "否则停滞判据在迭代预算耗尽前永远不会生效。"
+        )
+    if MICRO_LOOP_STALL_MIN_IMPROVE_UM < 0:
+        raise ValueError("MICRO_LOOP_STALL_MIN_IMPROVE_UM 不能为负。")
+    if MICRO_LOOP_CONVERGE_COUNT > MICRO_LOOP_MAX_ITER:
+        raise ValueError(
+            "MICRO_LOOP_CONVERGE_COUNT 不能超过 MICRO_LOOP_MAX_ITER，"
+            "否则永远攒不够连续收敛次数。"
+        )
+
+    # ---- 在线分析的帧预算 ----
+    # 这几个数直接决定整轮时长（在线耗时 ≈ 分析帧数 × 0.165 s），
+    # 所以它们之间的顺序写反会让实验要么超时、要么结论不可信，必须在启动前拦住。
+    if MICRO_LOOP_MEASURE_FRAMES < 4:
+        raise ValueError(
+            "MICRO_LOOP_MEASURE_FRAMES 至少为 4；再少中位数的统计意义就不成立了。"
+        )
+    if MICRO_LOOP_MIN_TAIL_FRAMES > MICRO_LOOP_MEASURE_FRAMES:
+        raise ValueError(
+            "MICRO_LOOP_MIN_TAIL_FRAMES 不能超过 MICRO_LOOP_MEASURE_FRAMES，"
+            "否则每一轮测量都会因为“合格帧不够”被判不可用。"
+        )
+    if MICRO_LOOP_MIN_TAIL_FRAMES < max(3, MICRO_LOOP_MEASURE_FRAMES // 2):
+        raise ValueError(
+            "MICRO_LOOP_MIN_TAIL_FRAMES 相对 MICRO_LOOP_MEASURE_FRAMES 过小，"
+            "合格帧屈指可数时仍会放行，测量不可信。"
+        )
+    if MICRO_LOOP_REFERENCE_FRAMES <= MICRO_LOOP_MEASURE_FRAMES:
+        raise ValueError(
+            "MICRO_LOOP_REFERENCE_FRAMES 必须大于 MICRO_LOOP_MEASURE_FRAMES；"
+            "零点的不确定度不能比单次测量本身还差。"
+        )
+    if MICRO_LOOP_STATIC_ANALYZE_FRAMES < MICRO_LOOP_MEASURE_FRAMES:
+        raise ValueError(
+            "MICRO_LOOP_STATIC_ANALYZE_FRAMES 不能小于 MICRO_LOOP_MEASURE_FRAMES；"
+            "静止基线算不出比单次测量更好的统计量就没有意义。"
+        )
+    if MICRO_LOOP_PROCESS_EVERY_N_FRAMES < 1:
+        raise ValueError("MICRO_LOOP_PROCESS_EVERY_N_FRAMES 必须至少为 1。")
+
+    # ---- 开环模式 ----
+    if not MICRO_LOOP_OPEN_MODES:
+        raise ValueError("MICRO_LOOP_OPEN_MODES 不能为空。")
+    if set(MICRO_LOOP_OPEN_MODES) - {"seq", "alt"}:
+        raise ValueError('MICRO_LOOP_OPEN_MODES 只能包含 "seq" 和 "alt"。')
+    if MICRO_LOOP_OPEN_SEQ_POSITIVE_STEPS < 1 or MICRO_LOOP_OPEN_SEQ_NEGATIVE_STEPS < 1:
+        raise ValueError("开环 seq 模式的正向与反向步数都必须至少为 1。")
+    if MICRO_LOOP_OPEN_ALT_STEPS < 2 or MICRO_LOOP_OPEN_ALT_STEPS % 2 != 0:
+        raise ValueError(
+            "MICRO_LOOP_OPEN_ALT_STEPS 必须是大于等于 2 的偶数；"
+            "换向模式按 +Δ/−Δ 成对出现，奇数步会留下净位移。"
+        )
+    if not 0.0 < MICRO_LOOP_OPEN_MIN_RATIO < 1.0:
+        raise ValueError("MICRO_LOOP_OPEN_MIN_RATIO 必须在 0 到 1 之间。")
+    if MICRO_LOOP_OPEN_MAX_RATIO <= 1.0:
+        raise ValueError("MICRO_LOOP_OPEN_MAX_RATIO 必须大于 1。")
+    if MICRO_LOOP_OPEN_ZERO_UM <= 0:
+        raise ValueError("MICRO_LOOP_OPEN_ZERO_UM 必须为正数。")
+    if MICRO_LOOP_OPEN_JUMP_UM <= max(MICRO_LOOP_AMPLITUDES_UM) * MICRO_LOOP_OPEN_MAX_RATIO:
+        raise ValueError(
+            "MICRO_LOOP_OPEN_JUMP_UM 太小，正常档位就会触发异常跳变告警。"
+        )
+
+    # ---- 漂移守卫 ----
+    if MICRO_LOOP_AXIS_DRIFT_ABORT_UM <= MICRO_LOOP_AXIS_DRIFT_WARN_UM:
+        raise ValueError(
+            "MICRO_LOOP_AXIS_DRIFT_ABORT_UM 必须大于 MICRO_LOOP_AXIS_DRIFT_WARN_UM。"
+        )
+    if MICRO_LOOP_AXIS_DRIFT_ABORT_UM >= ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M * 1e6 / 10.0:
+        raise ValueError(
+            "MICRO_LOOP_AXIS_DRIFT_ABORT_UM 相对 200 mm 相对工作区过大，失去守卫意义。"
+        )
+
+    # ---- 数据落盘与内存 ----
+    if MICRO_LOOP_KEEP_ALL_RESERVE_GB < 0:
+        raise ValueError("MICRO_LOOP_KEEP_ALL_RESERVE_GB 不能为负。")
+    if MICRO_LOOP_KEEP_ALL_RESERVE_GB > MICRO_LOOP_MIN_FREE_GB_START:
+        raise ValueError(
+            "MICRO_LOOP_KEEP_ALL_RESERVE_GB 不应大于 MICRO_LOOP_MIN_FREE_GB_START，"
+            "两者语义重复，会让“是否全量保留”几乎永远为假。"
+        )
+    if MICRO_LOOP_MIN_FREE_RAM_GB <= 0:
+        raise ValueError("MICRO_LOOP_MIN_FREE_RAM_GB 必须为正数。")
+    if MICRO_LOOP_MIN_FREE_RAM_GB >= 8.0:
+        raise ValueError(
+            "MICRO_LOOP_MIN_FREE_RAM_GB 大得不像可用物理内存门槛；"
+            "本机总内存 15.77 GiB，门槛定到 8 GiB 以上等于永远拒绝启动。"
+        )
+    if MICRO_LOOP_EVIDENCE_MAX < 0 or MICRO_LOOP_EVIDENCE_MAX > 3:
+        raise ValueError("MICRO_LOOP_EVIDENCE_MAX 只能在 0 到 3 之间。")
+    if not 0.0 < MICRO_LOOP_CYCLE_PTP_KEEP <= 1.0:
+        raise ValueError("MICRO_LOOP_CYCLE_PTP_KEEP 必须在 0 到 1 之间。")
+    if not 0.0 < MICRO_LOOP_CYCLE_ABS_KEEP <= 1.0:
+        raise ValueError("MICRO_LOOP_CYCLE_ABS_KEEP 必须在 0 到 1 之间。")
+    if MICRO_LOOP_CONVERGE_COUNT < 1:
+        raise ValueError("MICRO_LOOP_CONVERGE_COUNT 必须至少为 1。")
+    if MICRO_LOOP_CONVERGE_COUNT > MICRO_LOOP_MAX_ITER:
+        raise ValueError("MICRO_LOOP_CONVERGE_COUNT 不能大于 MICRO_LOOP_MAX_ITER。")
+    if MICRO_LOOP_POSITION_TOL_UM <= 0:
+        raise ValueError("MICRO_LOOP_POSITION_TOL_UM 必须为正数。")
+    if MICRO_LOOP_POSITION_TOL_MODE not in {"absolute", "noise_relative"}:
+        raise ValueError(
+            'MICRO_LOOP_POSITION_TOL_MODE 只能是 "absolute" 或 "noise_relative"。'
+        )
+    if MICRO_LOOP_NOISE_SIGMA_MULT <= 0:
+        raise ValueError("MICRO_LOOP_NOISE_SIGMA_MULT 必须为正数。")
+    if not 0.0 < MICRO_LOOP_MIN_DIRECTIONAL_FRACTION <= 1.0:
+        raise ValueError(
+            "MICRO_LOOP_MIN_DIRECTIONAL_FRACTION 必须落在 (0, 1] 内："
+            "它是“至少要走完幅值的多大比例才承认朝目标逼近”的门槛。"
+        )
+
+    if not ROBOT_EXPERIMENT_MIN_SPEED_MM_S <= MICRO_LOOP_SPEED_MM_S <= ROBOT_EXPERIMENT_MAX_SPEED_MM_S:
+        raise ValueError(
+            "MICRO_LOOP_SPEED_MM_S 必须落在 ROBOT_EXPERIMENT_MIN_SPEED_MM_S 与 "
+            "ROBOT_EXPERIMENT_MAX_SPEED_MM_S 之间。"
+        )
+    if not ROBOT_EXPERIMENT_MIN_SPEED_MM_S <= MICRO_LOOP_RETURN_SPEED_MM_S <= ROBOT_EXPERIMENT_MAX_SPEED_MM_S:
+        raise ValueError("MICRO_LOOP_RETURN_SPEED_MM_S 必须落在实验允许的速度区间内。")
+    if MICRO_LOOP_ACHIEVED_MAX_RATIO < MICRO_LOOP_ACHIEVED_MIN_RATIO:
+        raise ValueError("MICRO_LOOP_ACHIEVED_MAX_RATIO 不能小于 MICRO_LOOP_ACHIEVED_MIN_RATIO。")
+
+    # 探针：增益门禁必须自洽，且探针位移本身要能构成合法线段。
+    if MICRO_LOOP_PROBE_UM <= 0:
+        raise ValueError("MICRO_LOOP_PROBE_UM 必须为正数。")
+    if MICRO_LOOP_PROBE_UM / 1000.0 > ROBOT_EXPERIMENT_MAX_SEGMENT_MM:
+        raise ValueError("MICRO_LOOP_PROBE_UM 不能超过 ROBOT_EXPERIMENT_MAX_SEGMENT_MM。")
+    if not 0.0 < MICRO_LOOP_GAIN_MIN < MICRO_LOOP_GAIN_MAX:
+        raise ValueError("MICRO_LOOP_GAIN_MIN 必须为正数且小于 MICRO_LOOP_GAIN_MAX。")
+    if MICRO_LOOP_GAIN_MIN * MICRO_LOOP_PROBE_UM < MICRO_LOOP_POSITION_TOL_UM:
+        raise ValueError(
+            "MICRO_LOOP_GAIN_MIN 与探针位移的乘积小于位置容差，"
+            "探针将无法把一个真实位移与噪声区分开。"
+        )
+    if not 0.0 < MICRO_LOOP_PROBE_HYSTERESIS_RATIO < 1.0:
+        raise ValueError("MICRO_LOOP_PROBE_HYSTERESIS_RATIO 必须在 0 到 1 之间。")
+    if not 0.0 < MICRO_LOOP_CROSS_COUPLING_WARN < 1.0:
+        raise ValueError("MICRO_LOOP_CROSS_COUPLING_WARN 必须在 0 到 1 之间。")
+
+    # 运行期联锁：漂移告警必须早于漂移中止，中止必须远小于 200 mm 相对工作区。
+    if MICRO_LOOP_DRIFT_WARN_UM <= 0 or MICRO_LOOP_DRIFT_ABORT_UM <= 0:
+        raise ValueError("漂移守卫阈值必须为正数。")
+    if MICRO_LOOP_DRIFT_WARN_UM >= MICRO_LOOP_DRIFT_ABORT_UM:
+        raise ValueError("MICRO_LOOP_DRIFT_WARN_UM 必须小于 MICRO_LOOP_DRIFT_ABORT_UM。")
+    if MICRO_LOOP_DRIFT_ABORT_UM / 1000.0 > ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M * 1000.0:
+        raise ValueError("MICRO_LOOP_DRIFT_ABORT_UM 不能超过相对工作区半径。")
+    if MICRO_LOOP_CUM_COMMAND_ABORT_UM <= MICRO_LOOP_MAX_CORRECTION_UM:
+        raise ValueError(
+            "MICRO_LOOP_CUM_COMMAND_ABORT_UM 必须大于单次限幅，否则第一步就会触发中止。"
+        )
+    if MICRO_LOOP_SIGN_FLIP_ABORT_COUNT < 1:
+        raise ValueError("MICRO_LOOP_SIGN_FLIP_ABORT_COUNT 必须至少为 1。")
+
+    # 磁盘：续跑门槛必须低于启动门槛，回收配额必须低于续跑门槛，
+    # 否则会出现"刚通过检查就因为回收目录超配额而中止"的死循环。
+    if MICRO_LOOP_MIN_FREE_GB_CONTINUE >= MICRO_LOOP_MIN_FREE_GB_START:
+        raise ValueError(
+            "MICRO_LOOP_MIN_FREE_GB_CONTINUE 必须小于 MICRO_LOOP_MIN_FREE_GB_START。"
+        )
+    if MICRO_LOOP_TRASH_QUOTA_GB >= MICRO_LOOP_MIN_FREE_GB_CONTINUE:
+        raise ValueError(
+            "MICRO_LOOP_TRASH_QUOTA_GB 必须小于 MICRO_LOOP_MIN_FREE_GB_CONTINUE。"
+        )
+    if MICRO_LOOP_MIN_FREE_GB_CONTINUE <= 0:
+        raise ValueError("MICRO_LOOP_MIN_FREE_GB_CONTINUE 必须为正数。")
+
+    if MICRO_LOOP_QUALITY_MIN < 0.0 or MICRO_LOOP_QUALITY_MIN > 1.0:
+        raise ValueError("MICRO_LOOP_QUALITY_MIN 必须在 0 到 1 之间。")
+    if MICRO_LOOP_SCALE_TOL <= 0 or MICRO_LOOP_SCALE_TOL >= 0.5:
+        raise ValueError("MICRO_LOOP_SCALE_TOL 必须为正且远小于 1。")
+    if MICRO_LOOP_MAX_PLAUSIBLE_SHIFT_UM <= MICRO_LOOP_MAX_ITER_JUMP_UM:
+        raise ValueError(
+            "MICRO_LOOP_MAX_PLAUSIBLE_SHIFT_UM 必须大于 MICRO_LOOP_MAX_ITER_JUMP_UM，"
+            "否则逐帧物理门禁比迭代间联锁还严，无法区分两种失效。"
+        )
+    if MICRO_LOOP_MAX_ITER_JUMP_UM <= 0:
+        raise ValueError("MICRO_LOOP_MAX_ITER_JUMP_UM 必须为正数。")
+    if MICRO_LOOP_MIN_TAIL_FRAMES < 1:
+        raise ValueError("MICRO_LOOP_MIN_TAIL_FRAMES 必须至少为 1。")
+    if MICRO_LOOP_EVIDENCE_MAX < 0:
+        raise ValueError("MICRO_LOOP_EVIDENCE_MAX 不能为负数。")
+    if MICRO_LOOP_VERIFY_MAX_ATTEMPTS < 0:
+        raise ValueError("MICRO_LOOP_VERIFY_MAX_ATTEMPTS 不能为负数。")
+
+    for name, value in {
+        "MICRO_LOOP_PRE_SECONDS": MICRO_LOOP_PRE_SECONDS,
+        "MICRO_LOOP_POST_SECONDS": MICRO_LOOP_POST_SECONDS,
+        "MICRO_LOOP_TAIL_WINDOW_S": MICRO_LOOP_TAIL_WINDOW_S,
+        "MICRO_LOOP_REFERENCE_SECONDS": MICRO_LOOP_REFERENCE_SECONDS,
+        "MICRO_LOOP_STATIC_SECONDS": MICRO_LOOP_STATIC_SECONDS,
+        "MICRO_LOOP_CAMERA_WARMUP_SECONDS": MICRO_LOOP_CAMERA_WARMUP_SECONDS,
+        "MICRO_LOOP_PREVIEW_FPS": MICRO_LOOP_PREVIEW_FPS,
+        "MICRO_LOOP_PREVIEW_MAX_WIDTH": MICRO_LOOP_PREVIEW_MAX_WIDTH,
+        "MICRO_LOOP_PROCESS_EVERY_N_FRAMES": MICRO_LOOP_PROCESS_EVERY_N_FRAMES,
+        "MICRO_LOOP_ACCELERATION_M_S2": MICRO_LOOP_ACCELERATION_M_S2,
+        "MICRO_LOOP_STABLE_WINDOW_MS": MICRO_LOOP_STABLE_WINDOW_MS,
+        "MICRO_LOOP_STABLE_WINDOW_UM": MICRO_LOOP_STABLE_WINDOW_UM,
+        "MICRO_LOOP_STABLE_SPEED_MM_S": MICRO_LOOP_STABLE_SPEED_MM_S,
+        "MICRO_LOOP_STABLE_HOLD_SECONDS": MICRO_LOOP_STABLE_HOLD_SECONDS,
+        "MICRO_LOOP_STABLE_TIMEOUT_S": MICRO_LOOP_STABLE_TIMEOUT_S,
+        "MICRO_LOOP_MOTION_SETTLE_SECONDS": MICRO_LOOP_MOTION_SETTLE_SECONDS,
+        "MICRO_LOOP_STEP_TIMEOUT_S": MICRO_LOOP_STEP_TIMEOUT_S,
+        "MICRO_LOOP_PRE_STABLE_TIMEOUT_S": MICRO_LOOP_PRE_STABLE_TIMEOUT_S,
+        "MICRO_LOOP_POST_STABLE_TIMEOUT_S": MICRO_LOOP_POST_STABLE_TIMEOUT_S,
+        "MICRO_LOOP_MAX_WINDOW_SECONDS": MICRO_LOOP_MAX_WINDOW_SECONDS,
+        "MICRO_LOOP_TAIL_SIGMA_MAX_UM": MICRO_LOOP_TAIL_SIGMA_MAX_UM,
+        "MICRO_LOOP_PROBE_REFERENCE_SECONDS": MICRO_LOOP_PROBE_REFERENCE_SECONDS,
+    }.items():
+        if value <= 0:
+            raise ValueError(f"{name} 必须为正数。")
+
+    # 录制窗口内各阶段的最坏耗时之和必须装得进相机进程预分配的缓冲。
+    # 装不进去不会静默丢数据（相机会如实标记截断），但那一刻的数据已经不可用了。
+    worst_window_s = (
+        MICRO_LOOP_PRE_SECONDS
+        + MICRO_LOOP_PRE_STABLE_TIMEOUT_S
+        + MICRO_LOOP_MOTION_SETTLE_SECONDS
+        + MICRO_LOOP_STEP_TIMEOUT_S
+        + MICRO_LOOP_POST_STABLE_TIMEOUT_S
+        + MICRO_LOOP_MOTION_SETTLE_SECONDS
+        + MICRO_LOOP_POST_SECONDS
+    )
+    if worst_window_s >= MICRO_LOOP_MAX_WINDOW_SECONDS:
+        raise ValueError(
+            f"录制窗口最坏耗时 {worst_window_s:.2f} s 已达到或超过 "
+            f"MICRO_LOOP_MAX_WINDOW_SECONDS={MICRO_LOOP_MAX_WINDOW_SECONDS:g} s。"
+            "请调小窗口内的超时，或调大预分配缓冲。"
+        )
+
+    # 取尾窗口中位数要求窗口内有足够多的帧，否则"尾部中位数"退化成一帧。
+    if MICRO_LOOP_TAIL_WINDOW_S > MICRO_LOOP_POST_SECONDS:
+        raise ValueError(
+            "MICRO_LOOP_TAIL_WINDOW_S 不能大于 MICRO_LOOP_POST_SECONDS，"
+            "否则尾部窗口会伸进运动瞬态。"
+        )
+    if MICRO_LOOP_FULL_FRAME_WIDTH < 16 or MICRO_LOOP_FULL_FRAME_HEIGHT < 16:
+        raise ValueError("MICRO_LOOP_FULL_FRAME_WIDTH/HEIGHT 过小。")
 
     for name, value in {
         "BRIGHTNESS_BASELINE_SECONDS": BRIGHTNESS_BASELINE_SECONDS,

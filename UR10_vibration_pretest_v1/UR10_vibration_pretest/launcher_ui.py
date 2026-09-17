@@ -60,16 +60,28 @@ MOTION_MODES = {
     "xy_line_experiment",
     "xy_l_experiment",
     "batch_experiment",
+    "micro_closed_loop",
     "boundary_check",
 }
 USAGE_GUIDE_TEXT = (
-    "1. 先点击“检测机械臂通信（不会运动）”。通过后才会解锁三个运动实验。\n\n"
+    "1. 先点击“检测机械臂通信（不会运动）”。通过后才会解锁运动实验。\n\n"
     "2. 做运动实验前，先手动开始索尼相机录像，再填写速度、时间、方向等参数。\n\n"
     "3. 点击对应实验按钮后，确认弹窗中的安全项。工业相机会开始保存 RAW，随后按提示打开并关闭手机手电筒。\n\n"
     "4. 检测到手电筒并等待画面恢复后，机械臂才会开始一次往返运动；结束后工业相机会继续记录 1 秒并自动封口保存。\n\n"
     "5. 需要停止时点“停止当前任务”，请等待窗口提示安全收尾完成；真实危险以示教器急停/安全停止为准。\n\n"
     "6. 完整批量实验只做连续录像和时间/机器人记录，不在实机采集阶段运行视觉识别。\n\n"
-    "7. 实验结束后手动停止索尼相机录像；之后可点‘批次录像离线识别’，选择批次目录再生成各段 VISION。"
+    "7. 实验结束后手动停止索尼相机录像；之后可点‘批次录像离线识别’，选择批次目录再生成各段 VISION。\n\n"
+    "8. “XY微动 + 视觉闭环快速测试”是一次点击跑完全程的独立流程，不需要手电筒，也不改动上面任何实验：\n"
+    "   自动完成 设备检查 → 相机预热 → 轴向/符号探针 → 5 s 全分辨率静止基线\n"
+    "   → X/Y × 5/20/50 μm 的开环连续微动与开环来回微动 → X/Y 视觉闭环 → 汇总并安全结束。\n"
+    "   目标幅值固定为 5 / 20 / 50 μm 且顺序从小到大，界面上不再提供幅值输入框。\n"
+    "   它回答的是：这三个数量级里，哪些能稳定动作、哪些只是部分有效、哪些根本分不出来，\n"
+    "   以及开环执行能力与视觉闭环逼近能力差多少；不追求标定出精确的最小分辨率。\n"
+    "   每一步都是「测量位置 → 发一次微动 → 等短时间稳定 → 再测量 → 立即算位移」，\n"
+    "   不是先跑完几十个动作再统一处理。全程目标 8 分钟内、硬上限 10 分钟；\n"
+    "   投影总时长一旦超出预算，会在开下一段之前安全收尾并保留已完成的数据。\n"
+    "   原始 RAW 按实验块写入 D:/UR10_micro_raw（static 块永久保留，其余本轮全部保留），\n"
+    "   工程目录只留 CSV/JSON 与少量 PNG 证据帧（绝不用 JPEG），不会留下任何完整视频。"
 )
 
 
@@ -95,6 +107,7 @@ class LauncherApp:
 
         self._build_hardware_section(root)
         self._build_motion_sections(root)
+        self._build_micro_section(root)
         self._build_batch_section(root)
         self._build_log_section(root)
 
@@ -364,8 +377,101 @@ class LauncherApp:
         self.l_motion_button.pack(side=RIGHT, padx=6, pady=6)
         self.motion_buttons.append(self.l_motion_button)
 
+    def _build_micro_section(self, root: Tk) -> None:
+        """XY 微动 + 视觉闭环快速测试：一次点击跑完全程的独立流程。"""
+
+        section = LabelFrame(
+            root, text="E. XY 微动 + 视觉闭环快速测试（一键完成，不需要手电筒）"
+        )
+        section.pack(fill="x", padx=10, pady=4)
+
+        # 档位是**固定**的 5 / 20 / 50 μm，故意不提供输入框：
+        # 本轮的目标是"10 分钟以内判断三个数量级的表现"。一旦允许随便填，
+        # 就会有人填回 11 档扫描，运行时间立刻回到几小时——那正是这轮要收缩掉的东西。
+        levels_text = " / ".join(f"{int(v)}" for v in config.MICRO_LOOP_AMPLITUDES_UM)
+        self.micro_levels_label = Label(
+            section, text=f"目标幅值 {levels_text} μm（固定，顺序从小到大）"
+        )
+        self.micro_levels_label.pack(side=LEFT, padx=(6, 2))
+
+        self.micro_hint_label = Label(
+            section,
+            text=(
+                "X/Y × 连续 / 换向 / 闭环；约 11 分钟，"
+                "时间只提示不中止；每步在线测量"
+            ),
+            anchor="w",
+        )
+        self.micro_hint_label.pack(side=LEFT, padx=6)
+
+        self.micro_button = Button(
+            section,
+            text="XY微动 + 视觉闭环快速测试",
+            command=self.start_micro_closed_loop,
+            width=28,
+            state="disabled",
+        )
+        self.micro_button.pack(side=RIGHT, padx=6, pady=6)
+        # 追加进 motion_buttons，即可继承“通信检测通过后才解锁”和停止按钮的协作式停止。
+        self.motion_buttons.append(self.micro_button)
+
+    def start_micro_closed_loop(self) -> None:
+        """确认后一键启动 XY 微动 + 视觉闭环快速测试。"""
+
+        try:
+            if not config.ROBOT_RELATIVE_MOTION_ENABLED:
+                raise ValueError(
+                    "config.ROBOT_RELATIVE_MOTION_ENABLED 当前为 False，"
+                    "微动闭环测试被锁定，请先在 config.py 中确认真机安全后解锁。"
+                )
+            # 只在按下按钮时才导入：micro_closed_loop 会连带拉进 numpy 与 cv2，
+            # 放在模块顶层会让启动器每次开窗都慢一拍。
+            import micro_closed_loop as mcl
+
+            amplitudes = [int(v) for v in config.MICRO_LOOP_AMPLITUDES_UM]
+            axes = list(config.MICRO_LOOP_AXES)
+            plan = mcl.estimate_run_plan()
+            budget_lines = "\n".join(mcl.format_budget_lines(plan))
+            summary = (
+                f"目标幅值：{' → '.join(str(v) for v in amplitudes)} μm（固定顺序），"
+                f"轴 {'/'.join(axes)}，每档 {len(config.MICRO_LOOP_OPEN_MODES)} 种开环模式"
+                f"（{'/'.join(config.MICRO_LOOP_OPEN_MODES)}）+ 闭环。\n"
+                "\n自动流程（全程无需人工切视频、标记步骤或按下一步）：\n"
+                "  1. UR10 通信检查\n"
+                "  2. 相机检查与预热\n"
+                "  3. X/Y 轴与视觉轴、正负号探针\n"
+                "  4. 静止基线约 5 s（完整 RAW 永久保留）\n"
+                f"  5. X 开环连续微动 {' → '.join(str(v) for v in amplitudes)} μm\n"
+                "  6. X 开环来回微动\n"
+                "  7. Y 开环连续微动\n"
+                "  8. Y 开环来回微动\n"
+                f"  9. X 视觉闭环（每目标最多 {config.MICRO_LOOP_MAX_ITER} 次迭代）\n"
+                " 10. Y 视觉闭环\n"
+                " 11. 汇总并安全结束\n"
+                "\n每一步都是「测量位置 → 发一次微动 → 等短时间稳定 → 再测量 → "
+                "立即算位移」，不是先跑完再统一处理。\n"
+                f"{budget_lines}\n"
+                f"原始 RAW 写入 {config.MICRO_LOOP_RAW_ROOT}，本轮全部保留；"
+                "工程目录里只留 CSV/JSON/少量 PNG，不会留下任何视频。\n"
+                "时长说明：上面的预计时间只是提示，**到点不会中止实验、不会跳过"
+                "任何目标**。只要机器人、相机、磁盘正常，12 个开环块与 12 个闭环"
+                "目标全部跑完（12～15 分钟都属正常）。单拎一个闭环目标达到迭代上限、"
+                "判 STALLED 或 LIMIT_CYCLE，只结束那个目标，后面的照跑。\n"
+                "中途点“停止当前任务”会安全收尾并保留已完成的数据。"
+            )
+            if not self._confirm_motion("XY 微动 + 视觉闭环快速测试确认", summary):
+                return
+            stop_path = self._make_stop_request_path("micro_closed_loop")
+            self.start_mode(
+                "micro_closed_loop",
+                ["--ui-confirmed", "--stop-request-path", str(stop_path)],
+                stop_path,
+            )
+        except (ImportError, ValueError) as exc:
+            messagebox.showerror("微动闭环参数错误", str(exc))
+
     def _build_batch_section(self, root: Tk) -> None:
-        section = LabelFrame(root, text="E. 完整批量实验计划（双击或选中后编辑）")
+        section = LabelFrame(root, text="F. 完整批量实验计划（双击或选中后编辑）")
         section.pack(fill="x", padx=10, pady=4)
         controls = Frame(section)
         controls.pack(fill="x", padx=6, pady=4)
@@ -698,7 +804,7 @@ class LauncherApp:
                 robot.disconnect()
 
     def _build_log_section(self, root: Tk) -> None:
-        section = LabelFrame(root, text="F. 日志和停止")
+        section = LabelFrame(root, text="G. 日志和停止")
         section.pack(fill=BOTH, expand=True, padx=10, pady=(4, 10))
 
         button_row = Frame(section)
