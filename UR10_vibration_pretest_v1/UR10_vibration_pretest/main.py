@@ -439,6 +439,14 @@ def run_vision_offline_mode() -> Path:
     return run_vision_offline()
 
 
+def run_offline_static_test_mode(arguments: argparse.Namespace) -> Path:
+    """机械臂可完全断电；只启动工业相机并测三次静止底噪。"""
+
+    from offline_static_test import run_offline_static_test
+
+    return run_offline_static_test(arguments.stop_request_path)
+
+
 def run_robot_dry_run_mode() -> Path:
     """
     用户选择 robot_dry_run 后进入这里。
@@ -1200,14 +1208,14 @@ def run_batch_experiment_mode(arguments: argparse.Namespace) -> Path:
 
 def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
     """
-    一键执行 XY 微动闭环能力测试。
+    一键执行 XY 多目标视觉闭环逼近测试。
 
     输入：命令行参数（--ui-confirmed、--stop-request-path）。
     输出：本次运行目录 Path。
 
-    流程：前置门禁 → 磁盘检查 → 设备检查与预热 → 5 s 全分辨率静止基线
-    → 轴向/符号探针 → X/Y × 5/20/50 μm × ± 方向逐个闭环逼近 → 回到初始位姿
-    → 汇总。全程临时视频随用随删，结束目录里不留下任何完整视频。
+    流程：前置门禁 → 设备检查与预热 → 轴向/符号探针 → 5 s 静止基线
+    → 建立统一视觉原点 → X/Y 各 6 个累计目标逐个闭环逼近 → 回到初始位姿
+    → 汇总。每次迭代 RAW 分析落盘后立即删除，结束时还有兜底清理。
 
     与既有模式最大的结构差别：这里**父进程自己就是视觉处理进程**。
     迭代必须等测量结果才能决定下一步命令，再开第三个进程只增加 IPC 复杂度，
@@ -1265,8 +1273,8 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
     # -------------------------------------------------------------------------
     # 预算：时长、体积、内存。全部在创建任何目录之前算完并打印。
     # -------------------------------------------------------------------------
-    plan = mcl.estimate_run_plan()
-    budget_lines = mcl.format_budget_lines(plan)
+    plan = mcl.estimate_multi_target_run_plan()
+    budget_lines = mcl.format_multi_target_budget_lines(plan)
     for line in budget_lines:
         print(line, flush=True)
 
@@ -1275,18 +1283,18 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
     # outputs/ 被几十 GB 二进制淹没，而 RAW 的保留策略也可能需要单独调整。
     raw_root = Path(config.MICRO_LOOP_RAW_ROOT)
     raw_free_gb = mcl.free_gb(raw_root if raw_root.exists() else raw_root.parent)
-    # 按**最坏**而不是正常值要空间：保留策略是全量保留，而"跑到一半发现
-    # 放不下"只能靠事后删数据收场，那正是被明令禁止的。
-    need_gb = plan["bytes_worst"] / (1024.0 ** 3) + float(
+    # 每组汇总落盘后立即删该组视频，所以门禁按最大单组驻盘量 + 余量计算。
+    # 整轮累计生成量仍打印供知情，但不会同时占在磁盘上。
+    need_gb = plan["peak_group_bytes_worst"] / (1024.0 ** 3) + float(
         config.MICRO_LOOP_KEEP_ALL_RESERVE_GB
     )
     if raw_free_gb < need_gb:
         raise RuntimeError(
             f"原始 RAW 目标卷 {raw_root} 剩余 {raw_free_gb:.2f} GiB，"
-            f"低于最坏所需 {need_gb:.2f} GiB（最坏原始数据 "
-            f"{mcl.format_gib(int(plan['bytes_worst']))} + 余量 "
+            f"低于最大单组所需 {need_gb:.2f} GiB（最大单组 "
+            f"{mcl.format_gib(int(plan['peak_group_bytes_worst']))} + 余量 "
             f"{config.MICRO_LOOP_KEEP_ALL_RESERVE_GB:g} GiB）。"
-            "原始实验块按策略需要全量保留，空间不足时在动手之前就拒绝开始。"
+            "空间不足时在动手之前就拒绝开始。"
         )
 
     ram_gb = mcl.available_ram_gb()
@@ -1298,10 +1306,10 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             "内存不足会在录制中途丢帧，所以拒绝开始。"
         )
     print(
-        f"原始 RAW 目标卷 {raw_root} 剩余 {raw_free_gb:.2f} GiB（最坏需 {need_gb:.2f} GiB）｜ "
+        f"原始 RAW 目标卷 {raw_root} 剩余 {raw_free_gb:.2f} GiB（最大单组需 {need_gb:.2f} GiB）｜ "
         f"可用内存 {ram_gb:.2f} GiB"
         if math.isfinite(ram_gb)
-        else f"原始 RAW 目标卷 {raw_root} 剩余 {raw_free_gb:.2f} GiB（最坏需 {need_gb:.2f} GiB）｜ "
+        else f"原始 RAW 目标卷 {raw_root} 剩余 {raw_free_gb:.2f} GiB（最大单组需 {need_gb:.2f} GiB）｜ "
         "可用内存取不到（按未知处理，不当作充足）",
         flush=True,
     )
@@ -1330,38 +1338,67 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         print(f"[状态] {text}" if status else text, flush=True)
         mcl.append_log(log_path, text)
 
+    def cleanup_raw_group(block_id: str, description: str, *, quiet: bool = False) -> None:
+        """结果已落盘后删除这一组的视频载荷；删除失败则停止继续累积。"""
+
+        if not bool(config.MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP):
+            return
+        released, failed = mcl.delete_video_payloads(raw_run_dir / block_id)
+        if failed:
+            raise RuntimeError(
+                f"{description}结束后清理视频失败，仍有 {len(failed)} 个文件被占用："
+                + "，".join(str(path) for path in failed[:3])
+                + "。为防止后续实验继续占满磁盘，已停止。"
+            )
+        if not quiet:
+            log(
+                f"{description}结果已落盘；该组 RAW/视频已删除，释放 "
+                f"{mcl.format_gib(released)}。",
+                status=True,
+            )
+
     mcl.write_json(
         run_dir / "config.json",
         {
             "kind": "MICRO_CLOSED_LOOP_CONFIG",
             "run_id": run_id,
             "axes": list(config.MICRO_LOOP_AXES),
-            "amplitudes_um": list(config.MICRO_LOOP_AMPLITUDES_UM),
-            "kp": config.MICRO_LOOP_KP,
-            "max_correction_um": config.MICRO_LOOP_MAX_CORRECTION_UM,
+            "experiment": "XY_MULTI_TARGET_VISUAL_CLOSED_LOOP",
+            "relative_targets_um": list(config.MICRO_TARGET_RELATIVE_STEPS_UM),
+            "absolute_targets_um": list(config.MICRO_TARGET_ABSOLUTE_UM),
+            "control_law": "command = error",
+            "max_command_um": config.MICRO_TARGET_MAX_COMMAND_UM,
             "min_command_um": config.MICRO_LOOP_MIN_COMMAND_UM,
-            "max_iter": config.MICRO_LOOP_MAX_ITER,
-            "position_tol_um": config.MICRO_LOOP_POSITION_TOL_UM,
-            "position_tol_mode": config.MICRO_LOOP_POSITION_TOL_MODE,
-            "noise_sigma_mult": config.MICRO_LOOP_NOISE_SIGMA_MULT,
-            "converge_count": config.MICRO_LOOP_CONVERGE_COUNT,
+            "max_iter": config.MICRO_TARGET_MAX_ITER,
+            "stable_tolerance_um": config.MICRO_TARGET_STABLE_TOL_UM,
+            "stable_count": config.MICRO_TARGET_STABLE_COUNT,
+            "small_command_um": config.MICRO_TARGET_SMALL_COMMAND_UM,
             "pre_seconds": config.MICRO_LOOP_PRE_SECONDS,
             "post_seconds": config.MICRO_LOOP_POST_SECONDS,
             "tail_window_s": config.MICRO_LOOP_TAIL_WINDOW_S,
             "max_window_seconds": config.MICRO_LOOP_MAX_WINDOW_SECONDS,
             "speed_mm_s": config.MICRO_LOOP_SPEED_MM_S,
             "acceleration_m_s2": config.MICRO_LOOP_ACCELERATION_M_S2,
-            "cycle_window": config.MICRO_LOOP_CYCLE_WINDOW,
-            "cycle_min_sign_changes": config.MICRO_LOOP_CYCLE_MIN_SIGN_CHANGES,
-            "cycle_ptp_keep": config.MICRO_LOOP_CYCLE_PTP_KEEP,
-            "cycle_abs_keep": config.MICRO_LOOP_CYCLE_ABS_KEEP,
+            "limit_cycle_window": config.MICRO_TARGET_LIMIT_WINDOW,
+            "limit_cycle_min_sign_changes": config.MICRO_TARGET_LIMIT_MIN_SIGN_CHANGES,
+            "matrix_max_condition": config.MICRO_TARGET_MATRIX_MAX_CONDITION,
+            "local_range_um": config.MICRO_TARGET_LOCAL_RANGE_UM,
             "probe_um": config.MICRO_LOOP_PROBE_UM,
+            "probe_remeasure_attempts": config.MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS,
+            "probe_reference_frames": config.MICRO_LOOP_PROBE_REFERENCE_FRAMES,
+            "probe_measure_frames": config.MICRO_LOOP_PROBE_MEASURE_FRAMES,
+            "probe_tail_window_s": config.MICRO_LOOP_PROBE_TAIL_WINDOW_S,
+            "fixed_safety_radius_m": config.MICRO_LOOP_FIXED_SAFETY_RADIUS_M,
+            "delete_video_files_after_group": config.MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP,
+            "delete_video_files_on_exit": config.MICRO_LOOP_DELETE_VIDEO_FILES_ON_EXIT,
             "gain_min": config.MICRO_LOOP_GAIN_MIN,
             "gain_max": config.MICRO_LOOP_GAIN_MAX,
             "process_every_n_frames": config.MICRO_LOOP_PROCESS_EVERY_N_FRAMES,
             "temp_dir": str(temp_dir),
             "note": (
-                "全程未压缩 RAW 临时文件，随处理随删除；运行目录内不含任何完整视频。"
+                "每次迭代在同一活动窗口内取得 before 快照、发送命令并取得 after；"
+                "迭代结果落盘后立即删除其未压缩 RAW；"
+                "正常结束、用户停止或异常退出时再做整轮兜底清理。"
             ),
         },
     )
@@ -1533,6 +1570,30 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         watch.charge((time.perf_counter_ns() - int(open_window.started_ns)) / 1e9)
         return saved
 
+    def snapshot_active_window(label: str) -> dict[str, Any]:
+        """复制活动命令窗口中最后 16 帧；原窗口保持打开并继续记录。"""
+
+        stem = mcl.next_clip_stem(run_id, f"{label}_before", next(clip_counter))
+        camera_commands.put(
+            {
+                "action": "SNAPSHOT_WINDOW",
+                "temp_dir": str(temp_dir),
+                "stem": stem,
+                "clip_label": f"{label}_before",
+                "frame_count": int(config.MICRO_LOOP_MEASURE_FRAMES),
+            }
+        )
+        saved = inbox.wait(
+            "camera",
+            "WINDOW_SNAPSHOT",
+            error_queue,
+            stop_event,
+            stop_request_path,
+            timeout_s=30.0,
+        )
+        saved["stem"] = stem
+        return saved
+
     def capture_window(
         label: str,
         *,
@@ -1585,7 +1646,9 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         vision_axis: str,
         iteration_id: str = "",
         prev_measured_um: float | None = None,
+        vision_to_axis_sign: float | None = None,
         tail_frames: int | None = None,
+        tail_window_s: float | None = None,
     ) -> tuple[mcl.ClipMeasurement, mcl.RawClip, list[Path]]:
         """
         打开临时 RAW 逐帧测量，返回 (测量, 片段, 待回收的临时文件路径)。
@@ -1606,9 +1669,11 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             every_n=every_n,
             iteration_id=iteration_id,
             prev_measured_um=prev_measured_um,
+            vision_to_axis_sign=vision_to_axis_sign,
             tail_frames=(
                 int(config.MICRO_LOOP_MEASURE_FRAMES) if tail_frames is None else tail_frames
             ),
+            tail_window_s=tail_window_s,
             vision_axis=vision_axis,
         )
         return measurement, clip, [paths["raw"], paths["meta"], paths["frames"]]
@@ -1625,13 +1690,9 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
 
         输入：片段对象、临时文件路径、实验块名、是否保留（None = 本轮全局策略）。
 
-        保留与删除的分工（这是用户明确要求的两条，不能混）：
-        - 静止基线的完整 RAW **永久保留**，用于事后重新确认"取消 MJPG 之后
-          静止抖动到底是多少"；
-        - 其它微动实验块按 MICRO_LOOP_KEEP_ALL_RAW 全量保留（本轮总量很小，
-          磁盘也够），绝不在实验结束后静默全部删除。
-        归档用同卷 os.replace，是原子的且瞬间完成——保留全部原始块的代价
-        只有磁盘，没有时间。
+        当前组内先归档完整 RAW，保证在线分析、证据帧与汇总都已完成；调用方在
+        该组结果落盘后通过 cleanup_raw_group 删除视频载荷，再进入下一组。
+        归档用同卷 os.replace，是原子的且瞬间完成。
         """
 
         if clip is not None:
@@ -1752,13 +1813,15 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             primed = meter.prime(
                 clip,
                 every_n=static_every_n,
-                frames=int(config.MICRO_LOOP_STATIC_ANALYZE_FRAMES),
+                # every_n 已经把整段均匀压到约 40 帧；若再传 frames=40，
+                # 会先截取末尾 40 帧再每 18 帧抽一次，最终只剩 3 帧。
+                frames=None,
             )
             measurement = meter.measure_clip(
                 clip,
                 every_n=static_every_n,
                 iteration_id="static",
-                tail_frames=int(config.MICRO_LOOP_STATIC_ANALYZE_FRAMES),
+                tail_frames=None,
                 # 这里的轴选择不影响结果：analyze_static_clip 直接从逐帧行的
                 # checker_dx_mm / checker_dy_mm 各算一份统计，两条轴都算。
                 vision_axis="x",
@@ -1780,11 +1843,12 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                     "analyze_every_n": static_every_n,
                     "analyze_frames": len(measurement.frame_rows),
                     "raw_archive": str(raw_run_dir / block_id),
-                    "raw_retained": True,
+                    "raw_retained": not bool(
+                        config.MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP
+                    ),
                     "note": (
-                        "完整 5 s 未压缩 RAW 永久保留在 raw_archive，"
-                        "用于事后重新确认取消 MJPG 后的静止抖动；"
-                        "本 JSON 的统计量只用了抽帧后的样本。"
+                        "完整 5 s 未压缩 RAW 用于在线分析，本组结果落盘后按配置"
+                        "立即删除；本 JSON、逐帧接受/拒绝记录和证据 PNG 保留。"
                     ),
                 }
             )
@@ -1834,16 +1898,14 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             )
             log(
                 f"静止噪声底：sigma {summary['static_sigma_um']:.2f} μm ｜ "
-                f"RMS {summary['static_rms_um']:.2f} μm ｜ 完整 RAW 已永久保留在 "
-                f"{raw_run_dir / block_id}",
+                f"RMS {summary['static_rms_um']:.2f} μm ｜ 完整 RAW 将在本组落盘后立即删除",
                 status=True,
             )
             return summary
         finally:
-            # 静止基线**永久保留**，不走回收目录。这是用户明确要求的：
-            # 它是"取消 MJPG 之后静止抖动到底是多少"的唯一原始证据。
             release(clip, [paths["raw"], paths["meta"], paths["frames"]],
                     block_id=block_id, keep=True)
+            cleanup_raw_group(block_id, "静止基线")
 
     # -------------------------------------------------------------------------
     # 轴向 / 符号探针
@@ -1869,7 +1931,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         half = float(config.MICRO_LOOP_PROBE_REFERENCE_SECONDS) / 2.0
 
         def probe_move(axis: str, delta_um: float, label: str) -> dict[str, float]:
-            """走一步探针位移并返回探针坐标系下的视觉位置（μm）。"""
+            """走一步探针位移；不合格时原地复测，返回可信的视觉位置。"""
 
             saved, move = capture_window(
                 label,
@@ -1886,33 +1948,115 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                 post_seconds=half,
             )
             move = move or {}
-            paths = mcl.clip_temp_paths(temp_dir, saved["stem"])
-            if bool(saved.get("truncated")):
-                release(None, list(paths.values()), block_id=PROBE_BLOCK)
-                raise RuntimeError(f"探针 {label} 的片段被缓冲截断，无法用于定符号。")
-            # vision_axis 在这里无所谓：探针要的是**两条视觉轴**各自的位移
-            # （positions[-1] 的 x 与 y 都读），不是某一条轴的标量。
-            measurement, clip, _ = read_window(
-                saved["stem"], meter, vision_axis="x", iteration_id=label
-            )
-            try:
-                log(
-                    f"探针 {label}：机器人侧实测 "
-                    f"{float(move.get('achieved_um', float('nan'))):+.1f} μm ｜ 视觉 "
-                    f"x {measurement.positions[-1]['x'] if measurement.positions else float('nan'):+.2f} μm ｜ "
-                    f"y {measurement.positions[-1]['y'] if measurement.positions else float('nan'):+.2f} μm"
-                )
-                if not measurement.is_usable:
-                    raise RuntimeError(
-                        f"探针 {label} 没有可用的稳定测量"
-                        f"（尾窗 {measurement.n_tail} 帧，标准差 "
-                        f"{measurement.sigma_tail_um:.2f} μm），无法定符号。"
+            max_remeasurements = int(config.MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS)
+            last_failure = "未知测量问题"
+
+            for attempt in range(max_remeasurements + 1):
+                attempt_label = label if attempt == 0 else f"{label}_remeasure_{attempt}"
+                if attempt > 0:
+                    # 复测只要求机器人保持当前位置并重新确认稳定，绝不再次发送 MOVE。
+                    robot_commands.put({"action": "STABILIZE"})
+                    stable = inbox.wait(
+                        "robot",
+                        "STABILIZED",
+                        error_queue,
+                        stop_event,
+                        stop_request_path,
+                        timeout_s=30.0,
                     )
-                last = measurement.positions[-1]
-                return {"x": float(last["x"]), "y": float(last["y"])}
-            finally:
-                release(clip, [paths["raw"], paths["meta"], paths["frames"]],
-                        block_id=PROBE_BLOCK)
+                    log(
+                        f"探针 {label} 开始第 {attempt}/{max_remeasurements} 次原地复测"
+                        f"（不发送运动命令，编码器稳定={bool(stable.get('settle_ok'))}）",
+                        status=True,
+                    )
+                    saved, _ = capture_window(
+                        attempt_label,
+                        command=None,
+                        pre_seconds=0.0,
+                        post_seconds=0.0,
+                    )
+
+                paths = mcl.clip_temp_paths(temp_dir, saved["stem"])
+                clip = None
+                measurement = None
+                try:
+                    if bool(saved.get("truncated")):
+                        last_failure = "片段被相机缓冲截断"
+                    else:
+                        # 探针要同时读取 x/y 位置；is_usable 仍按当前既有主轴门禁判断，
+                        # 复测不会改变 12 帧与 2.0 μm 的严格阈值。
+                        measurement, clip, _ = read_window(
+                            saved["stem"],
+                            meter,
+                            vision_axis="x",
+                            iteration_id=attempt_label,
+                            tail_frames=int(config.MICRO_LOOP_PROBE_MEASURE_FRAMES),
+                            tail_window_s=float(config.MICRO_LOOP_PROBE_TAIL_WINDOW_S),
+                        )
+                        last = (
+                            measurement.positions[-1]
+                            if measurement.positions
+                            else {"x": float("nan"), "y": float("nan")}
+                        )
+                        motion_text = (
+                            f"机器人侧实测 "
+                            f"{float(move.get('achieved_um', float('nan'))):+.1f} μm"
+                            if attempt == 0
+                            else "机器人侧无新运动"
+                        )
+                        log(
+                            f"探针 {attempt_label}：{motion_text} ｜ 视觉 "
+                            f"x {float(last['x']):+.2f} μm ｜ "
+                            f"y {float(last['y']):+.2f} μm"
+                        )
+                        if measurement.is_usable and measurement.positions:
+                            if attempt > 0:
+                                log(
+                                    f"探针 {label} 第 {attempt} 次原地复测合格，继续实验。",
+                                    status=True,
+                                )
+                            return {"x": float(last["x"]), "y": float(last["y"])}
+
+                        failures: list[str] = []
+                        if measurement.truncated:
+                            failures.append("片段被相机缓冲截断")
+                        if measurement.measured_um is None or not math.isfinite(
+                            float(measurement.measured_um)
+                        ):
+                            failures.append("没有有限测量值")
+                        if measurement.n_tail < int(config.MICRO_LOOP_MIN_TAIL_FRAMES):
+                            failures.append(
+                                f"尾窗合格帧 {measurement.n_tail} < "
+                                f"{int(config.MICRO_LOOP_MIN_TAIL_FRAMES)}"
+                            )
+                        if not math.isfinite(float(measurement.sigma_tail_um)):
+                            failures.append("尾窗标准差不是有限数")
+                        elif measurement.sigma_tail_um > float(
+                            config.MICRO_LOOP_TAIL_SIGMA_MAX_UM
+                        ):
+                            failures.append(
+                                f"尾窗标准差 {measurement.sigma_tail_um:.2f} μm > "
+                                f"{float(config.MICRO_LOOP_TAIL_SIGMA_MAX_UM):.2f} μm"
+                            )
+                        last_failure = "；".join(failures) or "测量未通过可用性门禁"
+                finally:
+                    release(
+                        clip,
+                        [paths["raw"], paths["meta"], paths["frames"]],
+                        block_id=PROBE_BLOCK,
+                    )
+
+                if attempt < max_remeasurements:
+                    log(
+                        f"探针 {attempt_label} 不合格：{last_failure}；"
+                        f"将进行第 {attempt + 1}/{max_remeasurements} 次原地复测。",
+                        status=True,
+                    )
+
+            raise RuntimeError(
+                f"探针 {label} 初测及 {max_remeasurements} 次原地复测均不合格；"
+                f"最后一次原因：{last_failure}。无法安全定符号。"
+            )
 
         # 参考片段：建立探针坐标系零点，并把 CheckerboardTracker 的参考锁在 medoid 帧上。
         ref_saved, _ = capture_window(
@@ -1925,7 +2069,9 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         ref_clip = mcl.open_raw_clip(ref_paths["raw"])
         try:
             primed = meter.prime(
-                ref_clip, every_n=every_n, frames=int(config.MICRO_LOOP_REFERENCE_FRAMES)
+                ref_clip,
+                every_n=every_n,
+                frames=int(config.MICRO_LOOP_PROBE_REFERENCE_FRAMES),
             )
             log(
                 f"探针参考已锁定：medoid 帧 {primed['reference_frame_index']} ｜ "
@@ -1956,6 +2102,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             )
         for note in gains.notes:
             log(f"探针提示：{note}", status=True)
+        cleanup_raw_group(PROBE_BLOCK, "轴向/符号探针")
         return gains
 
     # -------------------------------------------------------------------------
@@ -2022,6 +2169,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             f"基线位置 X {baseline_positions.get('X')} / Y {baseline_positions.get('Y')} μm",
             status=True,
         )
+        cleanup_raw_group("02_open_baseline", "开环基线")
 
         chain: dict[str, float | None] = dict(baseline_positions)
         block_stats: list[dict[str, Any]] = []
@@ -2072,6 +2220,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                     # 每块结束都刷新开环汇总：中途因预算或异常收尾时，
                     # 已经跑完的块必须已经落盘，而不是等最后统一写。
                     write_summary()
+                    cleanup_raw_group(str(stats["block_id"]), f"开环块 {stats['block_id']}")
 
         write_summary()
         min_levels = {
@@ -2156,9 +2305,19 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             measured_increment: float | None = None
             n_tail = 0
             sigma_tail = math.nan
+            n_valid = 0
+            accept_rate = 0.0
+            reject_reasons = ""
+            measured_positions: dict[str, float | None] = {}
             note = ""
             if bool(saved.get("truncated")):
                 note = "相机缓冲写满，本段被截断，本步测量不可用"
+                truncated_paths = mcl.clip_temp_paths(temp_dir, saved["stem"])
+                release(
+                    None,
+                    [truncated_paths["raw"], truncated_paths["meta"], truncated_paths["frames"]],
+                    block_id=block_id,
+                )
             else:
                 measurement, clip, paths = read_window(
                     saved["stem"],
@@ -2166,12 +2325,20 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                     vision_axis=vision_axis,
                     iteration_id=label,
                     prev_measured_um=before_um,
+                    vision_to_axis_sign=float(gains.sign[axis]),
                 )
                 n_tail = measurement.n_tail
                 sigma_tail = measurement.sigma_tail_um
-                measured_after = mcl.GroupVisionMeter.axis_measured_um(
-                    measurement, axis, gains
+                n_valid = measurement.n_valid
+                accept_rate = measurement.accept_rate
+                reject_reasons = measurement.rejection_summary
+                # 一次识别同时产生两个视觉轴的位置。把两条机器人轴的链都更新，
+                # 否则 X 运动造成的交叉耦合不会进入 Y 的基点，切到 Y 时第一步
+                # 会把此前累计横向偏移错误地算成本步响应。
+                measured_positions = mcl.GroupVisionMeter.axis_positions_um(
+                    measurement, gains, robot_axes=config.MICRO_LOOP_AXES
                 )
+                measured_after = measured_positions.get(axis)
                 release(clip, paths, block_id=block_id)
 
             requested = commanded + pending_command_um
@@ -2186,7 +2353,6 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                 # 链条真的断了（开环零点那次测量就失败过）。不猜、不插值：
                 # 把本步位置当作新基点，并如实标注这一步的增量不可用。
                 status = mcl.OPEN_STEP_MEASUREMENT_LOST
-                chain[axis] = measured_after
                 pending_command_um = 0.0
                 pending_steps = 0
                 note = "本步之前没有可用基点，无法算增量；已把本步位置作为新基点"
@@ -2195,9 +2361,15 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                 status, note = mcl.classify_open_step(requested, measured_increment)
                 if span > 1:
                     note += f"（增量跨越 {span} 步，前面的测量丢失已合并到这一步）"
-                chain[axis] = measured_after
                 pending_command_um = 0.0
                 pending_steps = 0
+
+            if measured_after is not None:
+                for observed_axis, observed_position in measured_positions.items():
+                    if observed_position is not None and math.isfinite(
+                        float(observed_position)
+                    ):
+                        chain[observed_axis] = float(observed_position)
 
             if drift_note:
                 status = mcl.OPEN_STEP_ABNORMAL_JUMP
@@ -2225,6 +2397,11 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                     "measurement_timestamp_ns": int(move.get("command_end_ns") or 0),
                     "settling_time_s": float(move.get("settling_time_s", math.nan)),
                     "settle_ok": bool(move.get("settle_ok", False)),
+                    "n_valid_frames": n_valid,
+                    "n_tail_frames": n_tail,
+                    "sigma_tail_um": sigma_tail,
+                    "accept_rate": accept_rate,
+                    "reject_reasons": reject_reasons,
                     "status": status,
                     "note": note,
                 }
@@ -2253,7 +2430,9 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                 "sign": float(gains.sign[axis]),
                 "out_dir": str(out_dir),
                 "raw_dir": str(raw_run_dir / block_id),
-                "raw_retained": bool(keep_all_raw),
+                "raw_retained": bool(keep_all_raw) and not bool(
+                    config.MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP
+                ),
             }
         )
         mean_text = (
@@ -2397,6 +2576,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                     vision_axis=vision_axis,
                     iteration_id=f"{target_key}_verify{verify_attempts:02d}",
                     prev_measured_um=last_measured,
+                    vision_to_axis_sign=float(gains.sign[axis]),
                 )
                 frame_rows.extend(measurement.frame_rows)
                 n_tail = measurement.n_tail
@@ -2405,6 +2585,13 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                     measurement, axis, gains
                 )
                 release(clip, paths, block_id=block_id)
+            else:
+                truncated_paths = mcl.clip_temp_paths(temp_dir, saved["stem"])
+                release(
+                    None,
+                    [truncated_paths["raw"], truncated_paths["meta"], truncated_paths["frames"]],
+                    block_id=block_id,
+                )
 
             observation = (
                 "零命令复测片段不可用"
@@ -2416,7 +2603,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             if verify_measured is None:
                 converged_verified = False
                 note = f"收敛验证失败：{observation}"
-                log(f"[状态] {axis} {direction:+d}{amplitude_um} μm 收敛验证：片段不可用。")
+                log(f"[状态] {axis} {target_um:+g} μm 收敛验证：片段不可用。")
                 record_verification_row(verify_measured, residual_um, n_tail, sigma_tail, note)
                 return None
 
@@ -2424,7 +2611,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             threshold_um = 2.0 * float(sigma_um)
             converged_verified = verify_delta_um <= threshold_um
             log(
-                f"[状态] {axis} {direction:+d}{amplitude_um} μm 收敛验证：{observation}"
+                f"[状态] {axis} {target_um:+g} μm 收敛验证：{observation}"
                 f"（阈值 {threshold_um:.2f} μm）｜ {'通过' if converged_verified else '不通过，重开闭环'}",
                 status=True,
             )
@@ -2496,7 +2683,8 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             iteration_index = next_iteration
             next_iteration += 1
             iteration_id = f"{target_key}_i{iteration_index:02d}"
-            error_before = target_um - (0.0 if last_measured is None else last_measured)
+            previous_measured = last_measured
+            error_before = target_um - (0.0 if previous_measured is None else previous_measured)
             # 刻意**不传 sign**：error_before = target − last_measured，两端都
             # 已经是 axis_measured_um 归一过的机器人轴坐标，这里再乘一次 sign
             # 会在 sign=−1 的相机安装下把方向翻反。sign 的唯一用武之地是
@@ -2505,9 +2693,9 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             below_deadband = command_um == 0.0
 
             log(
-                f"{axis} {direction:+d}{amplitude_um} μm ｜ 迭代 {iteration_index}/"
+                f"{axis} {target_um:+g} μm ｜ 迭代 {iteration_index}/"
                 f"{config.MICRO_LOOP_MAX_ITER} ｜ 位置 "
-                f"{(0.0 if last_measured is None else last_measured):+.2f} μm ｜ 误差 "
+                f"{(0.0 if previous_measured is None else previous_measured):+.2f} μm ｜ 误差 "
                 f"{error_before:+.2f} μm ｜ 指令 "
                 f"{'死区不发' if below_deadband else f'{command_um:+.2f} μm'}"
             )
@@ -2534,12 +2722,19 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
 
             if bool(saved.get("truncated")):
                 note = "相机缓冲写满，本段被截断，本轮测量不可用"
+                truncated_paths = mcl.clip_temp_paths(temp_dir, saved["stem"])
+                release(
+                    None,
+                    [truncated_paths["raw"], truncated_paths["meta"], truncated_paths["frames"]],
+                    block_id=block_id,
+                )
             else:
                 measurement, clip, paths = read_window(
                     saved["stem"], meter,
                     vision_axis=vision_axis,
                     iteration_id=iteration_id,
-                    prev_measured_um=last_measured,
+                    prev_measured_um=previous_measured,
+                    vision_to_axis_sign=float(gains.sign[axis]),
                 )
                 frame_rows.extend(measurement.frame_rows)
                 n_tail = measurement.n_tail
@@ -2548,15 +2743,21 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                 # 直接读 measurement.measured_um 会漏掉符号——视觉轴反向时
                 # 误差会每步翻倍，而 CSV 里看起来完全正常。
                 measured = mcl.GroupVisionMeter.axis_measured_um(measurement, axis, gains)
-                if measured is not None and last_measured is not None:
-                    displacement_um = measured - last_measured
+                displacement_um, g_obs = mcl.measured_delta_and_gain(
+                    previous_measured_um=previous_measured,
+                    measured_um=measured,
+                    command_um=command_um,
+                )
                 if measured is None:
-                    measured = None
-                else:
                     note = (
                         f"本轮测量不可用：尾窗 {measurement.n_tail} 帧，标准差 "
                         f"{measurement.sigma_tail_um:.2f} μm，合格率 "
                         f"{measurement.accept_rate:.1%}"
+                        + (
+                            f"，拒绝原因：{measurement.rejection_summary}"
+                            if measurement.rejection_summary
+                            else ""
+                        )
                     )
 
                 # 证据帧：每个目标最多 3 张全分辨率 PNG（绝不 JPEG）。
@@ -2591,14 +2792,10 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             # 每次修正之后都跑一次全局漂移守卫（不是每段一次）。
             # 非空返回即"需要中止"；超警戒线但未越限的提示由守卫自己打日志。
             drift_abort_note = track_drift(move) if move else ""
-            g_obs = math.nan
-            if measured is not None and last_measured is not None and command_um != 0.0:
-                # 分子与分母都已在"机器人测试轴正方向"这一个坐标系里：
-                # measured 由 axis_measured_um 归一符号，command_um 由
-                # command_for_error 从同样已归一的 error 直接算出（它不再接
-                # sign）。所以这里**不能再乘 sign**——乘了就是第三次归一，
-                # 会让 sign=−1 的安装下 g_obs 的符号翻反，从而谎报方向异常。
-                g_obs = (measured - last_measured) / command_um
+            # g_obs 已在读到本轮测量后、覆盖 last_measured 之前由纯函数算好。
+            # 两端位置与命令都在机器人测试轴坐标系里，不再乘探针 sign。
+            if measured is None:
+                g_obs = math.nan
 
             if measured is None:
                 lost_streak += 1
@@ -2640,10 +2837,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                 flipped = mcl.sign_flip_detected(
                     command_um=command_um,
                     achieved_robot_um=achieved_robot_um,
-                    measured_delta_um=(
-                        None if measured is None or last_measured is None
-                        else measured - last_measured
-                    ),
+                    measured_delta_um=displacement_um,
                     g_obs=g_obs,
                 )
                 sign_flip_streak = sign_flip_streak + 1 if flipped else 0
@@ -2853,10 +3047,8 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         # 上一版写的是 abs(final_measured)，那是位置而不是误差：目标在 −50 μm
         # 时它报 50 μm 的"误差"，在 +50 μm 收敛良好时也报 50——整列数全是错的，
         # 而且错得很有规律（正好等于幅值），最容易被当成"没收敛"。
-        final_residual = (
-            target_um - float(result["final_measured"])
-            if result["final_measured"] is not None
-            else None
+        final_residual = mcl.closed_loop_final_residual_um(
+            float(result["target_um"]), result["final_measured"]
         )
         return {
             "axis": result["axis"],
@@ -3031,7 +3223,9 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
                 "raw_retained": static_summary.get("raw_retained"),
             },
             "raw_root": str(raw_run_dir),
-            "raw_retained_all_blocks": bool(keep_all_raw),
+            "raw_retained_all_blocks": bool(keep_all_raw) and not bool(
+                config.MICRO_LOOP_DELETE_VIDEO_FILES_ON_EXIT
+            ),
             # 时长只作信息记录：stopped_early 恒为 False（时长不再中止实验），
             # 保留这个字段是为了让读报告的人一眼看见"没有因为时间跳过任何目标"。
             "timing": {
@@ -3125,7 +3319,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         lines = [
             "UR10 微动开环 + 视觉闭环快速判读",
             f"运行目录：{run_dir}",
-            f"原始 RAW 根目录：{raw_run_dir}（全部保留：{keep_all_raw}）",
+            f"原始 RAW 根目录：{raw_run_dir}（组内暂存：{keep_all_raw}；组末自动删视频）",
             "",
             f"静止基线：sigma {report['static']['static_sigma_um']} μm ｜ "
             f"RMS {report['static']['static_rms_um']} μm ｜ 峰峰值 "
@@ -3181,6 +3375,695 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         return json_path
 
     # -------------------------------------------------------------------------
+    # 当前多目标视觉闭环（旧 5/20/50、alt、seq 状态机不再从本模式调用）
+    # -------------------------------------------------------------------------
+
+    class _TargetVisionLost(RuntimeError):
+        def __init__(
+            self,
+            message: str,
+            *,
+            command_um: float | None = None,
+            move: dict[str, Any] | None = None,
+        ) -> None:
+            super().__init__(message)
+            self.command_um = command_um
+            self.move = dict(move or {})
+
+    def _pose_text(pose: Any) -> str:
+        if pose is None:
+            return ""
+        try:
+            return ";".join(f"{float(value):.9f}" for value in pose)
+        except (TypeError, ValueError):
+            return ""
+
+    def _position_from_stem(
+        stem: str,
+        meter: mcl.GroupVisionMeter,
+        gains: mcl.ProbeGains,
+        *,
+        iteration_id: str,
+    ) -> tuple[mcl.RobotXYMeasurement, mcl.ClipMeasurement, mcl.RawClip, list[Path]]:
+        clip: mcl.RawClip | None = None
+        paths_dict = mcl.clip_temp_paths(temp_dir, stem)
+        paths = [paths_dict["raw"], paths_dict["meta"], paths_dict["frames"]]
+        try:
+            measurement, clip, paths = read_window(
+                stem,
+                meter,
+                vision_axis="x",
+                iteration_id=iteration_id,
+                tail_frames=int(config.MICRO_LOOP_MEASURE_FRAMES),
+                tail_window_s=float(config.MICRO_LOOP_TAIL_WINDOW_S),
+            )
+            robot_xy = mcl.robot_xy_from_measurement(measurement, gains)
+            return robot_xy, measurement, clip, paths
+        except BaseException:
+            release(clip, paths, keep=False)
+            raise
+
+    def _persist_target_rows(rows: list[dict[str, Any]]) -> None:
+        mcl.write_rows_csv(
+            run_dir / "iterations.csv", rows, mcl.TARGET_ITERATION_COLUMNS
+        )
+
+    def _run_target_iteration(
+        meter: mcl.GroupVisionMeter,
+        gains: mcl.ProbeGains,
+        *,
+        axis: str,
+        target_index: int,
+        target_nominal_um: float,
+        target_absolute_um: float,
+        iteration: int,
+        baseline_noise_um: float,
+    ) -> tuple[dict[str, Any], mcl.RawClip, list[Path], mcl.ClipMeasurement]:
+        """一个活动窗口内完成 before 快照、command、after，并返回待清理文件。"""
+
+        label = f"{axis}_T{target_index:02d}_I{iteration:02d}"
+        watch.observe(label)
+        stem = open_window(label)
+        _batch_safe_sleep(
+            float(config.MICRO_LOOP_PRE_SECONDS),
+            error_queue,
+            stop_event,
+            stop_request_path,
+        )
+
+        before_saved = snapshot_active_window(label)
+        before_clip: mcl.RawClip | None = None
+        before_paths: list[Path] = []
+        before_measurement: mcl.ClipMeasurement | None = None
+        before_xy: mcl.RobotXYMeasurement | None = None
+        before_error: BaseException | None = None
+        try:
+            before_xy, before_measurement, before_clip, before_paths = _position_from_stem(
+                before_saved["stem"], meter, gains, iteration_id=f"{label}_before"
+            )
+            if not before_xy.is_usable:
+                raise _TargetVisionLost(
+                    f"运动前视觉测量不合格：{before_xy.reason}", command_um=0.0
+                )
+        except BaseException as exc:
+            before_error = exc
+        finally:
+            if before_paths:
+                release(before_clip, before_paths, block_id=f"{label}_snapshot", keep=True)
+                cleanup_raw_group(
+                    f"{label}_snapshot", f"{label} 运动前快照", quiet=True
+                )
+
+        def close_aborted_window(description: str) -> None:
+            """命令前门禁失败时也封口并删除活动 RAW，避免下一轮撞上未关闭窗口。"""
+
+            try:
+                close_window()
+            finally:
+                aborted_paths = mcl.clip_temp_paths(temp_dir, stem)
+                release(
+                    None,
+                    [aborted_paths["raw"], aborted_paths["meta"], aborted_paths["frames"]],
+                    block_id=label,
+                    keep=True,
+                )
+                cleanup_raw_group(label, description)
+
+        if before_error is not None:
+            close_aborted_window(f"{label} 未执行命令的失败窗口")
+            raise before_error
+
+        worker_error = _pop_worker_error(error_queue)
+        if worker_error:
+            stop_event.set()
+            raise RuntimeError(worker_error)
+        if _external_stop_requested(stop_request_path) or stop_event.is_set():
+            stop_event.set()
+            raise RuntimeError("发送微动命令前收到用户停止请求，未发送本轮运动。")
+
+        assert before_xy is not None and before_xy.x_um is not None and before_xy.y_um is not None
+        before = {"X": float(before_xy.x_um), "Y": float(before_xy.y_um)}
+        if max(abs(before["X"]), abs(before["Y"])) > float(
+            config.MICRO_TARGET_LOCAL_RANGE_UM
+        ):
+            close_aborted_window(f"{label} 局部范围门禁窗口")
+            raise RuntimeError(
+                f"{label} 视觉位置已超出局部实验范围 ±"
+                f"{float(config.MICRO_TARGET_LOCAL_RANGE_UM):g} μm，拒绝继续运动。"
+            )
+
+        error_before = float(target_absolute_um) - before[axis]
+        if abs(error_before) > float(config.MICRO_TARGET_MAX_COMMAND_UM):
+            close_aborted_window(f"{label} 单步命令门禁窗口")
+            raise RuntimeError(
+                f"{label} 剩余误差 {error_before:+.2f} μm 超过单步安全上限 "
+                f"{float(config.MICRO_TARGET_MAX_COMMAND_UM):g} μm。"
+            )
+        command_um = (
+            error_before
+            if abs(error_before) >= float(config.MICRO_LOOP_MIN_COMMAND_UM)
+            else 0.0
+        )
+
+        move: dict[str, Any] = {}
+        if command_um != 0.0:
+            robot_commands.put(
+                {"action": "MOVE", "axis": axis, "delta_um": command_um}
+            )
+            move = inbox.wait(
+                "robot",
+                "MOVE_DONE",
+                error_queue,
+                stop_event,
+                stop_request_path,
+                timeout_s=30.0,
+            )
+        else:
+            _batch_safe_sleep(
+                float(config.MICRO_LOOP_MOTION_SETTLE_SECONDS),
+                error_queue,
+                stop_event,
+                stop_request_path,
+            )
+        _batch_safe_sleep(
+            float(config.MICRO_LOOP_POST_SECONDS),
+            error_queue,
+            stop_event,
+            stop_request_path,
+        )
+        saved = close_window()
+        saved["stem"] = stem
+
+        after_xy: mcl.RobotXYMeasurement | None = None
+        after_measurement: mcl.ClipMeasurement | None = None
+        after_clip: mcl.RawClip | None = None
+        after_paths: list[Path] = []
+        after_xy, after_measurement, after_clip, after_paths = _position_from_stem(
+            stem, meter, gains, iteration_id=f"{label}_after"
+        )
+        if not after_xy.is_usable:
+            release(after_clip, after_paths, block_id=label, keep=True)
+            cleanup_raw_group(label, f"{label} 命令窗口")
+            raise _TargetVisionLost(
+                f"运动后视觉测量不合格：{after_xy.reason}",
+                command_um=command_um,
+                move=move,
+            )
+
+        assert after_xy.x_um is not None and after_xy.y_um is not None
+        after = {"X": float(after_xy.x_um), "Y": float(after_xy.y_um)}
+        if max(abs(after["X"]), abs(after["Y"])) > float(
+            config.MICRO_TARGET_LOCAL_RANGE_UM
+        ):
+            release(after_clip, after_paths, block_id=label, keep=True)
+            cleanup_raw_group(label, f"{label} 命令窗口")
+            raise RuntimeError(
+                f"{label} 运动后视觉位置超出局部实验范围 ±"
+                f"{float(config.MICRO_TARGET_LOCAL_RANGE_UM):g} μm。"
+            )
+
+        other_axis = "Y" if axis == "X" else "X"
+        vision_delta = after[axis] - before[axis]
+        error_after = float(target_absolute_um) - after[axis]
+        same_direction: bool | str = ""
+        if command_um != 0.0:
+            same_direction = bool(
+                vision_delta != 0.0
+                and (vision_delta > 0.0) == (command_um > 0.0)
+            )
+        achieved = float(move.get("achieved_um", 0.0)) if move else 0.0
+        row: dict[str, Any] = {
+            "axis": axis,
+            "target_index": int(target_index),
+            "target_nominal_um": float(target_nominal_um),
+            "target_absolute_um": float(target_absolute_um),
+            "iteration": int(iteration),
+            "position_before_um": before[axis],
+            "error_before_um": error_before,
+            "command_um": command_um,
+            "vision_delta_um": vision_delta,
+            "position_after_um": after[axis],
+            "error_after_um": error_after,
+            "orthogonal_axis_before_um": before[other_axis],
+            "orthogonal_axis_after_um": after[other_axis],
+            "orthogonal_drift_um": after[other_axis] - before[other_axis],
+            "command_and_motion_same_direction": same_direction,
+            "rtde_before": _pose_text(move.get("tcp_before")),
+            "rtde_after": _pose_text(move.get("tcp_after")),
+            "rtde_delta_um": achieved,
+            "baseline_noise_reference_um": baseline_noise_um,
+            "stop_reason": "",
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "before_valid_frames": int(before_xy.n_tail),
+            "after_valid_frames": int(after_xy.n_tail),
+            "before_sigma_um": max(before_xy.sigma_x_um, before_xy.sigma_y_um),
+            "after_sigma_um": max(after_xy.sigma_x_um, after_xy.sigma_y_um),
+            "command_start_ns": move.get("command_start_ns", ""),
+            "command_end_ns": move.get("command_end_ns", ""),
+            "note": (
+                "RTDE状态仅作旁证；微米级方向与终止判据只使用视觉。"
+                + (f" RTDE备注：{move.get('note')}" if move.get("note") else "")
+            ),
+        }
+        return row, after_clip, after_paths, after_measurement
+
+    def _target_summary(
+        rows: list[dict[str, Any]], *, axis: str, target_index: int, stop_reason: str
+    ) -> dict[str, Any]:
+        errors = [float(row["error_after_um"]) for row in rows]
+        clear_gate = max(
+            1.0,
+            2.0 * float(rows[-1]["baseline_noise_reference_um"]),
+        )
+        clear_commands = [
+            abs(float(row["command_um"]))
+            for row in rows
+            if row["command_and_motion_same_direction"] is True
+            and abs(float(row["vision_delta_um"])) > clear_gate
+        ]
+        recent = errors[-5:]
+        return {
+            "axis": axis,
+            "target_index": int(target_index),
+            "target_nominal_um": float(rows[0]["target_nominal_um"]),
+            "target_absolute_um": float(rows[0]["target_absolute_um"]),
+            "initial_error_um": float(rows[0]["error_before_um"]),
+            "iterations": len(rows),
+            "final_error_um": errors[-1],
+            "recent_error_min_um": min(recent),
+            "recent_error_max_um": max(recent),
+            "empirical_smallest_clear_same_direction_command_um": (
+                min(clear_commands) if clear_commands else None
+            ),
+            "stop_reason": stop_reason,
+        }
+
+    def _write_multi_target_plots(
+        rows: list[dict[str, Any]], summaries: list[dict[str, Any]]
+    ) -> list[str]:
+        rows = [
+            row for row in rows
+            if row.get("error_after_um") not in (None, "")
+            and row.get("vision_delta_um") not in (None, "")
+        ]
+        if not rows:
+            return []
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plot_dir = run_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        outputs: list[str] = []
+
+        fig, axes_plot = plt.subplots(2, 1, figsize=(10, 8), sharex=False)
+        for plot_axis, axis in zip(axes_plot, ("X", "Y")):
+            for summary in [item for item in summaries if item["axis"] == axis]:
+                subset = [
+                    row for row in rows
+                    if row["axis"] == axis and int(row["target_index"]) == int(summary["target_index"])
+                ]
+                plot_axis.plot(
+                    [int(row["iteration"]) for row in subset],
+                    [float(row["error_after_um"]) for row in subset],
+                    marker="o",
+                    label=f"T{summary['target_index']} {summary['target_absolute_um']:+.0f} μm",
+                )
+            plot_axis.axhspan(-3.0, 3.0, color="green", alpha=0.10)
+            plot_axis.axhline(0.0, color="black", linewidth=0.8)
+            plot_axis.set_ylabel(f"{axis} error / μm")
+            plot_axis.grid(alpha=0.25)
+            plot_axis.legend(ncol=3, fontsize=8)
+        axes_plot[-1].set_xlabel("iteration")
+        fig.tight_layout()
+        path = plot_dir / "01_error_convergence.png"
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        outputs.append(str(path))
+
+        fig, ax = plt.subplots(figsize=(9, 6))
+        styles = {("X", 1): ("tab:blue", "o"), ("X", -1): ("tab:cyan", "s"),
+                  ("Y", 1): ("tab:orange", "^"), ("Y", -1): ("tab:red", "v")}
+        for (axis, sign), (color, marker) in styles.items():
+            subset = [
+                row for row in rows
+                if row["axis"] == axis and float(row["command_um"]) * sign > 0.0
+            ]
+            ax.scatter(
+                [abs(float(row["command_um"])) for row in subset],
+                [abs(float(row["vision_delta_um"])) for row in subset],
+                c=color,
+                marker=marker,
+                label=f"{axis} {'+' if sign > 0 else '-'}",
+                alpha=0.8,
+            )
+        max_value = max(
+            [abs(float(row["command_um"])) for row in rows]
+            + [abs(float(row["vision_delta_um"])) for row in rows]
+            + [1.0]
+        )
+        ax.plot([0, max_value], [0, max_value], "k--", linewidth=0.8, label="y=x")
+        ax.set_xlabel("|command| / μm")
+        ax.set_ylabel("|vision measured motion| / μm")
+        ax.grid(alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        path = plot_dir / "02_command_vs_vision_motion.png"
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        outputs.append(str(path))
+
+        labels = [f"{item['axis']}T{item['target_index']}" for item in summaries]
+        centers = [float(item["final_error_um"]) for item in summaries]
+        lower = [center - float(item["recent_error_min_um"]) for center, item in zip(centers, summaries)]
+        upper = [float(item["recent_error_max_um"]) - center for center, item in zip(centers, summaries)]
+        fig, ax = plt.subplots(figsize=(11, 5))
+        ax.errorbar(range(len(labels)), centers, yerr=[lower, upper], fmt="o", capsize=4)
+        ax.axhspan(-3.0, 3.0, color="green", alpha=0.10)
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_xticks(range(len(labels)), labels, rotation=45)
+        ax.set_ylabel("final error and recent range / μm")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        path = plot_dir / "03_final_error_bands.png"
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        outputs.append(str(path))
+        return outputs
+
+    def run_multi_target_phase(
+        gains: mcl.ProbeGains, static_summary: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        matrix = mcl.probe_gain_matrix(gains)
+        inverse = mcl.inverse_probe_matrix(gains)
+        condition = float(np.linalg.cond(matrix))
+        baseline_noise = float(static_summary.get("static_sigma_um") or 0.0)
+        probe_signal = float(config.MICRO_LOOP_PROBE_UM) * float(
+            min(np.linalg.norm(matrix[:, 0]), np.linalg.norm(matrix[:, 1]))
+        )
+        if probe_signal <= max(20.0, 10.0 * baseline_noise):
+            raise RuntimeError(
+                f"探针最小二维响应 {probe_signal:.1f} μm 未明显高于静止噪声 "
+                f"{baseline_noise:.2f} μm，拒绝开始正式微动。"
+            )
+        transform_info = {
+            "gain_matrix_visual_rows_robot_columns": matrix.tolist(),
+            "inverse_visual_to_robot": inverse.tolist(),
+            "determinant": float(np.linalg.det(matrix)),
+            "condition_number": condition,
+            "baseline_noise_reference_um": baseline_noise,
+            "probe_min_signal_um": probe_signal,
+        }
+        mcl.write_json(run_dir / "visual_robot_transform.json", transform_info)
+        log(
+            f"完整 2×2 视觉→机器人变换通过：det={transform_info['determinant']:.4f}，"
+            f"条件数={condition:.2f}，探针最小响应/静止噪声="
+            f"{probe_signal / max(baseline_noise, 1e-9):.1f}",
+            status=True,
+        )
+
+        robot_commands.put({"action": "STABILIZE"})
+        inbox.wait(
+            "robot", "STABILIZED", error_queue, stop_event, stop_request_path,
+            timeout_s=30.0,
+        )
+        origin_saved, _ = capture_window(
+            "experiment_origin",
+            command=None,
+            pre_seconds=float(config.MICRO_LOOP_REFERENCE_SECONDS),
+            post_seconds=0.0,
+        )
+        origin_paths = mcl.clip_temp_paths(temp_dir, origin_saved["stem"])
+        origin_clip = mcl.open_raw_clip(origin_paths["raw"])
+        meter = mcl.GroupVisionMeter(label="multi_target_origin")
+        try:
+            primed = meter.prime(
+                origin_clip,
+                every_n=every_n,
+                frames=int(config.MICRO_LOOP_REFERENCE_FRAMES),
+            )
+            mcl.write_json(
+                run_dir / "experiment_origin.json",
+                {"kind": "MICRO_MULTI_TARGET_ORIGIN", **primed, **transform_info},
+            )
+        finally:
+            release(
+                origin_clip,
+                [origin_paths["raw"], origin_paths["meta"], origin_paths["frames"]],
+                block_id="02_experiment_origin",
+                keep=True,
+            )
+            cleanup_raw_group("02_experiment_origin", "本次实验视觉原点")
+        log("本次实验视觉坐标原点已建立，X/Y 全部目标共用该原点。", status=True)
+
+        summaries: list[dict[str, Any]] = []
+        completed_axes: set[str] = set()
+        for target in mcl.build_multi_target_sequence():
+            axis = str(target["axis"])
+            target_index = int(target["target_index"])
+            target_nominal = float(target["target_nominal_um"])
+            target_absolute = float(target["target_absolute_um"])
+            if axis not in completed_axes:
+                log(f"=== {axis} 轴多目标视觉闭环开始 ===", status=True)
+                completed_axes.add(axis)
+            target_rows: list[dict[str, Any]] = []
+            errors: list[float] = []
+            commands: list[float] = []
+            motions: list[float] = []
+            vision_loss_count = 0
+            reverse_count = 0
+            stop_reason = mcl.TARGET_MAX_ITER_REACHED
+            log(
+                f"{axis} Target {target_index}/6：相邻目标 {target_nominal:+.0f} μm，"
+                f"绝对目标 {target_absolute:+.0f} μm",
+                status=True,
+            )
+
+            for iteration in range(1, int(config.MICRO_TARGET_MAX_ITER) + 1):
+                after_clip: mcl.RawClip | None = None
+                after_paths: list[Path] = []
+                after_measurement: mcl.ClipMeasurement | None = None
+                try:
+                    row, after_clip, after_paths, after_measurement = _run_target_iteration(
+                        meter,
+                        gains,
+                        axis=axis,
+                        target_index=target_index,
+                        target_nominal_um=target_nominal,
+                        target_absolute_um=target_absolute,
+                        iteration=iteration,
+                        baseline_noise_um=baseline_noise,
+                    )
+                    vision_loss_count = 0
+                    error = float(row["error_after_um"])
+                    command = float(row["command_um"])
+                    motion = float(row["vision_delta_um"])
+                    errors.append(error)
+                    commands.append(command)
+                    motions.append(motion)
+
+                    reverse_gate = max(3.0, 2.0 * baseline_noise)
+                    is_large_reverse = (
+                        abs(command) > float(config.MICRO_TARGET_LARGE_REVERSE_COMMAND_UM)
+                        and abs(motion) > reverse_gate
+                        and command * motion < 0.0
+                    )
+                    reverse_count = reverse_count + 1 if is_large_reverse else 0
+                    if reverse_count >= int(config.MICRO_TARGET_LARGE_REVERSE_COUNT):
+                        raise RuntimeError(
+                            f"{axis} Target {target_index} 连续 {reverse_count} 次大命令"
+                            "产生明确反向视觉位移，已按安全异常终止。"
+                        )
+                    if command != 0.0 and abs(motion) > max(
+                        500.0, 3.0 * abs(command) + 6.0 * baseline_noise
+                    ):
+                        raise RuntimeError(
+                            f"{axis} Target {target_index} 视觉实测位移 {motion:+.1f} μm "
+                            f"远超命令 {command:+.1f} μm，已按异常过冲终止。"
+                        )
+
+                    detected = mcl.classify_multi_target_stop(
+                        errors,
+                        commands,
+                        motions,
+                        baseline_noise_um=baseline_noise,
+                    )
+                    if detected is not None:
+                        stop_reason = detected
+                        row["stop_reason"] = detected
+                    target_rows.append(row)
+                    master_rows.append(row)
+                    _persist_target_rows(master_rows)
+                    log(
+                        f"{axis} T{target_index}/6 ｜ 迭代 {iteration}/"
+                        f"{int(config.MICRO_TARGET_MAX_ITER)} ｜ 误差 "
+                        f"{float(row['error_before_um']):+.2f}→{error:+.2f} μm ｜ "
+                        f"命令 {command:+.2f} μm ｜ 视觉实测 {motion:+.2f} μm",
+                        status=True,
+                    )
+                    if detected is not None:
+                        evidence_index = (
+                            mcl.last_accepted_frame_index(after_measurement)
+                            if after_measurement is not None
+                            else None
+                        )
+                        if evidence_index is not None and after_clip is not None:
+                            mcl.save_evidence_png(
+                                after_clip,
+                                evidence_index,
+                                run_dir / axis / f"target_{target_index:02d}" / "final_evidence.png",
+                            )
+                        break
+                except _TargetVisionLost as exc:
+                    vision_loss_count += 1
+                    loss_row = {column: "" for column in mcl.TARGET_ITERATION_COLUMNS}
+                    loss_row.update(
+                        {
+                            "axis": axis,
+                            "target_index": target_index,
+                            "target_nominal_um": target_nominal,
+                            "target_absolute_um": target_absolute,
+                            "iteration": iteration,
+                            "command_um": (
+                                "" if exc.command_um is None else float(exc.command_um)
+                            ),
+                            "rtde_before": _pose_text(exc.move.get("tcp_before")),
+                            "rtde_after": _pose_text(exc.move.get("tcp_after")),
+                            "rtde_delta_um": exc.move.get("achieved_um", ""),
+                            "baseline_noise_reference_um": baseline_noise,
+                            "stop_reason": (
+                                "VISION_ABORT"
+                                if vision_loss_count >= int(config.MICRO_TARGET_VISION_LOSS_COUNT)
+                                else "VISION_RETRY"
+                            ),
+                            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+                            "note": str(exc),
+                        }
+                    )
+                    master_rows.append(loss_row)
+                    _persist_target_rows(master_rows)
+                    log(
+                        f"{axis} T{target_index}/6 第 {iteration} 次视觉测量不合格：{exc}；"
+                        f"连续 {vision_loss_count}/{int(config.MICRO_TARGET_VISION_LOSS_COUNT)} 次。",
+                        status=True,
+                    )
+                    if vision_loss_count >= int(config.MICRO_TARGET_VISION_LOSS_COUNT):
+                        raise RuntimeError(
+                            f"{axis} Target {target_index} 连续视觉测量失败，"
+                            "为避免盲目运动已安全终止。"
+                        ) from exc
+                finally:
+                    if after_paths:
+                        block_id = f"{axis}_T{target_index:02d}_I{iteration:02d}"
+                        release(after_clip, after_paths, block_id=block_id, keep=True)
+                        cleanup_raw_group(block_id, f"{axis} T{target_index} 第 {iteration} 次迭代")
+
+            if not target_rows:
+                raise RuntimeError(f"{axis} Target {target_index} 没有获得任何有效迭代。")
+            summary = _target_summary(
+                target_rows, axis=axis, target_index=target_index, stop_reason=stop_reason
+            )
+            summaries.append(summary)
+            target_dir = run_dir / axis / f"target_{target_index:02d}"
+            mcl.write_json(target_dir / "summary.json", summary)
+            recent_clear = summary["empirical_smallest_clear_same_direction_command_um"]
+            log(
+                f"[{axis} Target {target_index}] 目标 {target_absolute:+.0f} μm ｜ "
+                f"迭代 {summary['iterations']} 次 ｜ 最终误差 "
+                f"{summary['final_error_um']:+.2f} μm ｜ 最近范围 "
+                f"{summary['recent_error_min_um']:+.2f}~{summary['recent_error_max_um']:+.2f} μm ｜ "
+                f"最小明确同向响应命令 "
+                f"{'无法确定' if recent_clear is None else f'{float(recent_clear):.2f} μm'} ｜ "
+                f"状态 {stop_reason}",
+                status=True,
+            )
+
+            if target_index == len(config.MICRO_TARGET_ABSOLUTE_UM):
+                robot_commands.put({"action": "RETURN_START"})
+                returned = inbox.wait(
+                    "robot", "RETURNED", error_queue, stop_event, stop_request_path,
+                    timeout_s=config.ROBOT_MOTION_TIMEOUT_S * 2,
+                )
+                log(
+                    f"{axis} 轴目标序列结束，已回到实验初始位姿附近（RTDE偏差 "
+                    f"{float(returned.get('drift_mm', math.nan)):.4f} mm）。",
+                    status=True,
+                )
+
+        mcl.write_json(run_dir / "target_summaries.json", summaries)
+        return master_rows, summaries, transform_info
+
+    def write_multi_target_report(
+        rows: list[dict[str, Any]],
+        summaries: list[dict[str, Any]],
+        transform_info: dict[str, Any],
+        static_summary: dict[str, Any],
+    ) -> None:
+        plots = _write_multi_target_plots(rows, summaries)
+        axis_reports: dict[str, Any] = {}
+        text_lines = ["XY 多目标视觉闭环逼近实验", ""]
+        for axis in ("X", "Y"):
+            axis_rows = [
+                row for row in rows
+                if row["axis"] == axis
+                and row.get("vision_delta_um") not in (None, "")
+            ]
+            axis_summaries = [item for item in summaries if item["axis"] == axis]
+            clear = [
+                abs(float(row["command_um"]))
+                for row in axis_rows
+                if row["command_and_motion_same_direction"] is True
+                and abs(float(row["vision_delta_um"]))
+                > max(1.0, 2.0 * float(row["baseline_noise_reference_um"]))
+            ]
+            final_errors = [abs(float(item["final_error_um"])) for item in axis_summaries]
+            empirical = min(clear) if len(clear) >= 3 else None
+            axis_reports[axis] = {
+                "empirical_smallest_clear_same_direction_command_um": empirical,
+                "final_abs_error_median_um": (
+                    float(np.median(final_errors)) if final_errors else None
+                ),
+                "final_abs_error_max_um": max(final_errors) if final_errors else None,
+                "target_stop_reasons": [item["stop_reason"] for item in axis_summaries],
+                "conclusion": (
+                    f"本轮多目标数据中，约 {empirical:.1f} μm 及以上曾出现明确同向响应；"
+                    "该值是经验观测下限，不是严格最小运动单元。"
+                    if empirical is not None
+                    else "当前数据不能确定单一最小运动阈值。"
+                ),
+            }
+            text_lines.append(f"{axis}轴：{axis_reports[axis]['conclusion']}")
+            if final_errors:
+                text_lines.append(
+                    f"  多目标最终 |误差| 中位数 {np.median(final_errors):.2f} μm，"
+                    f"最大 {max(final_errors):.2f} μm。"
+                )
+        text_lines.extend(
+            [
+                "",
+                "说明：3 μm 稳定带接近视觉观测下限，不等于宣称机器人真实精度为 3 μm。",
+                "RTDE actual_TCP_pose 仅用于安全、工作空间和旁证，不参与微米级方向终止。",
+            ]
+        )
+        report = {
+            "kind": "MICRO_MULTI_TARGET_FINAL_REPORT",
+            "targets": summaries,
+            "axes": axis_reports,
+            "static_baseline": static_summary,
+            "transform": transform_info,
+            "plots": plots,
+            "iteration_csv": str(run_dir / "iterations.csv"),
+        }
+        mcl.write_json(run_dir / "final_report.json", report)
+        (run_dir / "final_report.txt").write_text(
+            "\n".join(text_lines) + "\n", encoding="utf-8"
+        )
+        for line in text_lines:
+            if line:
+                log(line, status=True)
+
+    # -------------------------------------------------------------------------
     # 主流程
     # -------------------------------------------------------------------------
 
@@ -3202,7 +4085,7 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
             "camera", "READY", error_queue, stop_event, stop_request_path,
             timeout_s=config.WORKER_READY_TIMEOUT_S,
         )
-        fps = float(camera_ready["camera_actual_fps"])
+        fps = float(camera_ready["actual_camera_fps"])
         capacity_frames = int(math.ceil(float(config.MICRO_LOOP_MAX_WINDOW_SECONDS) * fps)) + 8
         log(
             f"工业相机就绪：{camera_ready['full_width']}×{camera_ready['full_height']} ｜ "
@@ -3212,215 +4095,52 @@ def run_micro_closed_loop_mode(arguments: argparse.Namespace) -> Path:
         )
         log(f"磁盘剩余 {mcl.free_gb(config.OUTPUT_ROOT):.2f} GiB", status=True)
 
-        # 顺序按用户规定的 A→K：通信 → 相机 → 探针 → 静止基线 → 开环 → 闭环 → 汇总。
-        # 探针排在静止基线之前，是因为探针失败是**具名中止**：与其先花 5 s 录基线
-        # 再发现符号定不出来，不如把无法继续的那一步提到最前面。
+        # 当前唯一主动路径：通信 → 相机 → 探针 → 5 s 静止基线 → 单一视觉原点
+        # → X 六目标 → 回原点 → Y 六目标 → 回原点 → 汇总。
         gains = run_probe()
         static_summary = run_static_baseline()
-
-        # 每轴一个全局漂移基准。开环与闭环**共用同一条轴的基准**，"一条轴从头到尾
-        # 净位移应当≈0"这个不变量才成立；每个阶段各起一个基准会看不见跨阶段的走位。
-        axis_drift: dict[str, dict[str, Any]] = {axis: {} for axis in config.MICRO_LOOP_AXES}
-
-        # 开环阶段放在闭环之前：它测的是"给固定命令实际走多少"，是纯粹的
-        # 执行能力；闭环测的是"反复纠偏能否逼近"，是逼近能力。先看清前者，
-        # 后者若表现不好才知道该怀疑执行还是怀疑反馈。
-        #
-        # 不再有 try/except TimeBudgetExceeded：时间不再是中止条件。
-        # 这里能抛出来的只剩真实故障（通信、相机、磁盘、内存、探针联锁），
-        # 那些本来就该中断整轮并保留已完成的数据。
-        open_result = run_open_loop_phase(gains, axis_drift)
-
-        # 这里没有"时间到了就跳出"的分支：12 个闭环目标（2 轴 × 3 档 × ±）
-        # 全部要跑完。单个目标的 MAX_ITER / STALLED / LIMIT_CYCLE 只结束
-        # 那个目标，循环继续——那不是实验终止条件。
-        for axis in config.MICRO_LOOP_AXES:
-            sign = float(gains.sign[axis])
-            for amplitude_um in config.MICRO_LOOP_AMPLITUDES_UM:
-                group_dir = mcl.target_dir(run_dir, axis, amplitude_um)
-                log(f"=== 目标组 {axis} {amplitude_um} μm：建立本组视觉参考 ===", status=True)
-
-                robot_commands.put({"action": "STABILIZE"})
-                inbox.wait(
-                    "robot", "STABILIZED", error_queue, stop_event, stop_request_path,
-                    timeout_s=30.0,
-                )
-                # 每组只建一次参考；组内 +A 与 −A 共用它，
-                # 这样反向时的死区/回差才真正被测到，而不是被"重新定义零点"抹掉。
-                ref_saved, _ = capture_window(
-                    f"{axis}_{amplitude_um:03d}um_ref",
-                    command=None,
-                    pre_seconds=float(config.MICRO_LOOP_REFERENCE_SECONDS),
-                    post_seconds=0.0,
-                )
-                ref_paths = mcl.clip_temp_paths(temp_dir, ref_saved["stem"])
-                ref_clip = mcl.open_raw_clip(ref_paths["raw"])
-                closed_block = mcl.closed_block_id(axis, amplitude_um)
-                meter = mcl.GroupVisionMeter(label=f"{axis}_{amplitude_um:03d}um")
-                try:
-                    # 必须显式限定帧数：prime 会把整段扫**两遍**，
-                    # 不限定就等于把每一组参考都按整段长度算钱。
-                    primed = meter.prime(
-                        ref_clip,
-                        every_n=every_n,
-                        frames=int(config.MICRO_LOOP_REFERENCE_FRAMES),
-                    )
-                finally:
-                    release(
-                        ref_clip,
-                        [ref_paths["raw"], ref_paths["meta"], ref_paths["frames"]],
-                        block_id=closed_block,
-                    )
-
-                est_sigma = float(primed["est_sigma_um"])
-                sigma_um = est_sigma if math.isfinite(est_sigma) else float(primed["sigma_ref_um"])
-                tol_eff = mcl.effective_tolerance_um(
-                    float(config.MICRO_LOOP_POSITION_TOL_UM), sigma_um
-                )
-                log(
-                    f"本组噪声底 sigma = {sigma_um:.2f} μm ｜ 有效测量分辨率约 "
-                    f"{mcl.effective_tolerance_um(0.0, sigma_um):.2f} μm ｜ 实际收敛容差 "
-                    f"{tol_eff:.2f} μm ｜ 参考帧 {primed['reference_frame_index']}",
-                    status=True,
-                )
-                mcl.write_json(
-                    group_dir / "reference.json",
-                    {
-                        "kind": "MICRO_CLOSED_LOOP_GROUP_REFERENCE",
-                        "axis": axis,
-                        "amplitude_um": int(amplitude_um),
-                        "sign": sign,
-                        "sigma_um": sigma_um,
-                        "effective_tolerance_um": tol_eff,
-                        **primed,
-                    },
-                )
-
-                group_rows: list[dict[str, Any]] = []
-                for target in mcl.build_targets(
-                    axes=(axis,),
-                    amplitudes_um=(amplitude_um,),
-                    directions=mcl.DIRECTIONS,
-                ):
-                    # 没有 try/except TimeBudgetExceeded：时长不再中止实验。
-                    # run_target 自己会在 MAX_ITER / STALLED / LIMIT_CYCLE /
-                    # 联锁中止时正常返回并落盘，然后**继续下一个方向、下一档、
-                    # 下一条轴**。这里能抛出来的只剩真实故障，那些应当中断整轮。
-                    result = run_target(
-                        meter,
-                        axis=axis,
-                        amplitude_um=int(amplitude_um),
-                        direction=int(target["direction"]),
-                        gains=gains,
-                        sigma_um=sigma_um,
-                        block_id=closed_block,
-                        axis_drift=axis_drift[axis],
-                    )
-                    row = summarise(result, sigma_um=sigma_um)
-                    master_rows.append(row)
-                    group_rows.append(row)
-                    mcl.write_rows_csv(
-                        run_dir / "master_summary.csv", master_rows, mcl.MASTER_COLUMNS
-                    )
-                    mcl.write_json(
-                        group_dir / f"{mcl.direction_slug(int(target['direction']))}_summary.json",
-                        {
-                            "kind": "MICRO_CLOSED_LOOP_TARGET",
-                            "target_key": result["target_key"],
-                            "termination_state": row["termination_state"],
-                            "iteration_count": row["iteration_count"],
-                            "sigma_um": sigma_um,
-                            "effective_tolerance_um": tol_eff,
-                            "errors_um": result["errors_um"],
-                            "commands_um": [
-                                float(item["command_um"]) for item in result["iterations"]
-                            ],
-                            "summary": row,
-                        },
-                    )
-                    log(
-                        f"目标结束 {result['target_key']}：{row['termination_state']} ｜ 迭代 "
-                        f"{row['iteration_count']} 次 ｜ 最终残差 "
-                        f"{row['closed_loop_final_residual_um']} μm ｜ 最小指令 "
-                        f"{row['smallest_command_issued_um']} μm",
-                        status=True,
-                    )
-
-                # 往返净残差：+A 与 −A 都在同一参考下收敛后，两个方向的最终位置
-                # 之差应当正好是 2A。把两个残差之差记下来，它就是这一组的往返回差——
-                # 因为组内共用同一个视觉零点，任何"零点漂移"都被消掉了，
-                # 剩下的只能来自机械回差或单向剩磁式的迟滞。
-                if len(group_rows) == 2:
-                    plus_row, minus_row = group_rows[0], group_rows[1]
-                    # 往返回差 = 反向目标相对正向目标**多走了多少** = (−A 的残差) − (+A 的残差)。
-                    # 两个方向共用同一个视觉零点，所以任何零点漂移都被消掉，
-                    # 剩下的只能来自机械回差或迟滞。
-                    p_plus = plus_row["closed_loop_final_residual_um"]
-                    p_minus = minus_row["closed_loop_final_residual_um"]
-                    if p_plus != "" and p_minus != "":
-                        minus_row["ref_cross_group_delta_um"] = (
-                            float(p_minus) - float(p_plus)
-                        )
-                    mcl.write_rows_csv(
-                        run_dir / "master_summary.csv", master_rows, mcl.MASTER_COLUMNS
-                    )
-
-                # 每换一个幅值就回一次初始位姿，避免多组累积成整体走位。
-                robot_commands.put({"action": "RETURN_START"})
-                returned = inbox.wait(
-                    "robot", "RETURNED", error_queue, stop_event, stop_request_path,
-                    timeout_s=config.ROBOT_MOTION_TIMEOUT_S * 2,
-                )
-                log(
-                    f"已回到实验初始位姿，偏差 "
-                    f"{float(returned.get('drift_mm', math.nan)):.4f} mm",
-                    status=True,
-                )
-
-        # 计划内的目标列表与实际跑完的对比，差集就是"没跑到"的那些。
-        # 用集合差而不是在循环里维护计数器，是因为真实路径有三条
-        # （正常跑完 / 预算到点 / 目标层面中止），只有结果本身是权威的。
-        planned = [
-            {
-                "axis": str(item["axis"]),
-                "amplitude_um": int(item["amplitude_um"]),
-                "direction": int(item["direction"]),
-            }
-            for item in mcl.build_targets()
-        ]
-        finished = {
-            (
-                str(row["axis"]),
-                int(row["target_amplitude_um"]),
-                int(row["target_direction"]),
-            )
-            for row in master_rows
-        }
-        not_run = [
-            item
-            for item in planned
-            if (item["axis"], item["amplitude_um"], item["direction"]) not in finished
-        ]
+        rows, summaries, transform_info = run_multi_target_phase(gains, static_summary)
+        write_multi_target_report(rows, summaries, transform_info, static_summary)
+        log(f"全部实验完成：多目标视觉闭环 12/12 个目标。", status=True)
+        log(f"结果目录：{run_dir}", status=True)
         log(
-            f"全部实验完成：闭环目标 {len(finished)}/{len(planned)} 个"
-            + (f"，未跑 {len(not_run)} 个" if not_run else ""),
+            f"RAW 运行目录：{raw_run_dir}（每次迭代视频已立即删除，任务收尾再兜底清理）",
             status=True,
         )
-        write_final_report(static_summary, open_result, master_rows, not_run)
-        log(f"结果目录：{run_dir}", status=True)
-        log(f"原始 RAW 目录：{raw_run_dir}", status=True)
     finally:
         stop_event.set()
         for process in (robot, camera):
             if process.pid is not None:
                 _join_or_terminate(process)
-        mcl.write_rows_csv(run_dir / "master_summary.csv", master_rows, mcl.MASTER_COLUMNS)
+        mcl.write_rows_csv(
+            run_dir / "iterations.csv", master_rows, mcl.TARGET_ITERATION_COLUMNS
+        )
         # 循环全部结束之后才清回收目录，绝不中途清（那里可能有别人正在用的文件）。
         try:
             released = mcl.sweep_directory(trash_dir)
             log(f"临时文件回收目录已清空，释放 {mcl.format_gib(released)}")
         except OSError as exc:
             log(f"回收目录清理失败（不影响实验数据）：{exc}")
+        try:
+            released = mcl.sweep_directory(temp_dir)
+            if released:
+                log(f"活动临时目录已兜底清空，释放 {mcl.format_gib(released)}")
+        except OSError as exc:
+            log(f"活动临时目录兜底清理失败：{exc}")
+        if bool(config.MICRO_LOOP_DELETE_VIDEO_FILES_ON_EXIT):
+            released, failed = mcl.delete_video_payloads(raw_run_dir)
+            if failed:
+                log(
+                    f"本次任务视频载荷已自动清理 {mcl.format_gib(released)}，"
+                    f"但有 {len(failed)} 个文件仍被占用；下次运行前请关闭占用程序后删除："
+                    + "，".join(str(path) for path in failed[:3])
+                )
+            else:
+                log(
+                    f"本次任务的大体积 RAW/视频文件已自动删除，释放 "
+                    f"{mcl.format_gib(released)}；CSV/JSON/证据图保留。",
+                    status=True,
+                )
         for leftover in (temp_dir, trash_dir):
             try:
                 if leftover.exists() and not any(leftover.iterdir()):
@@ -3946,6 +4666,9 @@ def main() -> Path:
 
     if selected_mode == "vision_offline":
         return run_vision_offline_mode()
+
+    if selected_mode == "offline_static_test":
+        return run_offline_static_test_mode(arguments)
 
     if selected_mode == "robot_dry_run":
         return run_robot_dry_run_mode()

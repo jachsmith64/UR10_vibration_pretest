@@ -63,6 +63,7 @@ MOTION_MODES = {
     "micro_closed_loop",
     "boundary_check",
 }
+COOPERATIVE_CAMERA_MODES = {"offline_static_test"}
 USAGE_GUIDE_TEXT = (
     "1. 先点击“检测机械臂通信（不会运动）”。通过后才会解锁运动实验。\n\n"
     "2. 做运动实验前，先手动开始索尼相机录像，再填写速度、时间、方向等参数。\n\n"
@@ -71,17 +72,16 @@ USAGE_GUIDE_TEXT = (
     "5. 需要停止时点“停止当前任务”，请等待窗口提示安全收尾完成；真实危险以示教器急停/安全停止为准。\n\n"
     "6. 完整批量实验只做连续录像和时间/机器人记录，不在实机采集阶段运行视觉识别。\n\n"
     "7. 实验结束后手动停止索尼相机录像；之后可点‘批次录像离线识别’，选择批次目录再生成各段 VISION。\n\n"
-    "8. “XY微动 + 视觉闭环快速测试”是一次点击跑完全程的独立流程，不需要手电筒，也不改动上面任何实验：\n"
+    "8. “XY目标点 + 视觉闭环逼近测试”是一次点击跑完全程的独立流程，不需要手电筒，也不改动上面任何实验：\n"
     "   自动完成 设备检查 → 相机预热 → 轴向/符号探针 → 5 s 全分辨率静止基线\n"
-    "   → X/Y × 5/20/50 μm 的开环连续微动与开环来回微动 → X/Y 视觉闭环 → 汇总并安全结束。\n"
-    "   目标幅值固定为 5 / 20 / 50 μm 且顺序从小到大，界面上不再提供幅值输入框。\n"
-    "   它回答的是：这三个数量级里，哪些能稳定动作、哪些只是部分有效、哪些根本分不出来，\n"
-    "   以及开环执行能力与视觉闭环逼近能力差多少；不追求标定出精确的最小分辨率。\n"
-    "   每一步都是「测量位置 → 发一次微动 → 等短时间稳定 → 再测量 → 立即算位移」，\n"
-    "   不是先跑完几十个动作再统一处理。全程目标 8 分钟内、硬上限 10 分钟；\n"
-    "   投影总时长一旦超出预算，会在开下一段之前安全收尾并保留已完成的数据。\n"
-    "   原始 RAW 按实验块写入 D:/UR10_micro_raw（static 块永久保留，其余本轮全部保留），\n"
-    "   工程目录只留 CSV/JSON 与少量 PNG 证据帧（绝不用 JPEG），不会留下任何完整视频。"
+    "   → 建立统一视觉原点 → X/Y 各执行 0→100→250→460→360→210→0 μm 多目标闭环\n"
+    "   → 自动汇总、画图并安全结束；不再执行 5/20/50 μm 的 alt/seq 开环结构。\n"
+    "   每次微动的 before/after 来自同一个连续 RAW 窗口，并使用完整 2×2 坐标变换；\n"
+    "   预计时长只作提示，不会按时间跳过目标，也不宣称严格的电机最小分辨率。\n"
+    "   原始 RAW 运行期间写入 D:/UR10_micro_raw；每组结果落盘后立即删除视频，\n"
+    "   正常结束、用户停止或异常退出时再兜底清理，保留 CSV/JSON 与 PNG 证据帧。\n\n"
+    "9. “机械臂断电静止测试”完全不访问机器人，只用工业相机做 3×5 s 静止基线，\n"
+    "   并自动与最近一次通电静止基线比较，用于区分通电附加振动与视觉/环境底噪。"
 )
 
 
@@ -150,6 +150,14 @@ class LauncherApp:
         )
         self.offline_button.pack(side=LEFT, padx=6, pady=6)
 
+        self.offline_static_button = Button(
+            section,
+            text="机械臂断电静止测试",
+            command=self.start_offline_static_test,
+            width=20,
+        )
+        self.offline_static_button.pack(side=LEFT, padx=6, pady=6)
+
         self.dry_run_button = Button(
             section,
             text="轨迹 dry-run",
@@ -174,6 +182,28 @@ class LauncherApp:
         if not selected:
             return
         self.start_mode("batch_vision_offline", ["--batch-dir", selected])
+
+    def start_offline_static_test(self) -> None:
+        """启动只连接工业相机、绝不访问机器人的断电静止基线。"""
+
+        confirmed = messagebox.askokcancel(
+            "机械臂断电静止测试",
+            "请确认：\n\n"
+            "1. UR10 已完全断电，且机械臂、棋盘格、工业相机和支架均未移动；\n"
+            "2. 光照、曝光和镜头设置与通电静止基线一致；\n"
+            "3. 测试期间不要碰桌面、相机支架或机械臂。\n\n"
+            f"程序将只连接工业相机，执行 {config.OFFLINE_STATIC_REPEATS} 次 × "
+            f"{config.OFFLINE_STATIC_SECONDS:g} 秒静止采样；不会尝试 RTDE、Dashboard "
+            "或任何机器人通信。每次分析后立即删除 RAW。",
+        )
+        if not confirmed:
+            return
+        stop_path = self._make_stop_request_path("offline_static_test")
+        self.start_mode(
+            "offline_static_test",
+            ["--stop-request-path", str(stop_path)],
+            stop_path,
+        )
 
     def _add_labeled_entry(
         self,
@@ -378,27 +408,23 @@ class LauncherApp:
         self.motion_buttons.append(self.l_motion_button)
 
     def _build_micro_section(self, root: Tk) -> None:
-        """XY 微动 + 视觉闭环快速测试：一次点击跑完全程的独立流程。"""
+        """XY 多目标视觉闭环逼近：一次点击跑完全程的独立流程。"""
 
         section = LabelFrame(
-            root, text="E. XY 微动 + 视觉闭环快速测试（一键完成，不需要手电筒）"
+            root, text="E. XY 目标点 + 视觉闭环逼近测试（一键完成，不需要手电筒）"
         )
         section.pack(fill="x", padx=10, pady=4)
 
-        # 档位是**固定**的 5 / 20 / 50 μm，故意不提供输入框：
-        # 本轮的目标是"10 分钟以内判断三个数量级的表现"。一旦允许随便填，
-        # 就会有人填回 11 档扫描，运行时间立刻回到几小时——那正是这轮要收缩掉的东西。
-        levels_text = " / ".join(f"{int(v)}" for v in config.MICRO_LOOP_AMPLITUDES_UM)
         self.micro_levels_label = Label(
-            section, text=f"目标幅值 {levels_text} μm（固定，顺序从小到大）"
+            section, text="每轴目标：0 → 100 → 250 → 460 → 360 → 210 → 0 μm"
         )
         self.micro_levels_label.pack(side=LEFT, padx=(6, 2))
 
         self.micro_hint_label = Label(
             section,
             text=(
-                "X/Y × 连续 / 换向 / 闭环；约 11 分钟，"
-                "时间只提示不中止；每步在线测量"
+                "多目标视觉闭环逼近；观察小误差下的响应、停滞与极限振荡；"
+                "不用于精确标定电机最小分辨率"
             ),
             anchor="w",
         )
@@ -406,7 +432,7 @@ class LauncherApp:
 
         self.micro_button = Button(
             section,
-            text="XY微动 + 视觉闭环快速测试",
+            text="XY目标点 + 视觉闭环逼近测试",
             command=self.start_micro_closed_loop,
             width=28,
             state="disabled",
@@ -428,38 +454,34 @@ class LauncherApp:
             # 放在模块顶层会让启动器每次开窗都慢一拍。
             import micro_closed_loop as mcl
 
-            amplitudes = [int(v) for v in config.MICRO_LOOP_AMPLITUDES_UM]
             axes = list(config.MICRO_LOOP_AXES)
-            plan = mcl.estimate_run_plan()
-            budget_lines = "\n".join(mcl.format_budget_lines(plan))
+            plan = mcl.estimate_multi_target_run_plan()
+            budget_lines = "\n".join(mcl.format_multi_target_budget_lines(plan))
             summary = (
-                f"目标幅值：{' → '.join(str(v) for v in amplitudes)} μm（固定顺序），"
-                f"轴 {'/'.join(axes)}，每档 {len(config.MICRO_LOOP_OPEN_MODES)} 种开环模式"
-                f"（{'/'.join(config.MICRO_LOOP_OPEN_MODES)}）+ 闭环。\n"
+                f"测试轴：{'/'.join(axes)}。每轴绝对目标为 "
+                "0 → 100 → 250 → 460 → 360 → 210 → 0 μm。\n"
                 "\n自动流程（全程无需人工切视频、标记步骤或按下一步）：\n"
                 "  1. UR10 通信检查\n"
                 "  2. 相机检查与预热\n"
                 "  3. X/Y 轴与视觉轴、正负号探针\n"
-                "  4. 静止基线约 5 s（完整 RAW 永久保留）\n"
-                f"  5. X 开环连续微动 {' → '.join(str(v) for v in amplitudes)} μm\n"
-                "  6. X 开环来回微动\n"
-                "  7. Y 开环连续微动\n"
-                "  8. Y 开环来回微动\n"
-                f"  9. X 视觉闭环（每目标最多 {config.MICRO_LOOP_MAX_ITER} 次迭代）\n"
-                " 10. Y 视觉闭环\n"
-                " 11. 汇总并安全结束\n"
-                "\n每一步都是「测量位置 → 发一次微动 → 等短时间稳定 → 再测量 → "
-                "立即算位移」，不是先跑完再统一处理。\n"
+                "  4. 静止基线约 5 s\n"
+                "  5. 建立本次实验统一视觉原点与完整 2×2 坐标变换\n"
+                f"  6. X 六目标闭环（每目标最多 {config.MICRO_TARGET_MAX_ITER} 次）\n"
+                "  7. 回到 X≈0，再执行 Y 六目标闭环\n"
+                "  8. 回到 Y≈0，汇总、画图并安全结束\n"
+                "\n每次迭代在同一连续 RAW 窗口中取得命令前 16 帧、发送一次微动、"
+                "等待稳定并取得命令后 16 帧；绝不沿用上一轮 after。\n"
                 f"{budget_lines}\n"
-                f"原始 RAW 写入 {config.MICRO_LOOP_RAW_ROOT}，本轮全部保留；"
-                "工程目录里只留 CSV/JSON/少量 PNG，不会留下任何视频。\n"
+                f"原始 RAW 运行期间写入 {config.MICRO_LOOP_RAW_ROOT}；每组结果落盘后"
+                "立即删除该组视频，任务正常结束、用户停止或异常退出时再兜底清理，"
+                "CSV/JSON/少量 PNG 保留。\n"
                 "时长说明：上面的预计时间只是提示，**到点不会中止实验、不会跳过"
-                "任何目标**。只要机器人、相机、磁盘正常，12 个开环块与 12 个闭环"
-                "目标全部跑完（12～15 分钟都属正常）。单拎一个闭环目标达到迭代上限、"
-                "判 STALLED 或 LIMIT_CYCLE，只结束那个目标，后面的照跑。\n"
-                "中途点“停止当前任务”会安全收尾并保留已完成的数据。"
+                "任何目标**。只要机器人、相机、磁盘正常，X/Y 共 12 个目标全部跑完。"
+                "单个目标达到 STABLE_REACHED、LIMIT_CYCLE、SMALL_COMMAND_STALL 或"
+                "迭代上限，只结束该目标，后面的照跑。\n"
+                "中途点“停止当前任务”会安全收尾，保留分析结果并自动清理视频文件。"
             )
-            if not self._confirm_motion("XY 微动 + 视觉闭环快速测试确认", summary):
+            if not self._confirm_motion("XY 目标点 + 视觉闭环逼近测试确认", summary):
                 return
             stop_path = self._make_stop_request_path("micro_closed_loop")
             self.start_mode(
@@ -860,6 +882,7 @@ class LauncherApp:
             self.vision_button,
             self.capture_button,
             self.offline_button,
+            self.offline_static_button,
             self.batch_offline_button,
             self.dry_run_button,
             self.analyze_button,
@@ -1145,12 +1168,15 @@ class LauncherApp:
                 self.append_log(f"写入高速采集停止请求失败：{exc}\n")
             return
 
-        if self.current_mode in MOTION_MODES:
+        if self.current_mode in MOTION_MODES or self.current_mode in COOPERATIVE_CAMERA_MODES:
             try:
                 if self.current_stop_request_path is None:
                     self.current_stop_request_path = self._make_stop_request_path(self.current_mode)
                 self.current_stop_request_path.write_text("stop\n", encoding="utf-8")
-                self.append_log("已通知 main.py 安全停止：stopL、当前相机文件封口、子进程退出。\n")
+                if self.current_mode in MOTION_MODES:
+                    self.append_log("已通知 main.py 安全停止：stopL、当前相机文件封口、子进程退出。\n")
+                else:
+                    self.append_log("已通知断电静止测试停止采集、释放相机并清理 RAW。\n")
                 self.stop_button.configure(state="disabled")
             except OSError as exc:
                 self.append_log(f"写入运动实验停止请求失败：{exc}\n")
@@ -1164,7 +1190,11 @@ class LauncherApp:
 
     def on_close(self) -> None:
         if self.process is not None and self.process.poll() is None:
-            if self.current_mode == "vision_capture" or self.current_mode in MOTION_MODES:
+            if (
+                self.current_mode == "vision_capture"
+                or self.current_mode in MOTION_MODES
+                or self.current_mode in COOPERATIVE_CAMERA_MODES
+            ):
                 self.close_after_process = True
                 self.stop_process()
                 self.status.configure(text="正在安全停止，完成后关闭窗口。")

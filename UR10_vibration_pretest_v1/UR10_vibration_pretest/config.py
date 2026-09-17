@@ -19,6 +19,7 @@ UR10 末端振动预实验：统一配置文件。
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Final
 
@@ -55,6 +56,7 @@ VALID_RUN_MODES: Final[set[str]] = {
     "vision_test",    # 只测图像读取、标志识别和位移计算。
     "vision_capture", # 只高速采集相机原始帧，保存为 RAW，尽量少做额外处理。
     "vision_offline", # 读取 vision_capture 的 RAW 结果，再离线逐帧完整识别。
+    "offline_static_test", # 机械臂可完全断电；仅用工业相机重复测静止视觉/环境底噪。
     "robot_dry_run",  # 只生成并检查轨迹，不导入 UR 库，也不连接真机。
     "robot_connection_test", # 只读检测 UR 通信，不创建控制接口、不发送运动命令。
     "robot_test",     # 连接 UR，默认只读取状态；必须再次开关才允许低速运动。
@@ -63,7 +65,7 @@ VALID_RUN_MODES: Final[set[str]] = {
     "xy_line_experiment", # 以当前 TCP 为 A 点，执行 X-Y 倾斜直线往返并采 RAW。
     "xy_l_experiment",    # 以当前 TCP 为 A 点，执行 X-Y 平面 L 折线往返并采 RAW。
     "batch_experiment",   # 相机和 UR 各初始化一次，按 UI 计划连续执行分段批量实验。
-    "micro_closed_loop",  # 一键XY微动闭环能力测试：反复小幅纠偏逼近 5/20/50 μm 目标。
+    "micro_closed_loop",  # 一键XY多目标视觉闭环逼近测试。
     "batch_vision_offline", # 批次采集结束后，另行读取 AVI 和侧车时间戳做视觉识别。
     "boundary_check",     # 不等待手电筒，只显示实时画面并低速检查当前计划最大包络。
     "analyze",        # 读取已有 TXT/JSONL 记录并生成振动分析结果。
@@ -506,8 +508,8 @@ BATCH_MAX_CONSECUTIVE_MISSING_FRAMES = 30
 # -----------------------------------------------------------------------------
 # 9b. 一键 XY 微动闭环能力测试（micro_closed_loop）
 # -----------------------------------------------------------------------------
-# 本段服务一个独立的一键流程：设备检查 -> 相机预热 -> 静止基线 -> 轴向/符号探针
-# -> X/Y × 5/20/50 μm × ±方向 -> 每个目标反复闭环纠偏 -> 自动收尾。
+# 本段服务一个独立的一键流程：设备检查 -> 相机预热 -> 轴向/符号探针
+# -> 5 s 静止基线 -> 单一视觉原点 -> X/Y 多目标闭环逼近 -> 自动收尾。
 #
 # 与前一轮被舍弃的开环微动实验（micro_motion_experiment）的区别：
 # 那一版按固定档位表开环走步、只回答“走一步走多少”；这一版是**闭环**，
@@ -518,8 +520,36 @@ BATCH_MAX_CONSECUTIVE_MISSING_FRAMES = 30
 # 唯一的控制律就是操作者给出的 command = Kp · error。
 
 # 目标幅值（μm）与两个自由度。方向固定为 +1 / −1 两个。
+# 旧常量仅供历史离线分析函数/旧结果读取；当前 micro_closed_loop 主流程不再使用。
 MICRO_LOOP_AMPLITUDES_UM: Final[tuple[int, ...]] = (5, 20, 50)
 MICRO_LOOP_AXES: Final[tuple[str, ...]] = ("X", "Y")
+
+# 当前多目标闭环实验。相对步长累加后得到 100, 250, 460, 360, 210, 0 μm。
+# X/Y 各执行一次相同序列；另一轴名义目标始终保持在本次实验视觉原点。
+MICRO_TARGET_RELATIVE_STEPS_UM: Final[tuple[int, ...]] = (
+    100,
+    150,
+    210,
+    -100,
+    -150,
+    -210,
+)
+MICRO_TARGET_ABSOLUTE_UM: Final[tuple[int, ...]] = (100, 250, 460, 360, 210, 0)
+MICRO_TARGET_MAX_ITER = 12
+MICRO_TARGET_STABLE_TOL_UM = 3.0
+MICRO_TARGET_STABLE_COUNT = 3
+MICRO_TARGET_SMALL_COMMAND_UM = 10.0
+# 新序列相邻目标最大差为 210 μm。这个限值只用于本模式的单条命令防错，
+# 不改变机器人速度/加速度；固定 20 cm 安全包络仍是最高优先级联锁。
+MICRO_TARGET_MAX_COMMAND_UM = 250.0
+MICRO_TARGET_LOCAL_RANGE_UM = 1000.0
+MICRO_TARGET_MATRIX_MAX_CONDITION = 10.0
+MICRO_TARGET_LIMIT_WINDOW = 5
+MICRO_TARGET_LIMIT_MIN_SIGN_CHANGES = 3
+MICRO_TARGET_LIMIT_IMPROVEMENT_RATIO = 0.20
+MICRO_TARGET_LARGE_REVERSE_COMMAND_UM = 10.0
+MICRO_TARGET_LARGE_REVERSE_COUNT = 2
+MICRO_TARGET_VISION_LOSS_COUNT = 2
 
 # 比例增益。操作者第一版要求固定 Kp = 1.0，这里做成可配置以便离线重调，
 # 但运行时不启用任何自适应。
@@ -600,13 +630,22 @@ MICRO_LOOP_STATIC_SECONDS = 5.0
 # 全扫要 110 s；抽 40 帧覆盖同样长的时间跨度，统计量足够，耗时 6.6 s。
 MICRO_LOOP_STATIC_ANALYZE_FRAMES = 40
 
-# 相机进程预分配缓冲能容纳的最长窗口（秒）。这个值直接决定那一次 np.empty 的
-# 虚拟地址预留：6.0 s × 132.23 fps × 1936 × 1464 字节 = 2.10 GiB。
+# ---- 机械臂完全断电的相机-only 静止测试 ----
+# 使用与闭环静止基线相同的 5 s 窗口和 40 帧跨段分析。重复三次是为了避免把一次
+# 偶发桌面扰动误判成视觉底噪；该模式不会创建任何机器人或 RTDE 接口。
+OFFLINE_STATIC_SECONDS = MICRO_LOOP_STATIC_SECONDS
+OFFLINE_STATIC_REPEATS = 3
+# 单次 RAW 之外额外要求的磁盘余量；每次分析完成后立即删除该次 RAW。
+OFFLINE_STATIC_DISK_RESERVE_GB = 2.0
+
+# 相机进程预分配缓冲能容纳的最长窗口（秒）。当前每次多目标迭代会在活动窗口内
+# 分析命令前 16 帧（约 2.64 s），再发送命令并等待稳定；7.5 s 可覆盖这段分析延迟
+# 与全部既有运动超时，约预留 2.64 GiB。它不改变任何机器人速度/加速度。
 # 本机 15.77 GiB 物理内存，而 np.empty 在 Windows 上是**惰性提交**的——
 # 只有真正写进去的帧才占用物理页，所以典型窗口（约 2 s / 0.7 GiB 实际提交）
 # 与预留上限是两回事，预留给大一点几乎不花钱。反过来预留不够就等于丢数据。
 # 窗口内各阶段的最坏耗时之和约 5.6 s（见上面几个超时），留了约 0.4 s 余量。
-MICRO_LOOP_MAX_WINDOW_SECONDS = 6.0
+MICRO_LOOP_MAX_WINDOW_SECONDS = 7.5
 # 尾部窗口自身的静态性门禁。片段最后 TAIL_WINDOW_S 内的标准差超过这个值，
 # 说明这一轮测的不是"停稳后的位置"而是"还在动"，该轮测量不可用。
 MICRO_LOOP_TAIL_SIGMA_MAX_UM = 2.0
@@ -635,11 +674,23 @@ MICRO_LOOP_COMPUTE_METRICS = False
 # 而符号反了会让误差每步翻倍直冲限幅，所以启动时必须实测一次。
 MICRO_LOOP_PROBE_UM = 1000.0
 MICRO_LOOP_PROBE_REFERENCE_SECONDS = 1.0
+# 探针允许 SB 检测偶发回落，但绝不接受 legacy 与参考混用：通过扩大探针专用
+# 样本池，在保持“至少 12 帧、标准差 ≤2 μm”不变的前提下获得足够合格帧。
+# 闭环单步仍使用上面的 16 帧 / 0.20 s，不受这些探针专用参数影响。
+MICRO_LOOP_PROBE_REFERENCE_FRAMES = 32
+MICRO_LOOP_PROBE_MEASURE_FRAMES = 64
+MICRO_LOOP_PROBE_TAIL_WINDOW_S = 0.50
 # 探针专用的运动超时。1 mm 在 MICRO_LOOP_SPEED_MM_S=1 mm/s 下要走 1.0 s，
 # 加上加减速约 1.2 s——若沿用给微动的 MICRO_LOOP_STEP_TIMEOUT_S=1.0 s，
 # 探针会**每一次都超时**，然后退化成"靠固定 settle 猜"，而探针失败是具名中止。
 # 微动的超时和探针的超时必须分开，因为两者的移动量差 10~200 倍。
 MICRO_LOOP_PROBE_TIMEOUT_S = 3.0
+# 每次探针运动后的视觉测量若不合格，保持机器人当前位置、不再发送 MOVE，
+# 最多重新等待稳定并采集这么多次。初测不计入这个数字。
+MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS = 5
+# micro_closed_loop 启动时记录的 TCP 是不可移动的安全包络中心。任何目标点和
+# 运动中实测 TCP 到该中心的三维距离都不得超过 20 cm。
+MICRO_LOOP_FIXED_SAFETY_RADIUS_M = 0.20
 # 增益门禁：|g| > 2 有过冲振荡风险；|g| < 0.3 表示 20 次迭代也走不完 50 μm。
 MICRO_LOOP_GAIN_MIN = 0.3
 MICRO_LOOP_GAIN_MAX = 2.0
@@ -771,16 +822,18 @@ MICRO_LOOP_MIN_FREE_GB_CONTINUE = 10.0
 MICRO_LOOP_TRASH_QUOTA_GB = 2.0
 
 # ---- 原始数据存放策略 ----
-# 本轮总量很小（每步一段约 1.3 s 的窗口），所以**默认全量保留原始实验块**，
-# 不再"处理完即删"。原始 RAW 单独放到一个数据根目录，CSV/JSON/汇总仍留在工程
-# outputs/ 下——RAW 体积大、只是原始素材，和结果表放在一起会让工程目录难以搬运。
-# 启动时会先按分辨率/帧率/窗口数算出预计总量，写进日志与 config.json；
-# 若目标卷放不下，会**在创建目录之前拒绝启动**，绝不在实验结束后静默删除。
+# 每个实验组运行期间完整保留该组 RAW；该组的 CSV/JSON/证据图落盘后，立即删除
+# 该组的大体积视频载荷，再进入下一组。异常退出时另有整轮兜底清理。因此磁盘峰值
+# 是“最大单组 + 余量”，不是整轮 100+ GiB 的累计量。
 MICRO_LOOP_RAW_ROOT: Final[Path] = Path("D:/UR10_micro_raw")
-# True = 能放下就全量保留；False = 固定只留静止基线 + 每块代表步。
-# 即使为 True，放不下时也会自动降级为代表步模式，并在日志里明写降级原因。
+# True = 当前实验组内全量归档，供在线分析和该组汇总使用。
 MICRO_LOOP_KEEP_ALL_RAW = True
-# 全量保留时要求预留的余量（GiB）。低于它就算"放得下"也不全留——
+# 每组结果文件落盘后，立即删除该组的 .raw/.avi/.mp4/.mkv。
+MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP = True
+# 用户停止与正常/异常结束都删除本次 run_id 下的 .raw/.avi/.mp4/.mkv 大文件。
+# 这是异常/停止路径的兜底；只清本次任务目录，不碰以往运行，也保留旁车文件。
+MICRO_LOOP_DELETE_VIDEO_FILES_ON_EXIT = True
+# 单组暂存时要求预留的余量（GiB）。低于它就算"放得下"也不开始——
 # 中途窗口因稳定超时被拖长会额外吃空间，留余量比事后补救便宜。
 MICRO_LOOP_KEEP_ALL_RESERVE_GB = 15.0
 
@@ -791,8 +844,8 @@ MICRO_LOOP_KEEP_ALL_RESERVE_GB = 15.0
 MICRO_LOOP_MIN_FREE_RAM_GB = 1.5
 
 # 每个目标最多保存几张全分辨率 PNG 证据帧（绝不用 JPEG）。
-# 本轮定位是"快速判断"，所以默认只留 1 张：原始 RAW 已经全量保留，
-# 证据图能提供的信息都能从 RAW 里离线复算，多存只是占用体积。
+# 本轮定位是"快速判断"，所以默认只留 1 张；RAW 会在组末删除，证据图与
+# 逐帧 CSV 是长期保留、用于追查识别质量的材料。
 MICRO_LOOP_EVIDENCE_MAX = 1
 # 收敛后是否再录一段零命令静止片段做验证。这是唯一能把"真不动点"与
 # "运气好落进去"分开的动作，成本只有一段片段。
@@ -1213,6 +1266,39 @@ def validate_config(run_mode: str | None = None) -> None:
     if set(MICRO_LOOP_AXES) - {"X", "Y"} or not MICRO_LOOP_AXES:
         raise ValueError('MICRO_LOOP_AXES 只能包含 "X" 和 "Y"。')
 
+    if tuple(MICRO_TARGET_RELATIVE_STEPS_UM) != (100, 150, 210, -100, -150, -210):
+        raise ValueError(
+            "MICRO_TARGET_RELATIVE_STEPS_UM 必须保持为 "
+            "(100, 150, 210, -100, -150, -210)。"
+        )
+    cumulative: list[int] = []
+    position = 0
+    for step in MICRO_TARGET_RELATIVE_STEPS_UM:
+        position += int(step)
+        cumulative.append(position)
+    if tuple(cumulative) != tuple(MICRO_TARGET_ABSOLUTE_UM):
+        raise ValueError(
+            "MICRO_TARGET_ABSOLUTE_UM 必须等于相对目标序列的累计和。"
+        )
+    if MICRO_TARGET_MAX_ITER != 12:
+        raise ValueError("MICRO_TARGET_MAX_ITER 必须为 12。")
+    if MICRO_TARGET_STABLE_TOL_UM != 3.0 or MICRO_TARGET_STABLE_COUNT != 3:
+        raise ValueError("多目标闭环稳定到达判据必须是连续 3 次 |error| <= 3 μm。")
+    if MICRO_TARGET_SMALL_COMMAND_UM <= MICRO_LOOP_MIN_COMMAND_UM:
+        raise ValueError("MICRO_TARGET_SMALL_COMMAND_UM 必须大于运动命令死区。")
+    if MICRO_TARGET_MAX_COMMAND_UM < max(abs(v) for v in MICRO_TARGET_RELATIVE_STEPS_UM):
+        raise ValueError("MICRO_TARGET_MAX_COMMAND_UM 不能小于最大相邻目标步长。")
+    if MICRO_TARGET_LOCAL_RANGE_UM <= max(abs(v) for v in MICRO_TARGET_ABSOLUTE_UM):
+        raise ValueError("MICRO_TARGET_LOCAL_RANGE_UM 必须大于最大绝对目标位置。")
+    if MICRO_TARGET_MATRIX_MAX_CONDITION <= 1.0:
+        raise ValueError("MICRO_TARGET_MATRIX_MAX_CONDITION 必须大于 1。")
+    if MICRO_TARGET_LIMIT_WINDOW < 5:
+        raise ValueError("MICRO_TARGET_LIMIT_WINDOW 至少为 5。")
+    if MICRO_TARGET_LIMIT_MIN_SIGN_CHANGES < 3:
+        raise ValueError("极限振荡至少要求最近窗口发生 3 次误差换号。")
+    if not 0.0 < MICRO_TARGET_LIMIT_IMPROVEMENT_RATIO < 1.0:
+        raise ValueError("MICRO_TARGET_LIMIT_IMPROVEMENT_RATIO 必须在 0 到 1 之间。")
+
     # 死区必须严格大于 robot.validate_trajectory 的最小线段 1 μm。
     # 小于等于 1 μm 的命令会命中"两点位置重合"的硬抛，恰好在一个目标
     # 即将收敛的时刻把整轮弄死——这正是死区存在的唯一理由。
@@ -1388,6 +1474,47 @@ def validate_config(run_mode: str | None = None) -> None:
         raise ValueError("MICRO_LOOP_PROBE_UM 必须为正数。")
     if MICRO_LOOP_PROBE_UM / 1000.0 > ROBOT_EXPERIMENT_MAX_SEGMENT_MM:
         raise ValueError("MICRO_LOOP_PROBE_UM 不能超过 ROBOT_EXPERIMENT_MAX_SEGMENT_MM。")
+    if (
+        not isinstance(MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS, int)
+        or isinstance(MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS, bool)
+        or MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS < 0
+    ):
+        raise ValueError("MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS 必须是非负整数。")
+    if MICRO_LOOP_PROBE_REFERENCE_FRAMES < MICRO_LOOP_MIN_TAIL_FRAMES:
+        raise ValueError("MICRO_LOOP_PROBE_REFERENCE_FRAMES 不能小于最少尾窗帧数。")
+    if MICRO_LOOP_PROBE_MEASURE_FRAMES < MICRO_LOOP_MIN_TAIL_FRAMES:
+        raise ValueError("MICRO_LOOP_PROBE_MEASURE_FRAMES 不能小于最少尾窗帧数。")
+    if MICRO_LOOP_PROBE_TAIL_WINDOW_S <= 0:
+        raise ValueError("MICRO_LOOP_PROBE_TAIL_WINDOW_S 必须为正数。")
+    if MICRO_LOOP_PROBE_TAIL_WINDOW_S > MICRO_LOOP_MOTION_SETTLE_SECONDS:
+        raise ValueError(
+            "MICRO_LOOP_PROBE_TAIL_WINDOW_S 不能超过无运动复测的固定等待时间。"
+        )
+    if not math.isfinite(OFFLINE_STATIC_SECONDS) or OFFLINE_STATIC_SECONDS <= 0.0:
+        raise ValueError("OFFLINE_STATIC_SECONDS 必须是有限正数。")
+    if (
+        not isinstance(OFFLINE_STATIC_REPEATS, int)
+        or isinstance(OFFLINE_STATIC_REPEATS, bool)
+        or OFFLINE_STATIC_REPEATS < 1
+    ):
+        raise ValueError("OFFLINE_STATIC_REPEATS 必须是正整数。")
+    if (
+        not math.isfinite(OFFLINE_STATIC_DISK_RESERVE_GB)
+        or OFFLINE_STATIC_DISK_RESERVE_GB < 0.0
+    ):
+        raise ValueError("OFFLINE_STATIC_DISK_RESERVE_GB 必须是有限非负数。")
+    if (
+        not math.isfinite(MICRO_LOOP_FIXED_SAFETY_RADIUS_M)
+        or MICRO_LOOP_FIXED_SAFETY_RADIUS_M <= 0
+        or MICRO_LOOP_FIXED_SAFETY_RADIUS_M > ROBOT_RELATIVE_WORKSPACE_HALF_RANGE_M
+    ):
+        raise ValueError(
+            "MICRO_LOOP_FIXED_SAFETY_RADIUS_M 必须是有限正数，且不能超过相对工作区半径。"
+        )
+    if not isinstance(MICRO_LOOP_DELETE_VIDEO_FILES_ON_EXIT, bool):
+        raise ValueError("MICRO_LOOP_DELETE_VIDEO_FILES_ON_EXIT 必须是布尔值。")
+    if not isinstance(MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP, bool):
+        raise ValueError("MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP 必须是布尔值。")
     if not 0.0 < MICRO_LOOP_GAIN_MIN < MICRO_LOOP_GAIN_MAX:
         raise ValueError("MICRO_LOOP_GAIN_MIN 必须为正数且小于 MICRO_LOOP_GAIN_MAX。")
     if MICRO_LOOP_GAIN_MIN * MICRO_LOOP_PROBE_UM < MICRO_LOOP_POSITION_TOL_UM:
@@ -1476,6 +1603,8 @@ def validate_config(run_mode: str | None = None) -> None:
     # 装不进去不会静默丢数据（相机会如实标记截断），但那一刻的数据已经不可用了。
     worst_window_s = (
         MICRO_LOOP_PRE_SECONDS
+        # 当前多目标路径在同一活动 RAW 内先分析 16 帧，算出 error 后才发命令。
+        + MICRO_LOOP_MEASURE_FRAMES * 0.165
         + MICRO_LOOP_PRE_STABLE_TIMEOUT_S
         + MICRO_LOOP_MOTION_SETTLE_SECONDS
         + MICRO_LOOP_STEP_TIMEOUT_S

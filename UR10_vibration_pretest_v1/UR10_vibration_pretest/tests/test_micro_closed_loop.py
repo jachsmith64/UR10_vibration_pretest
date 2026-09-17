@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -576,6 +577,87 @@ class ProbeGateTests(unittest.TestCase):
         self.assertIn("gain_matrix", payload)
 
 
+class FixedSafetyEnvelopeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.center = [0.2, -0.6, 0.4, 0.0, 0.0, 0.0]
+
+    def test_center_and_exact_twenty_centimetre_boundary_pass(self) -> None:
+        self.assertEqual(
+            mcl.enforce_fixed_safety_envelope(
+                self.center, self.center, label="center", radius_m=0.20
+            ),
+            0.0,
+        )
+        distance = mcl.enforce_fixed_safety_envelope(
+            [0.4, -0.6, 0.4, 0.0, 0.0, 0.0],
+            self.center,
+            label="boundary",
+            radius_m=0.20,
+        )
+        self.assertAlmostEqual(distance, 0.20)
+
+    def test_target_beyond_twenty_centimetres_is_rejected(self) -> None:
+        with self.assertRaises(RuntimeError):
+            mcl.enforce_fixed_safety_envelope(
+                [0.400001, -0.6, 0.4, 0.0, 0.0, 0.0],
+                self.center,
+                label="outside",
+                radius_m=0.20,
+            )
+
+    def test_diagonal_corner_outside_sphere_is_rejected(self) -> None:
+        with self.assertRaises(RuntimeError):
+            mcl.enforce_fixed_safety_envelope(
+                [0.35, -0.45, 0.55, 0.0, 0.0, 0.0],
+                self.center,
+                label="diagonal",
+                radius_m=0.20,
+            )
+
+    def test_non_finite_pose_is_rejected(self) -> None:
+        with self.assertRaises(RuntimeError):
+            mcl.enforce_fixed_safety_envelope(
+                [float("nan"), -0.6, 0.4, 0.0, 0.0, 0.0],
+                self.center,
+                label="nan",
+                radius_m=0.20,
+            )
+
+    def test_micro_move_crossing_boundary_is_rejected_before_controller_call(self) -> None:
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.motion_command_time = None
+                self.controller_checked = False
+                self.executed = False
+
+            def read_state(self):
+                return {
+                    "actual_tcp_pose": [0.19995, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "host_ns": 1,
+                }
+
+            def verify_controller_safety_limits(self, _trajectory) -> None:
+                self.controller_checked = True
+
+            def execute_trajectory(self, _trajectory) -> None:
+                self.executed = True
+
+        robot = FakeRobot()
+        with patch.object(mcl, "_wait_until_position_stable", return_value=robot.read_state()):
+            with self.assertRaisesRegex(RuntimeError, "超过固定安全半径"):
+                mcl.send_cartesian_micro_correction(
+                    robot,
+                    "X",
+                    100.0,
+                    safety_center_pose=[0.0] * 6,
+                    stop_event=object(),
+                    write_state=lambda _state: None,
+                )
+
+        self.assertFalse(robot.controller_checked)
+        self.assertFalse(robot.executed)
+
+
 class RobotSideAchievedTests(unittest.TestCase):
     def test_on_target_step_is_valid(self) -> None:
         status, _ = mcl.evaluate_achieved_robot_side(10.0, 10.0)
@@ -642,6 +724,25 @@ class TempWorkspaceTests(unittest.TestCase):
             freed = mcl.sweep_directory(trash_dir)
             self.assertGreaterEqual(freed, 1536)
             self.assertEqual(mcl.directory_bytes(trash_dir), 0)
+
+    def test_exit_cleanup_deletes_only_video_payloads_and_keeps_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            block = root / "X_open_seq_005um"
+            block.mkdir()
+            (block / "clip.raw").write_bytes(b"r" * 100)
+            (block / "clip.avi").write_bytes(b"a" * 50)
+            (block / "clip_meta.json").write_text("{}", encoding="utf-8")
+            (block / "clip_frames.csv").write_text("frame\n", encoding="utf-8")
+
+            released, failed = mcl.delete_video_payloads(root)
+
+            self.assertEqual(released, 150)
+            self.assertEqual(failed, [])
+            self.assertFalse((block / "clip.raw").exists())
+            self.assertFalse((block / "clip.avi").exists())
+            self.assertTrue((block / "clip_meta.json").exists())
+            self.assertTrue((block / "clip_frames.csv").exists())
 
     def test_clip_temp_paths_are_namespaced_by_stem(self) -> None:
         paths = mcl.clip_temp_paths(Path("X:/t"), "run_X_005um_positive_007")
@@ -901,6 +1002,24 @@ class ConfigValidationTests(unittest.TestCase):
     def test_hysteresis_ratio_must_be_a_probability(self) -> None:
         with self.assertRaises(ValueError):
             self._validated_with("MICRO_LOOP_PROBE_HYSTERESIS_RATIO", 1.0)
+
+    def test_probe_remeasure_attempts_is_exactly_five_and_non_negative(self) -> None:
+        self.assertEqual(config.MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS, 5)
+        for invalid in (-1, 1.5, True):
+            with self.assertRaises(ValueError):
+                self._validated_with("MICRO_LOOP_PROBE_REMEASURE_ATTEMPTS", invalid)
+
+    def test_probe_specific_sample_pool_keeps_the_original_quality_gates(self) -> None:
+        self.assertEqual(config.MICRO_LOOP_PROBE_REFERENCE_FRAMES, 32)
+        self.assertEqual(config.MICRO_LOOP_PROBE_MEASURE_FRAMES, 64)
+        self.assertEqual(config.MICRO_LOOP_PROBE_TAIL_WINDOW_S, 0.5)
+        self.assertEqual(config.MICRO_LOOP_MIN_TAIL_FRAMES, 12)
+        self.assertEqual(config.MICRO_LOOP_TAIL_SIGMA_MAX_UM, 2.0)
+
+    def test_fixed_safety_radius_is_twenty_centimetres(self) -> None:
+        self.assertEqual(config.MICRO_LOOP_FIXED_SAFETY_RADIUS_M, 0.20)
+        with self.assertRaises(ValueError):
+            self._validated_with("MICRO_LOOP_FIXED_SAFETY_RADIUS_M", 0.21)
 
     def test_worst_case_window_must_fit_the_buffer(self) -> None:
         # 窗口超时之和必须落在缓冲上限内，否则每段都要临时扩容或写满截断。
@@ -1380,19 +1499,26 @@ class RunPlanBudgetTests(unittest.TestCase):
         self.assertLess(float(plan["seconds_normal"]), float(plan["seconds_worst"]))
         self.assertLessEqual(int(plan["windows_normal"]), int(plan["windows_worst"]))
 
-    def test_worst_case_data_volume_is_reported_and_fits_the_free_disk(self) -> None:
+    def test_worst_plan_includes_all_five_probe_remeasurements(self) -> None:
+        plan = mcl.estimate_run_plan()
+        expected = 2 * len(config.MICRO_LOOP_AXES) * 5
+        self.assertEqual(
+            int(plan["parts_worst"]["probe_remeasure"]["windows"]), expected
+        )
+
+    def test_worst_case_data_volume_is_reported(self) -> None:
         plan = mcl.estimate_run_plan()
         need_gb = plan["bytes_worst"] / (1024.0 ** 3)
         self.assertGreater(need_gb, 0.0)
-        free_gb = mcl.free_gb(config.MICRO_LOOP_RAW_ROOT)
-        if math.isfinite(free_gb):
-            self.assertGreaterEqual(free_gb, need_gb)
+        # 当前机器剩余空间是运行前门禁的职责，不是单元测试不变量；调试中止留下
+        # 的旧 RAW 可能暂时占盘，但不应让纯计算回归随机红灯。
 
-    def test_static_baseline_raw_is_retained_by_policy(self) -> None:
-        # 第 10 条：静止基线的完整 RAW 永久保留，且全局保留策略不允许静默全删。
+    def test_raw_is_kept_within_a_group_then_deleted_with_exit_fallback(self) -> None:
         self.assertTrue(bool(config.MICRO_LOOP_KEEP_ALL_RAW))
+        self.assertTrue(bool(config.MICRO_LOOP_DELETE_VIDEO_FILES_AFTER_GROUP))
+        self.assertTrue(bool(config.MICRO_LOOP_DELETE_VIDEO_FILES_ON_EXIT))
         self.assertGreater(float(config.MICRO_LOOP_KEEP_ALL_RESERVE_GB), 0.0)
-        # 保留目标卷与工程输出目录分开，避免几十 GB 二进制淹没 outputs/。
+        # 运行中的目标卷与工程输出目录分开，避免几十 GB 二进制淹没 outputs/。
         self.assertNotEqual(
             Path(config.MICRO_LOOP_RAW_ROOT).resolve(),
             Path(config.OUTPUT_ROOT).resolve(),
@@ -1522,6 +1648,19 @@ class SignChainTests(unittest.TestCase):
                 expected = target - position
                 self.assertAlmostEqual(command, expected)
                 self.assertEqual(command > 0.0, expected > 0.0)
+
+    def test_continuity_gate_compares_positions_after_sign_normalization(self) -> None:
+        # 本次实测故障的原值：视觉 +182.83 μm、上一轮机器人轴位置
+        # -143.64 μm、sign=-1。旧代码直接相减得到 326.47 μm 并拒绝全部帧；
+        # 正确地先归一符号后只有 39.19 μm，明显低于 300 μm 联锁。
+        jump = mcl.continuity_jump_um(182.834147645, -143.639099368, -1.0)
+        self.assertAlmostEqual(jump, 39.195048277, places=6)
+        self.assertLess(jump, float(config.MICRO_LOOP_MAX_ITER_JUMP_UM))
+
+    def test_continuity_gate_rejects_missing_or_invalid_sign(self) -> None:
+        for invalid in (0.0, 2.0, float("nan")):
+            with self.assertRaises(ValueError):
+                mcl.continuity_jump_um(10.0, 0.0, invalid)
 
     def test_the_vision_axis_the_probe_picked_is_the_one_that_is_used(self) -> None:
         # 视觉 x 与 y 上的数完全不同：选错轴会读出一个不相干的位移。
@@ -1769,6 +1908,191 @@ class OpenBlockSummaryTests(unittest.TestCase):
             "measurement_timestamp_ns", "settling_time_s", "status",
         }
         self.assertTrue(required.issubset(set(mcl.OPEN_STEP_COLUMNS)))
+
+
+class ClosedLoopBookkeepingRegressionTests(unittest.TestCase):
+    """闭环汇总与逐轮位置不能引用已被覆盖或不在作用域内的变量。"""
+
+    def test_visual_delta_and_gain_use_the_previous_position(self) -> None:
+        delta, gain = mcl.measured_delta_and_gain(
+            previous_measured_um=-3.0,
+            measured_um=2.0,
+            command_um=5.0,
+        )
+        self.assertEqual(delta, 5.0)
+        self.assertEqual(gain, 1.0)
+
+    def test_first_measurement_has_no_delta_or_gain(self) -> None:
+        delta, gain = mcl.measured_delta_and_gain(
+            previous_measured_um=None,
+            measured_um=2.0,
+            command_um=5.0,
+        )
+        self.assertIsNone(delta)
+        self.assertTrue(math.isnan(gain))
+
+    def test_final_residual_comes_from_the_result_target(self) -> None:
+        self.assertAlmostEqual(mcl.closed_loop_final_residual_um(5.0, 2.66), 2.34)
+        self.assertAlmostEqual(mcl.closed_loop_final_residual_um(-50.0, -47.0), -3.0)
+        self.assertIsNone(mcl.closed_loop_final_residual_um(5.0, None))
+
+
+class GroupRawRetentionBudgetTests(unittest.TestCase):
+    def test_peak_group_is_smaller_than_the_whole_run(self) -> None:
+        plan = mcl.estimate_run_plan()
+        self.assertGreater(int(plan["peak_group_bytes_worst"]), 0)
+        self.assertLess(int(plan["peak_group_bytes_worst"]), int(plan["bytes_worst"]))
+
+    def test_budget_text_states_group_cleanup(self) -> None:
+        text = "\n".join(mcl.format_budget_lines(mcl.estimate_run_plan()))
+        self.assertIn("按组落盘后立即删除", text)
+        self.assertIn("最大单组驻盘", text)
+
+
+class MultiTargetClosedLoopTests(unittest.TestCase):
+    """当前 micro_closed_loop 主流程的纯离线回归测试。"""
+
+    def test_required_multi_target_sequence(self) -> None:
+        targets = mcl.build_multi_target_sequence()
+        self.assertEqual(len(targets), 12)
+        for axis in ("X", "Y"):
+            axis_targets = [item for item in targets if item["axis"] == axis]
+            self.assertEqual(
+                [item["target_nominal_um"] for item in axis_targets],
+                [100, 150, 210, -100, -150, -210],
+            )
+            self.assertEqual(
+                [item["target_absolute_um"] for item in axis_targets],
+                [100, 250, 460, 360, 210, 0],
+            )
+
+    def test_full_matrix_inverse_keeps_cross_coupling(self) -> None:
+        gains = mcl.ProbeGains(
+            gain={"X": {"x": -0.9, "y": 0.4}, "Y": {"x": -0.5, "y": -0.8}}
+        )
+        expected_visual = mcl.probe_gain_matrix(gains) @ np.asarray([100.0, 50.0])
+        robot = mcl.visual_to_robot_xy(
+            {"x": float(expected_visual[0]), "y": float(expected_visual[1])}, gains
+        )
+        self.assertAlmostEqual(robot["X"], 100.0, places=8)
+        self.assertAlmostEqual(robot["Y"], 50.0, places=8)
+
+    def test_singular_probe_matrix_is_rejected(self) -> None:
+        gains = mcl.ProbeGains(
+            gain={"X": {"x": 1.0, "y": 2.0}, "Y": {"x": 2.0, "y": 4.0}}
+        )
+        with self.assertRaisesRegex(RuntimeError, "奇异"):
+            mcl.inverse_probe_matrix(gains)
+
+    def test_stable_reached_needs_three_fixed_three_micron_hits(self) -> None:
+        self.assertEqual(
+            mcl.classify_multi_target_stop(
+                [8.0, 2.9, -2.0, 1.0], [8.0, 2.9, -2.0, 1.0], [5.0] * 4,
+                baseline_noise_um=10.0,
+            ),
+            mcl.TARGET_STABLE_REACHED,
+        )
+
+    def test_limit_cycle_is_detected_after_six_iterations(self) -> None:
+        self.assertEqual(
+            mcl.classify_multi_target_stop(
+                [6.0, 5.0, -5.0, 5.0, -5.0, 5.0],
+                [20.0] * 6,
+                [10.0] * 6,
+                baseline_noise_um=0.5,
+            ),
+            mcl.TARGET_LIMIT_CYCLE,
+        )
+
+    def test_small_command_stall_uses_baseline_noise(self) -> None:
+        self.assertEqual(
+            mcl.classify_multi_target_stop(
+                [8.0, 7.9, 8.1, 8.0],
+                [8.0, 7.0, 6.0],
+                [0.2, -0.1, 0.1],
+                baseline_noise_um=0.5,
+            ),
+            mcl.TARGET_SMALL_COMMAND_STALL,
+        )
+
+    def test_max_iteration_is_a_normal_target_stop(self) -> None:
+        errors = [40.0 - index for index in range(12)]
+        self.assertEqual(
+            mcl.classify_multi_target_stop(
+                errors, [20.0] * 12, [5.0] * 12, baseline_noise_um=0.5
+            ),
+            mcl.TARGET_MAX_ITER_REACHED,
+        )
+
+    def test_camera_recognition_loss_is_not_a_usable_position(self) -> None:
+        measurement = mcl.ClipMeasurement(
+            raw_path=Path("missing.raw"), frame_count=16, n_valid=0,
+            measured_um=None, transverse_um=None, n_tail=0,
+            sigma_tail_um=float("nan"), peak_axis_um=float("nan"),
+            positions=[], times_ns=[], frame_rows=[], first_row_ns=0, last_row_ns=0,
+        )
+        gains = mcl.ProbeGains(
+            gain={"X": {"x": 1.0, "y": 0.0}, "Y": {"x": 0.0, "y": 1.0}}
+        )
+        result = mcl.robot_xy_from_measurement(measurement, gains)
+        self.assertFalse(result.is_usable)
+        self.assertIn("没有合格视觉帧", result.reason)
+
+    def test_iteration_csv_contains_every_required_field(self) -> None:
+        required = {
+            "axis", "target_index", "target_nominal_um", "target_absolute_um",
+            "iteration", "position_before_um", "error_before_um", "command_um",
+            "vision_delta_um", "position_after_um", "error_after_um",
+            "orthogonal_axis_before_um", "orthogonal_axis_after_um",
+            "orthogonal_drift_um", "command_and_motion_same_direction",
+            "rtde_before", "rtde_after", "rtde_delta_um",
+            "baseline_noise_reference_um", "stop_reason", "timestamp",
+        }
+        self.assertTrue(required.issubset(set(mcl.TARGET_ITERATION_COLUMNS)))
+
+    def test_iteration_csv_and_summary_json_round_trip(self) -> None:
+        row = {column: "" for column in mcl.TARGET_ITERATION_COLUMNS}
+        row.update(
+            {
+                "axis": "X", "target_index": 1, "target_nominal_um": 100,
+                "target_absolute_um": 100, "iteration": 1,
+                "position_before_um": 0.5, "error_before_um": 99.5,
+                "command_um": 99.5, "vision_delta_um": 98.0,
+                "position_after_um": 98.5, "error_after_um": 1.5,
+                "stop_reason": "", "timestamp": "2026-09-17T00:00:00.000",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mcl.write_rows_csv(root / "iterations.csv", [row], mcl.TARGET_ITERATION_COLUMNS)
+            loaded = mcl.read_rows_csv(root / "iterations.csv")
+            self.assertEqual(loaded[0]["axis"], "X")
+            self.assertEqual(loaded[0]["error_after_um"], "1.5")
+            mcl.write_json(root / "summary.json", {"row": row})
+            self.assertIn('"target_absolute_um": 100', (root / "summary.json").read_text(encoding="utf-8"))
+
+    def test_new_budget_does_not_describe_old_open_loop_blocks(self) -> None:
+        text = "\n".join(
+            mcl.format_multi_target_budget_lines(mcl.estimate_multi_target_run_plan())
+        )
+        self.assertIn("X 6 个目标 + Y 6 个目标", text)
+        self.assertNotIn("开环", text)
+
+    def test_user_stop_request_interrupts_wait_without_motion(self) -> None:
+        import queue
+        import threading
+        import main
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stop_path = Path(temp_dir) / "stop.request"
+            stop_path.write_text("stop", encoding="utf-8")
+            stop_event = threading.Event()
+            with self.assertRaisesRegex(RuntimeError, "用户停止请求"):
+                main._StatusInbox(queue.Queue()).wait(
+                    "robot", "MOVE_DONE", queue.Queue(), stop_event, stop_path,
+                    timeout_s=0.1,
+                )
+            self.assertTrue(stop_event.is_set())
 
 
 
